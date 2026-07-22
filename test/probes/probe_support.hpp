@@ -111,8 +111,9 @@ namespace privateer::probes {
 		int fd = -1;
 		std::string path;
 
-		temp_file(size_t len, unsigned char fill) {
-			std::string tmpl = (std::filesystem::temp_directory_path() / "privateer-probe-XXXXXX").string();
+		explicit temp_file(size_t len, unsigned char fill,
+						   std::filesystem::path const &dir = std::filesystem::temp_directory_path()) {
+			std::string tmpl = (dir / "privateer-probe-XXXXXX").string();
 			std::vector<char> name(tmpl.begin(), tmpl.end());
 			name.push_back('\0');
 			fd = ::mkstemp(name.data());

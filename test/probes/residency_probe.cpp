@@ -11,13 +11,41 @@
 #include "probe_support.hpp"
 
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <vector>
+
+#include <sys/vfs.h>
+
+#ifndef TMPFS_MAGIC
+#define TMPFS_MAGIC 0x01021994
+#endif
+#ifndef RAMFS_MAGIC
+#define RAMFS_MAGIC 0x858458f6
+#endif
 
 using namespace privateer::probes;
 
 namespace {
 
 	constexpr size_t probe_pages = 32;
+
+	// The probes must run on a disk-backed filesystem: memory-backed pages
+	// (tmpfs, e.g. /tmp on Ubuntu 25.04+) cannot be paged out without swap, so
+	// MADV_PAGEOUT is a no-op there and the resident trim does not apply. The
+	// working directory is the build tree, which is disk-backed on the CI
+	// runners and in the dev container.
+	std::filesystem::path probe_dir() {
+		return std::filesystem::current_path();
+	}
+
+	bool memory_backed(std::filesystem::path const &dir) {
+		struct statfs sb {};
+		if (::statfs(dir.c_str(), &sb) != 0) {
+			return false;
+		}
+		return sb.f_type == TMPFS_MAGIC || sb.f_type == RAMFS_MAGIC;
+	}
 
 	// forces every page in, with reads only, so file pages stay clean shared folios
 	void touch_all(mapping const &m) {
@@ -45,8 +73,11 @@ namespace {
 	}
 
 	TEST(ResidencyProbe, PageoutEvictsSingleMappedCleanPages) {
+		if (memory_backed(probe_dir())) {
+			GTEST_SKIP() << "working directory is memory-backed; MADV_PAGEOUT needs a disk-backed filesystem";
+		}
 		size_t const len = probe_pages * page_size();
-		temp_file file{len, 'X'};
+		temp_file file{len, 'X', probe_dir()};
 		mapping m = mapping::map_file(file.fd, len, PROT_READ);
 
 		touch_all(m);
@@ -67,8 +98,11 @@ namespace {
 	}
 
 	TEST(ResidencyProbe, PageoutOnDoublyMappedFileRecorded) {
+		if (memory_backed(probe_dir())) {
+			GTEST_SKIP() << "working directory is memory-backed; MADV_PAGEOUT needs a disk-backed filesystem";
+		}
 		size_t const len = probe_pages * page_size();
-		temp_file file{len, 'X'};
+		temp_file file{len, 'X', probe_dir()};
 		mapping a = mapping::map_file(file.fd, len, PROT_READ);
 		mapping b = mapping::map_file(file.fd, len, PROT_READ);
 
@@ -96,7 +130,7 @@ namespace {
 
 	TEST(ResidencyProbe, MincoreCountsPageCacheNotResidentSet) {
 		size_t const len = probe_pages * page_size();
-		temp_file file{len, 'X'};
+		temp_file file{len, 'X', probe_dir()};
 		mapping m = mapping::map_file(file.fd, len, PROT_READ);
 
 		touch_all(m);
