@@ -17,26 +17,31 @@ jobs:
             cc: gcc-14
             cxx: g++-14
             sanitizer: "address,undefined"
+            san-name: asan-ubsan
             experimental: false
           - os: ubuntu-24.04
             cc: clang-21
             cxx: clang++-21
             sanitizer: "address,undefined"
+            san-name: asan-ubsan
             experimental: false
           - os: ubuntu-24.04
             cc: clang-21
             cxx: clang++-21
             sanitizer: "thread"
+            san-name: tsan
             experimental: true
           - os: ubuntu-24.04-arm
             cc: gcc-14
             cxx: g++-14
             sanitizer: ""
+            san-name: plain
             experimental: false
           - os: ubuntu-24.04-arm
             cc: clang-21
             cxx: clang++-21
             sanitizer: ""
+            san-name: plain
             experimental: false
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
@@ -63,7 +68,7 @@ jobs:
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: ${{ matrix.os }}-${{ matrix.cc }}-${{ matrix.sanitizer }}
+          key: ${{ matrix.os }}-${{ matrix.cc }}-${{ matrix.san-name }}
 
       - name: Install conan
         uses: dice-group/cpp-conan-release-reusable-workflow/.github/actions/configure_conan@main
