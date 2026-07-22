@@ -61,3 +61,15 @@ void delete_privateer_object(void* privateer_instance){
   delete priv;
 }
 
+
+uint64_t privateer_version_block_size(const char* version_path){
+  return Privateer::version_block_size(std::string(version_path));
+}
+
+int get_privateer_action_create(){
+  return Privateer::CREATE;
+}
+
+int get_privateer_action_open(){
+  return Privateer::OPEN;
+}
