@@ -1,0 +1,140 @@
+// Probes P5 and P6, Linux only: the syscalls behind the resident-budget trim.
+//
+// P5: MADV_PAGEOUT on a clean single-mapped file range evicts the pages from
+//     the page cache (the load-bearing property for the resident trim). The
+//     doubly-mapped case is kernel-dependent and only recorded.
+// P6: mincore reports page-cache presence for file pages, not this process's
+//     resident set: MADV_DONTNEED drops the PTEs but mincore still reports 1.
+
+#include <gtest/gtest.h>
+
+#include "probe_support.hpp"
+
+#include <cstdint>
+#include <vector>
+
+using namespace privateer::probes;
+
+namespace {
+
+	constexpr size_t probe_pages = 32;
+
+	// forces every page in, with reads only, so file pages stay clean shared folios
+	void touch_all(mapping const &m) {
+		for (size_t off = 0; off < m.len; off += page_size()) {
+			(void) m.bytes()[off];
+		}
+	}
+
+	size_t resident_pages(mapping const &m) {
+#ifdef __APPLE__
+		using mincore_vec_t = char;
+#else
+		using mincore_vec_t = unsigned char;
+#endif
+		std::vector<mincore_vec_t> vec(m.len / page_size());
+		if (::mincore(m.addr, m.len, vec.data()) != 0) {
+			ADD_FAILURE() << "mincore failed: " << errno;
+			return SIZE_MAX;
+		}
+		size_t count = 0;
+		for (auto const b : vec) {
+			count += (b & 1);
+		}
+		return count;
+	}
+
+	TEST(ResidencyProbe, PageoutEvictsSingleMappedCleanPages) {
+		size_t const len = probe_pages * page_size();
+		temp_file file{len, 'X'};
+		mapping m = mapping::map_file(file.fd, len, PROT_READ);
+
+		touch_all(m);
+		ASSERT_EQ(resident_pages(m), probe_pages);
+
+		if (::madvise(m.addr, len, MADV_PAGEOUT) != 0) {
+			if (errno == EINVAL) {
+				GTEST_SKIP() << "kernel without MADV_PAGEOUT";
+			}
+			FAIL() << "madvise(MADV_PAGEOUT) failed: " << errno;
+		}
+
+		size_t const after = resident_pages(m);
+		RecordProperty("resident_after_pageout", static_cast<int>(after));
+		EXPECT_EQ(after, 0u) << "MADV_PAGEOUT left " << after << " of " << probe_pages
+							 << " clean single-mapped pages in the page cache; the resident trim "
+								"relies on eviction here";
+	}
+
+	TEST(ResidencyProbe, PageoutOnDoublyMappedFileRecorded) {
+		size_t const len = probe_pages * page_size();
+		temp_file file{len, 'X'};
+		mapping a = mapping::map_file(file.fd, len, PROT_READ);
+		mapping b = mapping::map_file(file.fd, len, PROT_READ);
+
+		touch_all(a);
+		touch_all(b);
+		ASSERT_EQ(resident_pages(a), probe_pages);
+		ASSERT_EQ(resident_pages(b), probe_pages);
+
+		if (::madvise(a.addr, len, MADV_PAGEOUT) != 0) {
+			GTEST_SKIP() << "madvise(MADV_PAGEOUT) failed: " << errno;
+		}
+
+		// kernel-dependent: recent kernels skip folios mapped more than once.
+		// Recorded because snapshots hard-link block files that other regions
+		// or processes may map too. On the 6.x CI kernels both stay resident.
+		size_t const after_a = resident_pages(a);
+		size_t const after_b = resident_pages(b);
+		RecordProperty("resident_a_after_pageout", static_cast<int>(after_a));
+		RecordProperty("resident_b_after_pageout", static_cast<int>(after_b));
+		std::printf("[ P5 ] PAGEOUT on a doubly-mapped file: %zu / %zu of %zu pages still resident\n",
+					after_a, after_b, probe_pages);
+		// the two mappings share folios, so their residency must agree
+		EXPECT_EQ(after_a, after_b);
+	}
+
+	TEST(ResidencyProbe, MincoreCountsPageCacheNotResidentSet) {
+		size_t const len = probe_pages * page_size();
+		temp_file file{len, 'X'};
+		mapping m = mapping::map_file(file.fd, len, PROT_READ);
+
+		touch_all(m);
+		ASSERT_EQ(resident_pages(m), probe_pages);
+
+		// drops this mapping's PTEs; the folios stay in the page cache
+		ASSERT_EQ(::madvise(m.addr, len, MADV_DONTNEED), 0);
+		EXPECT_EQ(resident_pages(m), probe_pages)
+				<< "mincore reports the resident set, not the page cache; victim "
+				   "selection for the resident trim assumes page-cache semantics";
+	}
+
+	TEST(ResidencyProbe, MincoreDropsForAnonymousDontneed) {
+		// contrast case: for anonymous memory DONTNEED really empties the range
+		size_t const len = probe_pages * page_size();
+		void *addr = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		ASSERT_NE(addr, MAP_FAILED);
+		for (size_t off = 0; off < len; off += page_size()) {
+			static_cast<unsigned char volatile *>(addr)[off] = 1;
+		}
+
+		std::vector<unsigned char> vec(probe_pages);
+		ASSERT_EQ(::mincore(addr, len, vec.data()), 0);
+		size_t resident = 0;
+		for (auto const b : vec) {
+			resident += (b & 1);
+		}
+		ASSERT_EQ(resident, probe_pages);
+
+		ASSERT_EQ(::madvise(addr, len, MADV_DONTNEED), 0);
+		ASSERT_EQ(::mincore(addr, len, vec.data()), 0);
+		resident = 0;
+		for (auto const b : vec) {
+			resident += (b & 1);
+		}
+		EXPECT_EQ(resident, 0u);
+
+		::munmap(addr, len);
+	}
+
+}  // namespace
