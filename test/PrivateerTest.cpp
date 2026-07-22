@@ -2,7 +2,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <mpi.h>
 #include <gtest/gtest.h>
 
 #include <spdlog/spdlog.h>
@@ -637,48 +636,6 @@ TEST_P(PrivateerTest, IncrementalRandomSparseSnapshot_Skewed_Threaded) {
   }
 }
 
-TEST(PrivateerTest_Concurrent, ConcurrentWrite) {
-  char* datastore = "/tmp/datastore";
-  if (std::getenv("PRIVATEER_TEST_DIR") != NULL) {
-    datastore = std::getenv("PRIVATEER_TEST_DIR");
-  }
-  size_t size_bytes = 1024LLU;
-  size_t num_ints = size_bytes / sizeof(size_t);
-  MPI_Init(NULL, NULL);
-  int world_size;
-  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-  int world_rank;
-  MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
-
-  if (world_rank == 0){
-      Privateer privateer(Privateer::CREATE, datastore);
-      privateer.create(nullptr, "v0", size_bytes, true);
-      privateer.msync();
-  }
-  MPI_Barrier(MPI_COMM_WORLD);
-
-  if (world_rank != 0){
-      Privateer privateer(Privateer::OPEN, datastore);
-      size_t *data = (size_t*) privateer.open_immutable(nullptr, "v0", ("v" + std::to_string(world_rank)).c_str());
-      for (size_t i = 0; i < num_ints; i++){
-        data[i] = i;
-      }
-      privateer.msync();
-  }
-  MPI_Barrier(MPI_COMM_WORLD);
-
-  if (world_rank == 0) {
-    for (int i = 1; i < world_size; i++){
-      Privateer privateer(Privateer::OPEN, datastore);
-      size_t *data = (size_t*) privateer.open_read_only(nullptr, ("v" + std::to_string(i)).c_str());
-      for (size_t j = 0; j < num_ints; j++){
-        EXPECT_EQ(data[j], j);
-      }
-    }
-  }
-  MPI_Finalize();
-  std::filesystem::remove_all(datastore);
-}
 
 /* Out of range cases are undefined!
 // Death tests

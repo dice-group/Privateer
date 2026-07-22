@@ -1,4 +1,8 @@
 build*/
+cmake-build*/
+.idea/
+.vscode/
+CMakeUserPresets.json
 docs/html
 docs/latex
-.vscode/
+conan_provider.cmake

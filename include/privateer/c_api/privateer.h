@@ -18,10 +18,10 @@ int privateer_snapshot(void* privateer_instance, const char* version_metadata_pa
 void* privateer_data(void* privateer_instance);
 int privateer_version_exists(const char* version_metadata_path, void* privateer_instance);
 uint64_t privateer_region_size(void* privateer_instance);
-static uint64_t privateer_version_capacity(void* privateer_instance, const char* version_path);
-static uint64_t version_block_size(const char* version_path);
-static int get_privateer_action_create();
-static int get_privateer_action_open();
+uint64_t privateer_version_capacity(void* privateer_instance, const char* version_path);
+uint64_t privateer_version_block_size(const char* version_path);
+int get_privateer_action_create();
+int get_privateer_action_open();
 void delete_privateer_object(void* privateer_instance);
 #ifdef __cplusplus
 }
