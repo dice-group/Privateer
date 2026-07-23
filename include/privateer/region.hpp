@@ -68,6 +68,11 @@ namespace privateer {
 		// to fail the change on purpose; everything else leaves it alone.
 		extern int (*mprotect_fn)(void *addr, size_t len, int prot);
 
+		// Test-only: when set, called after each completed commit phase
+		// (1 capture, 2 write-out, 3 durability barrier, 4 recipe rename,
+		// 5 reclaim). Crash tests kill the process inside it.
+		extern void (*commit_phase_hook)(int completed_phase);
+
 	}  // namespace detail_region
 
 	struct region {
@@ -121,6 +126,18 @@ namespace privateer {
 		// budget; a target at or below the current size is a no-op. The new
 		// size is persisted by the next commit.
 		result<> extend(uint64_t target_size);
+
+		// Commits the region's content: captures every dirty slot, freezes
+		// it, writes changed blocks to the store, and atomically replaces
+		// the recipe. durable adds the durability barrier before the rename
+		// and reclaims retired block files after it; a durable commit
+		// returns only after everything the new recipe references is on
+		// stable storage. One commit runs at a time; readers stay live
+		// throughout, and a writer that faults a captured slot waits only
+		// for that slot's own write-out. A consistent cut requires that the
+		// application does not write concurrently. On a read-only region
+		// this is a no-op success.
+		result<> commit(bool durable);
 
 	private:
 		region();

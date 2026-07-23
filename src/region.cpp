@@ -14,7 +14,9 @@
 #include <cstdio>
 #include <mutex>
 #include <new>
+#include <span>
 #include <utility>
+#include <vector>
 
 #include <pthread.h>
 #include <sys/mman.h>
@@ -65,8 +67,19 @@ namespace privateer {
 	namespace detail_region {
 
 		int (*mprotect_fn)(void *, size_t, int) = ::mprotect;
+		void (*commit_phase_hook)(int) = nullptr;
 
 	}  // namespace detail_region
+
+	namespace {
+
+		void commit_phase_done(int phase) {
+			if (detail_region::commit_phase_hook != nullptr) {
+				detail_region::commit_phase_hook(phase);
+			}
+		}
+
+	}  // namespace
 
 	namespace {
 
@@ -165,6 +178,7 @@ namespace privateer {
 		size_t vma_headroom = 0;
 		bool read_only = false;
 		std::mutex region_mutex;  // serializes extend and close bookkeeping
+		std::mutex commit_mutex;  // one commit at a time; owns the recipe table and the store bookkeeping
 
 		~state() {
 			if (hot != nullptr) {
@@ -414,6 +428,192 @@ namespace privateer {
 			st.hot->table.publish(i, slot_state::empty);
 		}
 		st.hot->table.set_extended_size(target);
+		return {};
+	}
+
+	result<> region::commit(bool durable) {
+		auto &st = *state_;
+		if (st.read_only) {
+			// metall's flush and the reference backend's destructor call sync
+			// without a read-only guard; a shared-locked datastore is never
+			// mutated, so this succeeds untouched
+			return {};
+		}
+		std::lock_guard const commit_lock{st.commit_mutex};
+		if (!check_sanity()) {
+			return fail(errc::datastore_inconsistent, "the region error flag is set");
+		}
+		auto &table = st.hot->table;
+		uint64_t const block_size = st.rec.block_size;
+		auto *const segment_base = static_cast<std::byte *>(segment());
+		auto const slot_addr = [&](size_t slot) { return segment_base + slot * block_size; };
+
+		// Phase 1: capture. The grown tail of a concurrent extend belongs to
+		// the next epoch; this epoch persists the size captured here.
+		uint64_t const captured_size = table.extended_size();
+		size_t const captured_slots = captured_size / block_size;
+		st.rec.entries.resize(captured_slots);
+
+		struct captured_slot {
+			size_t slot;
+			bool empty;  // captured from dirty_empty: an empty commit
+		};
+		std::vector<captured_slot> captured;
+
+		// Restores captured but unwritten slots after a failure, so no waiter
+		// parks on a syncing slot forever. A write capture may already be
+		// read-only; it must be writable again before dirty reappears, and
+		// re-protecting a still-writable page is harmless.
+		auto const restore_range = [&](size_t from, size_t to) {
+			for (size_t i = from; i < to; ++i) {
+				auto const &cap = captured[i];
+				if (cap.empty) {
+					table.publish(cap.slot, slot_state::dirty_empty);
+					continue;
+				}
+				if (::mprotect(slot_addr(cap.slot), block_size, PROT_READ | PROT_WRITE) != 0) {
+					table.publish(cap.slot, slot_state::poisoned);
+					table.sub_dirty();
+					st.hot->error.store(1, std::memory_order_release);
+					continue;
+				}
+				table.publish(cap.slot, slot_state::dirty);
+			}
+		};
+
+		for (size_t slot = 0; slot < captured_slots; ++slot) {
+			for (;;) {
+				slot_state const state = table.load(slot);
+				if (state == slot_state::dirty) {
+					if (table.try_claim(slot, slot_state::dirty, slot_state::syncing)) {
+						captured.push_back({slot, false});
+						break;
+					}
+					continue;
+				}
+				if (state == slot_state::dirty_empty) {
+					if (table.try_claim(slot, slot_state::dirty_empty, slot_state::syncing)) {
+						captured.push_back({slot, true});
+						break;
+					}
+					continue;
+				}
+				if (state == slot_state::materializing) {
+					(void) table.wait_changed(slot, state);
+					continue;
+				}
+				if (state == slot_state::poisoned) {
+					restore_range(0, captured.size());
+					return fail(errc::region_poisoned, "a slot is dead after a failed protection change");
+				}
+				// clean and empty are already persisted; a freeing slot
+				// resolves to dirty_empty and belongs to the next epoch
+				break;
+			}
+		}
+
+		// Freeze the write captures: one downgrade (and one TLB shootdown)
+		// per contiguous run. When mprotect returns, no core holds a stale
+		// writable entry, so the content is frozen.
+		for (size_t i = 0; i < captured.size();) {
+			if (captured[i].empty) {
+				++i;
+				continue;
+			}
+			size_t j = i + 1;
+			while (j < captured.size() && !captured[j].empty &&
+				   captured[j].slot == captured[j - 1].slot + 1) {
+				++j;
+			}
+			size_t const run_slots = captured[j - 1].slot - captured[i].slot + 1;
+			if (::mprotect(slot_addr(captured[i].slot), run_slots * block_size, PROT_READ) != 0) {
+				int const freeze_errno = errno;
+				for (size_t k = i; k < j; ++k) {
+					table.publish(captured[k].slot, slot_state::poisoned);
+					table.sub_dirty();
+				}
+				st.hot->error.store(1, std::memory_order_release);
+				restore_range(0, i);
+				restore_range(j, captured.size());
+				errno = freeze_errno;
+				return fail_errno(errc::io_error, "freeze captured slots");
+			}
+			i = j;
+		}
+		commit_phase_done(1);
+
+		// Phase 2: write-out with per-slot release. A writer parked on a
+		// captured slot resumes as soon as its own slot publishes.
+		for (size_t idx = 0; idx < captured.size(); ++idx) {
+			auto const &cap = captured[idx];
+			auto &entry = st.rec.entries[cap.slot];
+			if (cap.empty) {
+				if (entry.size != 0) {
+					st.store->drop_reference(entry);
+					entry = block_digest{};
+				}
+				// the fresh anonymous zero mapping is already in place
+				table.publish(cap.slot, slot_state::empty);
+				continue;
+			}
+			std::span<std::byte const> const content{slot_addr(cap.slot), block_size};
+			auto const name = hash_block(st.rec.algorithm, content);
+			if (name != entry) {
+				if (auto published = st.store->publish(name, content); !published) {
+					restore_range(idx, captured.size());
+					return std::unexpected{published.error()};
+				}
+				if (entry.size != 0) {
+					st.store->drop_reference(entry);
+				}
+				st.store->add_reference(name);
+				entry = name;
+			}
+			// One MAP_FIXED call replaces the private pages with the named
+			// block file; a concurrent reader either reads the old identical
+			// bytes or blocks inside its fault, never an unmapped window.
+			if (auto mapped = map_block_file(slot_addr(cap.slot), block_size, st.store->block_path(entry));
+				!mapped) {
+				table.publish(cap.slot, slot_state::poisoned);
+				table.sub_dirty();
+				st.hot->error.store(1, std::memory_order_release);
+				restore_range(idx + 1, captured.size());
+				return std::unexpected{mapped.error()};
+			}
+			table.publish(cap.slot, slot_state::clean);
+			table.sub_dirty();
+		}
+		commit_phase_done(2);
+
+		// Phase 3: the durability barrier. Covers this commit's blocks and
+		// every name inherited from earlier non-durable commits; the store
+		// skips names already in the durable set.
+		if (durable) {
+			std::vector<block_digest> referenced;
+			for (auto const &entry : st.rec.entries) {
+				if (entry.size != 0) {
+					referenced.push_back(entry);
+				}
+			}
+			if (auto synced = st.store->make_durable(referenced); !synced) {
+				return std::unexpected{synced.error()};
+			}
+			commit_phase_done(3);
+		}
+
+		// Phase 4: the atomic commit point.
+		st.rec.size = captured_size;
+		if (auto committed = st.rec.commit(st.segment_dir, durable); !committed) {
+			return std::unexpected{committed.error()};
+		}
+		commit_phase_done(4);
+
+		// Phase 5: reclaim. Errors are non-fatal and logged inside; a failed
+		// name stays a candidate, and the open-time sweep is the backstop.
+		if (durable) {
+			st.store->reclaim();
+			commit_phase_done(5);
+		}
 		return {};
 	}
 
