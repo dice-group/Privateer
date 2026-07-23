@@ -2,6 +2,12 @@ find_package(GTest REQUIRED)
 find_package(Threads REQUIRED)
 include(GoogleTest)
 
+# PRE_TEST: ctest discovers tests serially at startup. The POST_BUILD default
+# runs one discovery step per target during the build; those steps share one
+# temp file per directory (CMake 4.x names it by an empty-string hash) and
+# race under parallel ninja when several test binaries link at once.
+set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
+
 add_executable(privateer_smoke_test smoke_test.cpp)
 target_link_libraries(privateer_smoke_test PRIVATE privateer::privateer GTest::gtest_main)
 gtest_discover_tests(privateer_smoke_test)
