@@ -13,6 +13,7 @@ target_link_libraries(privateer_smoke_test PRIVATE privateer::privateer GTest::g
 gtest_discover_tests(privateer_smoke_test)
 
 add_executable(privateer_unit_tests
+        block_hash_tests.cpp
         error_tests.cpp
         file_util_tests.cpp
         file_util_crash_tests.cpp
