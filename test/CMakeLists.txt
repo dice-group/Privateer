@@ -21,6 +21,7 @@ add_executable(privateer_unit_tests
         file_util_crash_tests.cpp
         logger_tests.cpp
         recipe_tests.cpp
+        region_tests.cpp
         slot_table_tests.cpp
         vm_tests.cpp
         word_wait_tests.cpp)
