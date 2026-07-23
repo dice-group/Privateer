@@ -1,7 +1,7 @@
 #ifndef PRIVATEER_ERROR_HPP
 #define PRIVATEER_ERROR_HPP
 
-// Error codes and the result type of the engine (architecture section 13).
+// Error codes and the result type of the engine.
 // The public adapter API returns bool where metall's contract wants bool,
 // with a queryable last_error() on the region; internal functions return
 // result<T>. No exceptions cross the adapter boundary, no exit() anywhere.

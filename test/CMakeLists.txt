@@ -19,8 +19,8 @@ target_include_directories(privateer_logger_override_test PRIVATE ${CMAKE_CURREN
 target_link_libraries(privateer_logger_override_test PRIVATE privateer::privateer GTest::gtest_main)
 gtest_discover_tests(privateer_logger_override_test)
 
-# platform probes: validate the design assumptions the engine is built on
-# (architecture section 14); no library code, plain platform APIs
+# platform probes: validate the platform assumptions the engine is built on;
+# no library code, plain platform APIs
 add_executable(privateer_probes
         probes/barrier_probe.cpp
         probes/shootdown_probe.cpp
