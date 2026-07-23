@@ -55,20 +55,28 @@ namespace privateer {
 
 	struct region;
 
+#ifdef PRIVATEER_TEST_HOOKS
+	// Test-only hooks, compiled in when the build includes the tests.
 	namespace detail_region {
 
-		// Test-only access to the slot table behind a region.
+		// access to the slot table behind a region
 		[[nodiscard]] slot_table &table_of(region &reg) noexcept;
 
-		// Test-only: runs the fault path exactly as the process-wide handler
-		// would for a fault at addr. Returns whether the fault was handled.
+		// Runs the fault path exactly as the process-wide handler would for
+		// a fault at addr. Returns whether the fault was handled.
 		bool deliver_fault(region &reg, uintptr_t addr, int signo) noexcept;
 
 		// The protection-change syscall of the fault path. Tests replace it
 		// to fail the change on purpose; everything else leaves it alone.
 		extern int (*mprotect_fn)(void *addr, size_t len, int prot);
 
+		// When set, called after each completed commit phase (1 capture,
+		// 2 write-out, 3 durability barrier, 4 recipe rename, 5 reclaim).
+		// Crash tests kill the process inside it.
+		extern void (*commit_phase_hook)(int completed_phase);
+
 	}  // namespace detail_region
+#endif  // PRIVATEER_TEST_HOOKS
 
 	struct region {
 		// Creates a datastore: the block store skeleton and an empty durable
@@ -122,6 +130,18 @@ namespace privateer {
 		// size is persisted by the next commit.
 		result<> extend(uint64_t target_size);
 
+		// Commits the region's content: captures every dirty slot, freezes
+		// it, writes changed blocks to the store, and atomically replaces
+		// the recipe. durable adds the durability barrier before the rename
+		// and reclaims retired block files after it; a durable commit
+		// returns only after everything the new recipe references is on
+		// stable storage. One commit runs at a time; readers stay live
+		// throughout, and a writer that faults a captured slot waits only
+		// for that slot's own write-out. A consistent cut requires that the
+		// application does not write concurrently. On a read-only region
+		// this is a no-op success.
+		result<> commit(bool durable);
+
 	private:
 		region();
 
@@ -131,8 +151,10 @@ namespace privateer {
 		struct state;
 		std::unique_ptr<state> state_;
 
+#ifdef PRIVATEER_TEST_HOOKS
 		friend slot_table &detail_region::table_of(region &reg) noexcept;
 		friend bool detail_region::deliver_fault(region &reg, uintptr_t addr, int signo) noexcept;
+#endif
 	};
 
 }  // namespace privateer

@@ -43,6 +43,17 @@ namespace privateer::testing {
 		ASSERT_TRUE(rec.commit(segment_dir, true));
 	}
 
+	// number of files under <segment_dir>/blocks, across all shards
+	[[nodiscard]] inline size_t count_block_files(std::filesystem::path const &segment_dir) {
+		size_t count = 0;
+		for (auto const &shard : std::filesystem::directory_iterator{segment_dir / "blocks"}) {
+			for ([[maybe_unused]] auto const &entry : std::filesystem::directory_iterator{shard}) {
+				++count;
+			}
+		}
+		return count;
+	}
+
 }  // namespace privateer::testing
 
 #endif  // PRIVATEER_TEST_STORE_BUILDER_HPP
