@@ -6,6 +6,19 @@ add_executable(privateer_smoke_test smoke_test.cpp)
 target_link_libraries(privateer_smoke_test PRIVATE privateer::privateer GTest::gtest_main)
 gtest_discover_tests(privateer_smoke_test)
 
+add_executable(privateer_unit_tests
+        error_tests.cpp
+        logger_tests.cpp)
+target_include_directories(privateer_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(privateer_unit_tests PRIVATE privateer::privateer GTest::gtest_main)
+gtest_discover_tests(privateer_unit_tests)
+
+# own binary: its strong metall_log must replace the weak built-in sink at link time
+add_executable(privateer_logger_override_test logger_override_tests.cpp)
+target_include_directories(privateer_logger_override_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(privateer_logger_override_test PRIVATE privateer::privateer GTest::gtest_main)
+gtest_discover_tests(privateer_logger_override_test)
+
 # platform probes: validate the design assumptions the engine is built on
 # (architecture section 14); no library code, plain platform APIs
 add_executable(privateer_probes
