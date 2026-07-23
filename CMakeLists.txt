@@ -22,6 +22,7 @@ add_library(privateer STATIC
         src/file_util.cpp
         src/logger.cpp
         src/mlocked.cpp
+        src/recipe.cpp
         src/region_registry.cpp
         src/rlimits.cpp
         src/asio_src.cpp
