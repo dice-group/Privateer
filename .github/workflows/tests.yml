@@ -51,7 +51,8 @@ jobs:
       CXX: ${{ matrix.cxx }}
       ASAN_OPTIONS: allow_user_segv_handler=1:halt_on_error=1
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-      TSAN_OPTIONS: halt_on_error=1
+      # the probes install SIGSEGV/SIGBUS handlers; TSan must not own those signals
+      TSAN_OPTIONS: halt_on_error=1:handle_segv=0:handle_sigbus=0
     steps:
       - uses: actions/checkout@v4
 
