@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PRIVATEER_TEST_PROBE_SUPPORT_HPP
+#define PRIVATEER_TEST_PROBE_SUPPORT_HPP
 
 // Shared helpers for the platform probes: temp files, mappings, sigaction
 // guards, and the in-handler wait primitive the write barrier will use
@@ -205,3 +206,5 @@ namespace privateer::probes {
 	};
 
 }  // namespace privateer::probes
+
+#endif  // PRIVATEER_TEST_PROBE_SUPPORT_HPP

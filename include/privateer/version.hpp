@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PRIVATEER_VERSION_HPP
+#define PRIVATEER_VERSION_HPP
 
 namespace privateer {
 
@@ -6,3 +7,5 @@ namespace privateer {
 char const *version() noexcept;
 
 }  // namespace privateer
+
+#endif  // PRIVATEER_VERSION_HPP

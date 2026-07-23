@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PRIVATEER_TEST_SANDBOX_HPP
+#define PRIVATEER_TEST_SANDBOX_HPP
 
 // Fork-based crash harness, a port of the dice-template-library sandbox.
 // Runs a code block in a child process and reports how the child exited.
@@ -148,3 +149,5 @@ namespace privateer::testing {
 // };
 // EXPECT_TRUE(is_fault_signal(res));
 #define PRIVATEER_SANDBOX ::privateer::testing::detail_sandbox::sandbox{} + [&]()
+
+#endif  // PRIVATEER_TEST_SANDBOX_HPP
