@@ -2,13 +2,19 @@ cmake_minimum_required(VERSION 3.24)
 project(privateer VERSION 0.2.0 LANGUAGES CXX)
 
 option(PRIVATEER_BUILD_TESTING "Build the test suites" ${PROJECT_IS_TOP_LEVEL})
+option(PRIVATEER_BUILD_BENCHMARKS "Build the microbenchmarks" ${PROJECT_IS_TOP_LEVEL})
 option(PRIVATEER_BUILD_LEGACY "Build the inherited v0.1 engine (Linux x86_64 only)" OFF)
 
 find_package(asio REQUIRED)
+find_package(blake3 REQUIRED)
+find_package(xxHash REQUIRED)
+find_package(OpenSSL REQUIRED)
+find_package(rapidhash REQUIRED)
 find_package(Threads REQUIRED)
 
 add_library(privateer STATIC
         src/version.cpp
+        src/block_hash.cpp
         src/error.cpp
         src/fault_handler.cpp
         src/file_util.cpp
@@ -35,13 +41,13 @@ target_compile_definitions(privateer PUBLIC
 )
 target_compile_definitions(privateer PRIVATE PRIVATEER_VERSION="${PROJECT_VERSION}")
 target_link_libraries(privateer PUBLIC asio::asio Threads::Threads)
+target_link_libraries(privateer PRIVATE BLAKE3::blake3 xxHash::xxhash OpenSSL::Crypto rapidhash::rapidhash)
 
 if (PRIVATEER_BUILD_LEGACY)
     if (NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64"))
         message(FATAL_ERROR "The legacy engine decodes faults via the x86_64 signal context and builds on Linux x86_64 only.")
     endif ()
 
-    find_package(OpenSSL REQUIRED)
     find_package(OpenMP REQUIRED)
     find_package(Boost REQUIRED)
     find_package(spdlog REQUIRED)
@@ -73,6 +79,10 @@ endif ()
 if (PRIVATEER_BUILD_TESTING)
     enable_testing()
     add_subdirectory(test)
+endif ()
+
+if (PRIVATEER_BUILD_BENCHMARKS)
+    add_subdirectory(bench)
 endif ()
 
 include(GNUInstallDirs)
