@@ -83,18 +83,26 @@ namespace {
 		touch_all(m);
 		ASSERT_EQ(resident_pages(m), probe_pages);
 
-		if (::madvise(m.addr, len, MADV_PAGEOUT) != 0) {
-			if (errno == EINVAL) {
-				GTEST_SKIP() << "kernel without MADV_PAGEOUT";
+		// The kernel may refuse a pass over recently touched pages, so eviction is
+		// asserted over repeated passes, like the governor's repeated trim sweeps.
+		size_t after = probe_pages;
+		for (int attempt = 0; attempt < 10 && after > 0; ++attempt) {
+			if (::madvise(m.addr, len, MADV_PAGEOUT) != 0) {
+				if (errno == EINVAL) {
+					GTEST_SKIP() << "kernel without MADV_PAGEOUT";
+				}
+				FAIL() << "madvise(MADV_PAGEOUT) failed: " << errno;
 			}
-			FAIL() << "madvise(MADV_PAGEOUT) failed: " << errno;
+			after = resident_pages(m);
+			if (after > 0) {
+				timespec const backoff{0, 100'000'000};
+				::nanosleep(&backoff, nullptr);
+			}
 		}
-
-		size_t const after = resident_pages(m);
 		RecordProperty("resident_after_pageout", static_cast<int>(after));
 		EXPECT_EQ(after, 0u) << "MADV_PAGEOUT left " << after << " of " << probe_pages
-							 << " clean single-mapped pages in the page cache; the resident trim "
-								"relies on eviction here";
+							 << " clean single-mapped pages in the page cache after 10 passes; "
+								"the resident trim relies on eviction here";
 	}
 
 	TEST(ResidencyProbe, PageoutOnDoublyMappedFileRecorded) {

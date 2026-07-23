@@ -36,7 +36,7 @@ namespace {
 				g_wait_stuck.store(true, std::memory_order_relaxed);
 				::mprotect(g_page, g_page_len, PROT_READ | PROT_WRITE);
 			}
-			return;  // main restored PROT_READ | PROT_WRITE before setting the word (law L1)
+			return;  // main restored PROT_READ | PROT_WRITE before setting the word
 		}
 		::signal(sig, SIG_DFL);
 	}
@@ -82,7 +82,7 @@ namespace {
 			}
 
 			ASSERT_EQ(::mprotect(m.addr, len, PROT_READ | PROT_WRITE), 0);
-			g_resume_word.store(1, std::memory_order_release);  // publish after protect, law L1
+			g_resume_word.store(1, std::memory_order_release);  // publish only after the protection change
 			wake_all(g_resume_word);
 
 			// wait until the writer visibly makes progress again before the next round
