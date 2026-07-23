@@ -1,0 +1,97 @@
+#include <privateer/slot_table.hpp>
+
+#include <privateer/handler_text.hpp>
+#include <privateer/word_wait.hpp>
+
+#include <cassert>
+#include <new>
+
+namespace privateer {
+
+	char const *to_string(slot_state state) noexcept {
+		switch (state) {
+			case slot_state::empty: return "empty";
+			case slot_state::clean: return "clean";
+			case slot_state::dirty: return "dirty";
+			case slot_state::dirty_empty: return "dirty_empty";
+			case slot_state::poisoned: return "poisoned";
+			case slot_state::materializing: return "materializing";
+			case slot_state::syncing: return "syncing";
+			case slot_state::freeing: return "freeing";
+		}
+		return "unknown";
+	}
+
+	result<slot_table> slot_table::create(size_t slot_count, bool lock) {
+		if (slot_count == 0) {
+			return fail(errc::invalid_argument, "slot table needs at least one slot");
+		}
+		auto buffer = mlocked_buffer::allocate(sizeof(header) + slot_count * sizeof(std::atomic<uint32_t>), lock);
+		if (!buffer) {
+			return std::unexpected{buffer.error()};
+		}
+		slot_table table;
+		table.buffer_ = std::move(*buffer);
+		table.count_ = slot_count;
+		new (table.buffer_.addr()) header{};
+		auto *states = table.states();
+		for (size_t i = 0; i < slot_count; ++i) {
+			new (states + i) std::atomic<uint32_t>{static_cast<uint32_t>(slot_state::empty)};
+		}
+		return table;
+	}
+
+	slot_table::header *slot_table::head() const noexcept {
+		return static_cast<header *>(buffer_.addr());
+	}
+
+	std::atomic<uint32_t> *slot_table::states() const noexcept {
+		return reinterpret_cast<std::atomic<uint32_t> *>(static_cast<std::byte *>(buffer_.addr()) + sizeof(header));
+	}
+
+	PRIVATEER_HANDLER_TEXT slot_state slot_table::load(size_t slot) const noexcept {
+		assert(slot < count_);
+		return static_cast<slot_state>(states()[slot].load(std::memory_order_acquire));
+	}
+
+	PRIVATEER_HANDLER_TEXT bool slot_table::try_claim(size_t slot, slot_state expected, slot_state claim) noexcept {
+		assert(slot < count_);
+		assert(!is_transient(expected));
+		assert(is_transient(claim));
+		auto expected_word = static_cast<uint32_t>(expected);
+		return states()[slot].compare_exchange_strong(expected_word, static_cast<uint32_t>(claim),
+													  std::memory_order_acq_rel, std::memory_order_acquire);
+	}
+
+	PRIVATEER_HANDLER_TEXT void slot_table::publish(size_t slot, slot_state terminal) noexcept {
+		assert(slot < count_);
+		assert(!is_transient(terminal));
+		states()[slot].store(static_cast<uint32_t>(terminal), std::memory_order_release);
+		word_wake_all(states()[slot]);
+	}
+
+	PRIVATEER_HANDLER_TEXT slot_state slot_table::wait_changed(size_t slot, slot_state observed) noexcept {
+		assert(slot < count_);
+		return static_cast<slot_state>(word_wait(states()[slot], static_cast<uint32_t>(observed)));
+	}
+
+	PRIVATEER_HANDLER_TEXT uint64_t slot_table::dirty_slots() const noexcept {
+		return head()->dirty.load(std::memory_order_acquire);
+	}
+
+	PRIVATEER_HANDLER_TEXT void slot_table::add_dirty() noexcept {
+		head()->dirty.fetch_add(1, std::memory_order_acq_rel);
+	}
+
+	PRIVATEER_HANDLER_TEXT void slot_table::sub_dirty() noexcept {
+		[[maybe_unused]] uint64_t const previous = head()->dirty.fetch_sub(1, std::memory_order_acq_rel);
+		assert(previous > 0);
+		head()->governor.fetch_add(1, std::memory_order_release);
+		word_wake_all(head()->governor);
+	}
+
+	PRIVATEER_HANDLER_TEXT std::atomic<uint32_t> &slot_table::governor_word() noexcept {
+		return head()->governor;
+	}
+
+}  // namespace privateer

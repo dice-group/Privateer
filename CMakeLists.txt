@@ -25,6 +25,9 @@ add_library(privateer STATIC
         src/recipe.cpp
         src/region_registry.cpp
         src/rlimits.cpp
+        src/slot_table.cpp
+        src/vm.cpp
+        src/word_wait.cpp
         src/asio_src.cpp
 )
 add_library(privateer::privateer ALIAS privateer)
