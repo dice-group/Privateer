@@ -29,6 +29,12 @@ namespace privateer {
 		bool (*on_fault)(region_record &rec, uintptr_t addr, int signo) = nullptr;
 		void *context = nullptr;
 
+		// When non-null, the pthread_atfork child handler stores 1 through
+		// it: the engine is fork-unsafe (memory locks are not inherited, no
+		// executor thread survives, held mutexes stay locked), so a child
+		// touching the datastore must fail loudly instead of corrupting it.
+		std::atomic<uint32_t> *fork_poison = nullptr;
+
 		// how many lookups on this region are between acquire and release
 		std::atomic<uint32_t> handler_in_flight{0};
 		std::atomic<uint32_t> free_in_flight{0};
@@ -65,6 +71,12 @@ namespace privateer {
 		// the record. Returns nullptr on a miss.
 		region_record *acquire(uintptr_t addr, in_flight_kind kind) noexcept;
 		static void release(region_record &rec, in_flight_kind kind) noexcept;
+
+		// Visits every registered record without the registry mutex: the
+		// fork child handler runs while another thread may hold that mutex.
+		// Published tables are immutable and never freed, so the lock-free
+		// walk is safe. Async-signal-safe.
+		void visit(void (*fn)(region_record &)) noexcept;
 
 	private:
 		struct entry {

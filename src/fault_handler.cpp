@@ -55,6 +55,9 @@ namespace privateer {
 		}
 
 		extern "C" PRIVATEER_HANDLER_TEXT void privateer_fault_handler(int sig, siginfo_t *si, void *ctx) {
+			// the fault path issues syscalls; the interrupted thread's errno
+			// must survive the handler
+			int const saved_errno = errno;
 			auto addr = reinterpret_cast<uintptr_t>(si != nullptr ? si->si_addr : nullptr);
 #ifdef __aarch64__
 			// The kernel delivers si_addr untagged without SA_EXPOSE_TAGBITS,
@@ -67,10 +70,12 @@ namespace privateer {
 				bool const handled = rec->on_fault != nullptr && rec->on_fault(*rec, addr, sig);
 				region_registry::release(*rec, region_registry::in_flight_kind::handler);
 				if (handled) {
+					errno = saved_errno;
 					return;  // the faulting instruction is retried
 				}
 			}
 			forward_to(sig == SIGBUS ? g_prev_bus : g_prev_segv, sig, si, ctx);
+			errno = saved_errno;
 		}
 
 		// mlocks the pages of the handler text section

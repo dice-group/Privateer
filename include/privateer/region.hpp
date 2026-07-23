@@ -10,11 +10,17 @@
 // read-write mapping, volatile, never persisted. Each slot is block_size
 // bytes and maps its recipe entry: a block file read-only, or anonymous
 // zeros for the empty sentinel. Slots beyond the extended size stay
-// PROT_NONE. Every slot mapping is read-only; writes go through the fault
-// handler once it is registered for the region.
+// PROT_NONE.
+//
+// A read-write open registers the region with the process-wide fault
+// handler: the first write into a slot faults, the handler claims the slot,
+// makes it writable, counts it dirty, and the retried store lands. Later
+// writes to the slot are native. Read-only opens never register; a stray
+// write crashes honestly.
 
 #include <privateer/block_hash.hpp>
 #include <privateer/error.hpp>
+#include <privateer/slot_table.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +52,23 @@ namespace privateer {
 		// where anonymous pages are never reclaimed
 		bool lock_state_array = true;
 	};
+
+	struct region;
+
+	namespace detail_region {
+
+		// Test-only access to the slot table behind a region.
+		[[nodiscard]] slot_table &table_of(region &reg) noexcept;
+
+		// Test-only: runs the fault path exactly as the process-wide handler
+		// would for a fault at addr. Returns whether the fault was handled.
+		bool deliver_fault(region &reg, uintptr_t addr, int signo) noexcept;
+
+		// The protection-change syscall of the fault path. Tests replace it
+		// to fail the change on purpose; everything else leaves it alone.
+		extern int (*mprotect_fn)(void *addr, size_t len, int prot);
+
+	}  // namespace detail_region
 
 	struct region {
 		// Creates a datastore: the block store skeleton and an empty durable
@@ -88,6 +111,10 @@ namespace privateer {
 		[[nodiscard]] hash_algorithm algorithm() const noexcept;
 		[[nodiscard]] bool read_only() const noexcept;
 
+		// true while no failure was recorded on the region; once false,
+		// commits and close fail, and metall withholds the consistency mark
+		[[nodiscard]] bool check_sanity() const noexcept;
+
 		// Extends the region to at least target_size bytes, rounded up to
 		// whole slots: maps the grown range as anonymous zeros and publishes
 		// the new size. Fails cleanly beyond capacity or beyond the VMA
@@ -103,6 +130,9 @@ namespace privateer {
 
 		struct state;
 		std::unique_ptr<state> state_;
+
+		friend slot_table &detail_region::table_of(region &reg) noexcept;
+		friend bool detail_region::deliver_fault(region &reg, uintptr_t addr, int signo) noexcept;
 	};
 
 }  // namespace privateer

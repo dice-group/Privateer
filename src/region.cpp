@@ -1,15 +1,23 @@
 #include <privateer/region.hpp>
 
 #include <privateer/block_store.hpp>
+#include <privateer/fault_handler.hpp>
+#include <privateer/handler_text.hpp>
 #include <privateer/logger.hpp>
 #include <privateer/recipe.hpp>
+#include <privateer/region_registry.hpp>
 #include <privateer/rlimits.hpp>
 #include <privateer/slot_table.hpp>
 #include <privateer/vm.hpp>
+#include <privateer/word_wait.hpp>
 
 #include <cstdio>
 #include <mutex>
+#include <new>
 #include <utility>
+
+#include <pthread.h>
+#include <sys/mman.h>
 
 namespace privateer {
 
@@ -40,18 +48,137 @@ namespace privateer {
 #endif
 		}
 
+		// The region state the fault handler dereferences, placed in one
+		// mlocked buffer: the fault signal is masked while the handler runs,
+		// so a page fault on this data would kill the process.
+		struct region_hot {
+			region_record record{};
+			slot_table table;
+			std::atomic<uint32_t> error{0};
+			std::atomic<uint32_t> closing{0};
+			uintptr_t segment_start = 0;
+			uint64_t block_size = 0;
+		};
+
+	}  // namespace
+
+	namespace detail_region {
+
+		int (*mprotect_fn)(void *, size_t, int) = ::mprotect;
+
+	}  // namespace detail_region
+
+	namespace {
+
+		// The fault path. Runs in the process-wide handler with the record's
+		// in-flight counter held; everything it touches is mlocked, and every
+		// call it makes is async-signal-safe.
+		PRIVATEER_HANDLER_TEXT bool region_on_fault(region_record &rec, uintptr_t addr, int) {
+			auto &hot = *static_cast<region_hot *>(rec.context);
+			if (hot.closing.load(std::memory_order_acquire) != 0) {
+				return false;  // the application must have quiesced; fail loudly
+			}
+			uint64_t const offset = addr - hot.segment_start;
+			if (offset >= hot.table.extended_size()) {
+				return false;  // beyond the extended size: a genuine wild access
+			}
+			size_t const slot = offset / hot.block_size;
+			for (;;) {
+				slot_state const state = hot.table.load(slot);
+				switch (state) {
+					case slot_state::empty:
+					case slot_state::clean:
+					case slot_state::dirty_empty: {
+						if (!hot.table.try_claim(slot, state, slot_state::materializing)) {
+							continue;  // the slot moved; re-examine
+						}
+						hot.table.add_dirty();
+						void *const slot_addr =
+								reinterpret_cast<void *>(hot.segment_start + slot * hot.block_size);
+						if (detail_region::mprotect_fn(slot_addr, hot.block_size, PROT_READ | PROT_WRITE) != 0) {
+							// The slot is dead. Balance the count, publish the
+							// terminal poisoned state so no waiter parks
+							// forever, record the failure, and forward.
+							hot.table.sub_dirty();
+							hot.table.publish(slot, slot_state::poisoned);
+							hot.error.store(1, std::memory_order_release);
+							return false;
+						}
+						hot.table.publish(slot, slot_state::dirty);
+						return true;  // the retried store lands
+					}
+					case slot_state::materializing:
+					case slot_state::syncing:
+					case slot_state::freeing:
+						// Wait out the transient, then retry the instruction;
+						// the retry classifies itself: a read succeeds against
+						// the restored mapping, a write re-faults into the
+						// claim path.
+						(void) hot.table.wait_changed(slot, state);
+						return true;
+					case slot_state::dirty:
+						// Writable by publish-after-protect, so this is a
+						// stale TLB entry or a benign race with a fresh
+						// transition; the retry succeeds.
+						return true;
+					case slot_state::poisoned:
+						hot.error.store(1, std::memory_order_release);
+						return false;
+				}
+				// a corrupt state value: no claim was won, nothing to balance
+				hot.error.store(1, std::memory_order_release);
+				return false;
+			}
+		}
+
+		// The engine is fork-unsafe: memory locks are not inherited, no
+		// executor thread survives into the child, and held mutexes stay
+		// locked. The child handler marks every open region so misuse fails
+		// loudly instead of hanging or corrupting. Lock-free, because the
+		// parent may fork while another thread holds the registry mutex.
+		void poison_regions_in_fork_child() noexcept {
+			global_registry().visit([](region_record &rec) {
+				if (rec.fork_poison != nullptr) {
+					rec.fork_poison->store(1, std::memory_order_release);
+				}
+			});
+		}
+
+		std::once_flag g_atfork_once;
+
+		void install_fork_poison() {
+			std::call_once(g_atfork_once,
+						   [] { ::pthread_atfork(nullptr, nullptr, poison_regions_in_fork_child); });
+		}
+
 	}  // namespace
 
 	struct region::state {
 		fs::path segment_dir;
 		std::optional<block_store> store;
 		recipe rec;  // the in-memory recipe table; entries change only under the commit mutex
-		slot_table table;
+		mlocked_buffer hot_buffer;
+		region_hot *hot = nullptr;
+		bool registered = false;
 		vm_reservation reservation;
 		size_t header_bytes = 0;
 		size_t vma_headroom = 0;
 		bool read_only = false;
 		std::mutex region_mutex;  // serializes extend and close bookkeeping
+
+		~state() {
+			if (hot != nullptr) {
+				if (registered) {
+					// New faults forward as crashes from here on; the
+					// application has quiesced its readers and writers.
+					hot->closing.store(1, std::memory_order_seq_cst);
+					word_wake_all(hot->table.governor_word());
+					global_registry().remove(hot->record);
+				}
+				hot->~region_hot();
+				hot = nullptr;
+			}
+		}
 	};
 
 	region::region() : state_{std::make_unique<state>()} {}
@@ -132,7 +259,8 @@ namespace privateer {
 
 		bool const lock = !read_only && options.lock_state_array;
 		if (lock) {
-			if (auto raised = ensure_memlock_limit(slot_count * sizeof(uint32_t) + 64); !raised) {
+			if (auto raised = ensure_memlock_limit(slot_count * sizeof(uint32_t) + sizeof(region_hot) + 64);
+				!raised) {
 				return std::unexpected{raised.error()};
 			}
 		}
@@ -140,13 +268,34 @@ namespace privateer {
 		if (!table) {
 			return std::unexpected{table.error()};
 		}
+		auto hot_buffer = mlocked_buffer::allocate(sizeof(region_hot), lock);
+		if (!hot_buffer) {
+			return std::unexpected{hot_buffer.error()};
+		}
 
 		size_t const header_bytes = round_up(options.header_size, page_size());
 		auto reservation = vm_reservation::reserve(header_bytes + round_up(rec->capacity, page_size()));
 		if (!reservation) {
 			return std::unexpected{reservation.error()};
 		}
-		auto *const base = static_cast<std::byte *>(reservation->addr());
+
+		// From here on the region owns everything; its destructor cleans up
+		// every early-return path.
+		region reg;
+		auto &st = *reg.state_;
+		st.segment_dir = segment_dir;
+		st.rec = std::move(*rec);
+		st.hot_buffer = std::move(*hot_buffer);
+		st.hot = new (st.hot_buffer.addr()) region_hot{};
+		st.hot->table = std::move(*table);
+		st.hot->block_size = st.rec.block_size;
+		st.reservation = std::move(*reservation);
+		st.header_bytes = header_bytes;
+		st.vma_headroom = options.vma_headroom;
+		st.read_only = read_only;
+		st.store = std::move(*store);
+
+		auto *const base = static_cast<std::byte *>(st.reservation.addr());
 		if (header_bytes > 0) {
 			if (auto mapped = map_anonymous(base, header_bytes, page_access::read_write, false); !mapped) {
 				return std::unexpected{mapped.error()};
@@ -154,49 +303,57 @@ namespace privateer {
 		}
 
 		std::byte *const segment = base + header_bytes;
+		st.hot->segment_start = reinterpret_cast<uintptr_t>(segment);
 		for (uint64_t i = 0; i < size_slots; ++i) {
-			auto const &entry = rec->entries[i];
-			void *const slot_addr = segment + i * rec->block_size;
+			auto const &entry = st.rec.entries[i];
+			void *const slot_addr = segment + i * st.rec.block_size;
 			if (entry.size == 0) {
-				if (auto mapped = map_anonymous(slot_addr, rec->block_size, page_access::read); !mapped) {
+				if (auto mapped = map_anonymous(slot_addr, st.rec.block_size, page_access::read); !mapped) {
 					return std::unexpected{mapped.error()};
 				}
-				table->publish(i, slot_state::empty);
+				st.hot->table.publish(i, slot_state::empty);
 			} else {
-				if (auto mapped = map_block_file(slot_addr, rec->block_size, store->block_path(entry));
+				if (auto mapped = map_block_file(slot_addr, st.rec.block_size, st.store->block_path(entry));
 					!mapped) {
 					return std::unexpected{mapped.error()};
 				}
-				table->publish(i, slot_state::clean);
+				st.hot->table.publish(i, slot_state::clean);
 			}
 		}
-		table->set_extended_size(rec->size);
+		st.hot->table.set_extended_size(st.rec.size);
 
 		if (!read_only) {
-			for (auto const &entry : rec->entries) {
+			for (auto const &entry : st.rec.entries) {
 				if (entry.size != 0) {
-					store->seed_durable(entry);
-					store->add_reference(entry);
+					st.store->seed_durable(entry);
+					st.store->add_reference(entry);
 				}
 			}
-			auto swept = store->sweep(rec->entries);
+			auto swept = st.store->sweep(st.rec.entries);
 			if (!swept) {
 				return std::unexpected{swept.error()};
 			}
 			if (*swept > 0) {
 				PRIVATEER_LOG(log_level::info, "open-time sweep removed {} unreferenced files", *swept);
 			}
-		}
 
-		region reg;
-		reg.state_->segment_dir = segment_dir;
-		reg.state_->store = std::move(*store);
-		reg.state_->rec = std::move(*rec);
-		reg.state_->table = std::move(*table);
-		reg.state_->reservation = std::move(*reservation);
-		reg.state_->header_bytes = header_bytes;
-		reg.state_->vma_headroom = options.vma_headroom;
-		reg.state_->read_only = read_only;
+			// arm the write barrier
+			if (auto installed = install_fault_handler(); !installed) {
+				return std::unexpected{installed.error()};
+			}
+			if (auto armed = arm_thread_fault_stack(); !armed) {
+				return std::unexpected{armed.error()};
+			}
+			install_fork_poison();
+			st.hot->record.on_fault = &region_on_fault;
+			st.hot->record.context = st.hot;
+			st.hot->record.fork_poison = &st.hot->error;
+			auto const start = st.hot->segment_start;
+			if (auto added = global_registry().add(st.hot->record, start, start + st.rec.capacity); !added) {
+				return std::unexpected{added.error()};
+			}
+			st.registered = true;
+		}
 		return reg;
 	}
 
@@ -209,7 +366,7 @@ namespace privateer {
 	}
 
 	uint64_t region::size() const noexcept {
-		return state_->table.extended_size();
+		return state_->hot->table.extended_size();
 	}
 
 	uint64_t region::capacity() const noexcept {
@@ -228,13 +385,17 @@ namespace privateer {
 		return state_->read_only;
 	}
 
+	bool region::check_sanity() const noexcept {
+		return state_->hot->error.load(std::memory_order_acquire) == 0;
+	}
+
 	result<> region::extend(uint64_t target_size) {
 		auto &st = *state_;
 		if (st.read_only) {
 			return fail(errc::invalid_argument, "extend on a read-only region");
 		}
 		std::lock_guard lock{st.region_mutex};
-		uint64_t const current = st.table.extended_size();
+		uint64_t const current = st.hot->table.extended_size();
 		if (target_size <= current) {
 			return {};
 		}
@@ -250,10 +411,22 @@ namespace privateer {
 			return std::unexpected{mapped.error()};
 		}
 		for (uint64_t i = current / st.rec.block_size; i < target / st.rec.block_size; ++i) {
-			st.table.publish(i, slot_state::empty);
+			st.hot->table.publish(i, slot_state::empty);
 		}
-		st.table.set_extended_size(target);
+		st.hot->table.set_extended_size(target);
 		return {};
 	}
+
+	namespace detail_region {
+
+		slot_table &table_of(region &reg) noexcept {
+			return reg.state_->hot->table;
+		}
+
+		bool deliver_fault(region &reg, uintptr_t addr, int signo) noexcept {
+			return region_on_fault(reg.state_->hot->record, addr, signo);
+		}
+
+	}  // namespace detail_region
 
 }  // namespace privateer

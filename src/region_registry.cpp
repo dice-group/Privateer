@@ -158,6 +158,14 @@ namespace privateer {
 		counter.fetch_sub(1, std::memory_order_release);
 	}
 
+	void region_registry::visit(void (*fn)(region_record &)) noexcept {
+		if (table const *const t = current_.load(std::memory_order_acquire); t != nullptr) {
+			for (size_t i = 0; i < t->count; ++i) {
+				fn(*t->items()[i].record);
+			}
+		}
+	}
+
 	namespace {
 		constinit region_registry g_registry;
 	}
