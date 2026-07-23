@@ -32,6 +32,7 @@ namespace privateer::testing {
 		illegal_instruction = SIGILL,
 		aborted = SIGABRT,
 		floating_point_exception = SIGFPE,
+		killed = SIGKILL,
 		bus_error = SIGBUS,
 		segmentation_fault = SIGSEGV,
 		terminated = SIGTERM,

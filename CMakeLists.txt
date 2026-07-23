@@ -10,6 +10,7 @@ find_package(Threads REQUIRED)
 add_library(privateer STATIC
         src/version.cpp
         src/error.cpp
+        src/file_util.cpp
         src/logger.cpp
         src/asio_src.cpp
 )
