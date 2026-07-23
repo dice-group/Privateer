@@ -21,6 +21,15 @@ target_include_directories(privateer_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_D
 target_link_libraries(privateer_unit_tests PRIVATE privateer::privateer GTest::gtest_main)
 gtest_discover_tests(privateer_unit_tests)
 
+# own binary: these tests own the process-wide fault-signal dispositions
+add_executable(privateer_barrier_tests
+        registry_tests.cpp
+        fault_handler_tests.cpp
+        memlock_tests.cpp)
+target_include_directories(privateer_barrier_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(privateer_barrier_tests PRIVATE privateer::privateer GTest::gtest_main Threads::Threads)
+gtest_discover_tests(privateer_barrier_tests)
+
 # own binary: its strong metall_log must replace the weak built-in sink at link time
 add_executable(privateer_logger_override_test logger_override_tests.cpp)
 target_include_directories(privateer_logger_override_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
