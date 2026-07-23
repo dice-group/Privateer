@@ -27,6 +27,7 @@ namespace privateer {
 		hash_collision,          // dedup byte-compare found different content under one name
 		region_poisoned,         // a slot is dead after a failed protection change
 		shutting_down,           // the region is closing
+		capacity_exceeded,       // extend beyond the capacity fixed at create
 	};
 
 	// short stable name of the code, for logs and messages

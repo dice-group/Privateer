@@ -94,4 +94,12 @@ namespace privateer {
 		return head()->governor;
 	}
 
+	PRIVATEER_HANDLER_TEXT uint64_t slot_table::extended_size() const noexcept {
+		return head()->extended.load(std::memory_order_acquire);
+	}
+
+	void slot_table::set_extended_size(uint64_t bytes) noexcept {
+		head()->extended.store(bytes, std::memory_order_release);
+	}
+
 }  // namespace privateer

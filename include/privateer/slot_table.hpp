@@ -99,10 +99,20 @@ namespace privateer {
 		// through word_wait and word_wake_all with a value read from here.
 		[[nodiscard]] std::atomic<uint32_t> &governor_word() noexcept;
 
+		// The extended region size in bytes, a slot multiple. The fault
+		// handler gates on it before it reads any slot state, so it lives in
+		// the same mlocked buffer as the states. The store happens only after
+		// the grown range's mappings and states are in place (release), and
+		// every reader pairs with it (acquire), so a slot is only ever
+		// examined after its mapping and state are visible.
+		[[nodiscard]] uint64_t extended_size() const noexcept;
+		void set_extended_size(uint64_t bytes) noexcept;
+
 	private:
 		// buffer layout: the counters, then the state array
 		struct header {
 			std::atomic<uint64_t> dirty;
+			std::atomic<uint64_t> extended;
 			std::atomic<uint32_t> governor;
 		};
 

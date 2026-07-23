@@ -33,6 +33,7 @@ namespace {
 			errc::hash_collision,
 			errc::region_poisoned,
 			errc::shutting_down,
+			errc::capacity_exceeded,
 	};
 
 	TEST(ErrorCodes, NamesAreNonEmptyAndDistinct) {
