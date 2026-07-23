@@ -14,6 +14,8 @@ gtest_discover_tests(privateer_smoke_test)
 
 add_executable(privateer_unit_tests
         error_tests.cpp
+        file_util_tests.cpp
+        file_util_crash_tests.cpp
         logger_tests.cpp)
 target_include_directories(privateer_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(privateer_unit_tests PRIVATE privateer::privateer GTest::gtest_main)

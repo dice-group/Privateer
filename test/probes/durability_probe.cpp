@@ -3,7 +3,7 @@
 // Linux: O_TMPFILE plus linkat through /proc/self/fd (with mkstemp fallback on
 // filesystems without O_TMPFILE), fdatasync, directory fsync, and EEXIST on a
 // racing publication (the dedup path relies on it).
-// Darwin: fcntl(F_FULLFSYNC) on file and directory fds with the fsync fallback.
+// Darwin: plain fsync (no device-cache flush; macOS is not a production target).
 // Both: mkstemp plus rename publication under a directory fsync.
 //
 // Overlayfs power-cut durability stays a documented manual procedure: a
@@ -56,14 +56,14 @@ namespace {
 		}
 	};
 
-	// data barrier for one file: fdatasync on Linux, F_FULLFSYNC with fsync fallback on Darwin
+	// Data barrier for one file: fdatasync on Linux, fsync on Darwin. macOS
+	// fsync does not flush the device write cache (only the very slow
+	// fcntl(F_FULLFSYNC) does) but survives process and OS crashes; macOS is
+	// not a production target, so the engine uses plain fsync there.
 	int data_sync(int fd) {
 #ifdef __linux__
 		return ::fdatasync(fd);
 #else
-		if (::fcntl(fd, F_FULLFSYNC) != -1) {
-			return 0;
-		}
 		return ::fsync(fd);
 #endif
 	}
@@ -147,31 +147,5 @@ namespace {
 		temp_dir dir;
 		EXPECT_EQ(::fsync(dir.dirfd), 0);
 	}
-
-#ifdef __APPLE__
-
-	TEST(DurabilityProbe, FullFsyncOnFileAndDirectory) {
-		temp_dir dir;
-		std::string const file_path = dir.path + "/f";
-		int const fd = ::open(file_path.c_str(), O_CREAT | O_RDWR, 0644);
-		ASSERT_GE(fd, 0);
-		write_all(fd, "x", 1);
-
-		// APFS supports F_FULLFSYNC on files; the engine falls back to fsync where it fails
-		int const file_rc = ::fcntl(fd, F_FULLFSYNC);
-		RecordProperty("file_fullfsync_rc", file_rc);
-		EXPECT_EQ(file_rc, 0) << "F_FULLFSYNC on a file failed, errno " << errno;
-
-		// directory support is filesystem-dependent: recorded, fallback asserted
-		int const dir_rc = ::fcntl(dir.dirfd, F_FULLFSYNC);
-		RecordProperty("dir_fullfsync_rc", dir_rc);
-		if (dir_rc != 0) {
-			EXPECT_EQ(::fsync(dir.dirfd), 0);
-		}
-
-		::close(fd);
-	}
-
-#endif
 
 }  // namespace
