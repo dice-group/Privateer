@@ -55,25 +55,28 @@ namespace privateer {
 
 	struct region;
 
+#ifdef PRIVATEER_TEST_HOOKS
+	// Test-only hooks, compiled in when the build includes the tests.
 	namespace detail_region {
 
-		// Test-only access to the slot table behind a region.
+		// access to the slot table behind a region
 		[[nodiscard]] slot_table &table_of(region &reg) noexcept;
 
-		// Test-only: runs the fault path exactly as the process-wide handler
-		// would for a fault at addr. Returns whether the fault was handled.
+		// Runs the fault path exactly as the process-wide handler would for
+		// a fault at addr. Returns whether the fault was handled.
 		bool deliver_fault(region &reg, uintptr_t addr, int signo) noexcept;
 
 		// The protection-change syscall of the fault path. Tests replace it
 		// to fail the change on purpose; everything else leaves it alone.
 		extern int (*mprotect_fn)(void *addr, size_t len, int prot);
 
-		// Test-only: when set, called after each completed commit phase
-		// (1 capture, 2 write-out, 3 durability barrier, 4 recipe rename,
-		// 5 reclaim). Crash tests kill the process inside it.
+		// When set, called after each completed commit phase (1 capture,
+		// 2 write-out, 3 durability barrier, 4 recipe rename, 5 reclaim).
+		// Crash tests kill the process inside it.
 		extern void (*commit_phase_hook)(int completed_phase);
 
 	}  // namespace detail_region
+#endif  // PRIVATEER_TEST_HOOKS
 
 	struct region {
 		// Creates a datastore: the block store skeleton and an empty durable
@@ -148,8 +151,10 @@ namespace privateer {
 		struct state;
 		std::unique_ptr<state> state_;
 
+#ifdef PRIVATEER_TEST_HOOKS
 		friend slot_table &detail_region::table_of(region &reg) noexcept;
 		friend bool detail_region::deliver_fault(region &reg, uintptr_t addr, int signo) noexcept;
+#endif
 	};
 
 }  // namespace privateer

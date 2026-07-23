@@ -64,19 +64,32 @@ namespace privateer {
 
 	}  // namespace
 
+#ifdef PRIVATEER_TEST_HOOKS
 	namespace detail_region {
 
 		int (*mprotect_fn)(void *, size_t, int) = ::mprotect;
 		void (*commit_phase_hook)(int) = nullptr;
 
 	}  // namespace detail_region
+#endif
 
 	namespace {
 
-		void commit_phase_done(int phase) {
+		// the fault path's protection change; tests reroute it through the seam
+		PRIVATEER_HANDLER_TEXT int protect_slot_for_write(void *addr, size_t len) {
+#ifdef PRIVATEER_TEST_HOOKS
+			return detail_region::mprotect_fn(addr, len, PROT_READ | PROT_WRITE);
+#else
+			return ::mprotect(addr, len, PROT_READ | PROT_WRITE);
+#endif
+		}
+
+		void commit_phase_done([[maybe_unused]] int phase) {
+#ifdef PRIVATEER_TEST_HOOKS
 			if (detail_region::commit_phase_hook != nullptr) {
 				detail_region::commit_phase_hook(phase);
 			}
+#endif
 		}
 
 	}  // namespace
@@ -108,7 +121,7 @@ namespace privateer {
 						hot.table.add_dirty();
 						void *const slot_addr =
 								reinterpret_cast<void *>(hot.segment_start + slot * hot.block_size);
-						if (detail_region::mprotect_fn(slot_addr, hot.block_size, PROT_READ | PROT_WRITE) != 0) {
+						if (protect_slot_for_write(slot_addr, hot.block_size) != 0) {
 							// The slot is dead. Balance the count, publish the
 							// terminal poisoned state so no waiter parks
 							// forever, record the failure, and forward.
@@ -617,6 +630,7 @@ namespace privateer {
 		return {};
 	}
 
+#ifdef PRIVATEER_TEST_HOOKS
 	namespace detail_region {
 
 		slot_table &table_of(region &reg) noexcept {
@@ -628,5 +642,6 @@ namespace privateer {
 		}
 
 	}  // namespace detail_region
+#endif
 
 }  // namespace privateer

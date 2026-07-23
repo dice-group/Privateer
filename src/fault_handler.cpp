@@ -169,6 +169,7 @@ namespace privateer {
 		return {};
 	}
 
+#ifdef PRIVATEER_TEST_HOOKS
 	namespace detail_fault_handler {
 
 		void uninstall_for_tests() noexcept {
@@ -184,5 +185,6 @@ namespace privateer {
 		}
 
 	}  // namespace detail_fault_handler
+#endif
 
 }  // namespace privateer

@@ -30,6 +30,7 @@ namespace privateer {
 	// the stack is released at thread exit.
 	result<> arm_thread_fault_stack();
 
+#ifdef PRIVATEER_TEST_HOOKS
 	namespace detail_fault_handler {
 
 		// Test-only: restores the saved dispositions and forgets the
@@ -38,6 +39,7 @@ namespace privateer {
 		void uninstall_for_tests() noexcept;
 
 	}  // namespace detail_fault_handler
+#endif
 
 }  // namespace privateer
 

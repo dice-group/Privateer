@@ -83,6 +83,12 @@ if (PRIVATEER_BUILD_LEGACY)
 endif ()
 
 if (PRIVATEER_BUILD_TESTING)
+    # Compile the test-only hooks into the library (failure-injection seams,
+    # crash-test kill points, internal accessors). PUBLIC so the library and
+    # every test executable agree on the declarations; excluded from consumer
+    # builds, which do not build the tests.
+    target_compile_definitions(privateer PUBLIC PRIVATEER_TEST_HOOKS=1)
+
     enable_testing()
     add_subdirectory(test)
 endif ()
