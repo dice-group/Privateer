@@ -22,6 +22,7 @@ add_executable(privateer_unit_tests
         logger_tests.cpp
         recipe_tests.cpp
         region_tests.cpp
+        region_write_tests.cpp
         slot_table_tests.cpp
         vm_tests.cpp
         word_wait_tests.cpp)

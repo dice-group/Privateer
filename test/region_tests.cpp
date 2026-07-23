@@ -6,6 +6,7 @@
 #include <privateer/vm.hpp>
 
 #include "support/sandbox.hpp"
+#include "support/store_builder.hpp"
 #include "support/temp_dir.hpp"
 
 #include <cstddef>
@@ -31,31 +32,8 @@ namespace {
 			return options;
 		}
 
-		// builds a committed datastore through the storage layer: one entry
-		// per element, a fill character for a block or nullopt for the empty
-		// sentinel
 		void build_store(std::vector<std::optional<char>> const &slots, uint64_t capacity_slots = 16) {
-			auto store = block_store::create(dir.path);
-			ASSERT_TRUE(store.has_value()) << to_string(store.error());
-			recipe rec;
-			rec.block_size = bs;
-			rec.capacity = capacity_slots * bs;
-			rec.size = slots.size() * bs;
-			rec.algorithm = hash_algorithm::xxh3_128;
-			std::vector<block_digest> names;
-			for (auto const &fill : slots) {
-				if (!fill) {
-					rec.entries.emplace_back();
-					continue;
-				}
-				std::vector<std::byte> const data(bs, static_cast<std::byte>(*fill));
-				auto const name = hash_block(rec.algorithm, data);
-				ASSERT_TRUE(store->publish(name, data));
-				names.push_back(name);
-				rec.entries.push_back(name);
-			}
-			ASSERT_TRUE(store->make_durable(names));
-			ASSERT_TRUE(rec.commit(dir.path, true));
+			privateer::testing::build_committed_store(dir.path, bs, slots, capacity_slots);
 		}
 
 		[[nodiscard]] static unsigned char read_byte(region const &reg, uint64_t offset) {
