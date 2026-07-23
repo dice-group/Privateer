@@ -37,7 +37,7 @@ namespace {
 		auto const block = random_block(len);
 		auto const copy = block;
 		for (auto _ : state) {
-			int const equal = std::memcmp(block.data(), copy.data(), len);
+			int equal = std::memcmp(block.data(), copy.data(), len);
 			benchmark::DoNotOptimize(equal);
 		}
 		state.SetBytesProcessed(static_cast<int64_t>(state.iterations() * len));

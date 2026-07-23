@@ -14,6 +14,7 @@ gtest_discover_tests(privateer_smoke_test)
 
 add_executable(privateer_unit_tests
         block_hash_tests.cpp
+        block_store_tests.cpp
         error_tests.cpp
         file_util_tests.cpp
         file_util_crash_tests.cpp
