@@ -6,6 +6,7 @@ option(PRIVATEER_BUILD_BENCHMARKS "Build the microbenchmarks" ${PROJECT_IS_TOP_L
 option(PRIVATEER_BUILD_LEGACY "Build the inherited v0.1 engine (Linux x86_64 only)" OFF)
 
 find_package(asio REQUIRED)
+find_package(Boost REQUIRED)
 find_package(blake3 REQUIRED)
 find_package(xxHash REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -15,6 +16,7 @@ find_package(Threads REQUIRED)
 add_library(privateer STATIC
         src/version.cpp
         src/block_hash.cpp
+        src/block_store.cpp
         src/error.cpp
         src/fault_handler.cpp
         src/file_util.cpp
@@ -40,7 +42,7 @@ target_compile_definitions(privateer PUBLIC
         ASIO_NO_DEPRECATED
 )
 target_compile_definitions(privateer PRIVATE PRIVATEER_VERSION="${PROJECT_VERSION}")
-target_link_libraries(privateer PUBLIC asio::asio Threads::Threads)
+target_link_libraries(privateer PUBLIC asio::asio Boost::headers Threads::Threads)
 target_link_libraries(privateer PRIVATE BLAKE3::blake3 xxHash::xxhash OpenSSL::Crypto rapidhash::rapidhash)
 
 if (PRIVATEER_BUILD_LEGACY)
@@ -49,7 +51,6 @@ if (PRIVATEER_BUILD_LEGACY)
     endif ()
 
     find_package(OpenMP REQUIRED)
-    find_package(Boost REQUIRED)
     find_package(spdlog REQUIRED)
 
     add_library(privateer-legacy STATIC

@@ -12,6 +12,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
 #include <string>
 
@@ -47,6 +48,17 @@ namespace privateer {
 		uint8_t size = 0;
 
 		friend bool operator==(block_digest const &, block_digest const &) = default;
+	};
+
+	// Hash functor for containers keyed by block_digest. The digest bytes
+	// are uniformly distributed already, so the first eight serve directly;
+	// every supported digest is at least eight bytes wide.
+	struct block_digest_hash {
+		size_t operator()(block_digest const &digest) const noexcept {
+			uint64_t word;
+			std::memcpy(&word, digest.bytes.data(), sizeof(word));
+			return static_cast<size_t>(word);
+		}
 	};
 
 	// hashes one block; alg must be a known algorithm
