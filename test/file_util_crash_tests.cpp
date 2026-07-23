@@ -56,7 +56,7 @@ namespace {
 		auto file = staged_file::create_in(dir);
 		ASSERT_TRUE(file.has_value()) << to_string(file.error());
 		ASSERT_TRUE(file->write(as_bytes(content)));
-		ASSERT_TRUE(file->sync(sync_policy::full));
+		ASSERT_TRUE(file->sync());
 		ASSERT_TRUE(file->publish(name, publish_mode::replace).value_or(false));
 	}
 
@@ -74,7 +74,7 @@ namespace {
 	TEST_P(StagedFileCrashTest, KilledBeforePublishLeavesOnlySweepableLitter) {
 		auto const res = PRIVATEER_SANDBOX {
 			auto file = staged_file::create_in(dir.path, GetParam());
-			if (!file || !file->write(as_bytes("doomed")) || !file->sync(sync_policy::full)) {
+			if (!file || !file->write(as_bytes("doomed")) || !file->sync()) {
 				return 1;
 			}
 			::raise(SIGKILL);
@@ -90,11 +90,11 @@ namespace {
 	TEST_P(StagedFileCrashTest, KilledAfterPublishKeepsTheFullContent) {
 		auto const res = PRIVATEER_SANDBOX {
 			auto file = staged_file::create_in(dir.path, GetParam());
-			if (!file || !file->write(as_bytes("survives")) || !file->sync(sync_policy::full)) {
+			if (!file || !file->write(as_bytes("survives")) || !file->sync()) {
 				return 1;
 			}
 			auto const published = file->publish("blob", publish_mode::fail_if_exists);
-			if (!published.value_or(false) || !sync_directory(dir.path, sync_policy::full)) {
+			if (!published.value_or(false) || !sync_directory(dir.path)) {
 				return 1;
 			}
 			::raise(SIGKILL);
@@ -112,7 +112,7 @@ namespace {
 
 		auto const res = PRIVATEER_SANDBOX {
 			auto file = staged_file::create_in(dir.path, GetParam());
-			if (!file || !file->write(as_bytes("new recipe")) || !file->sync(sync_policy::full)) {
+			if (!file || !file->write(as_bytes("new recipe")) || !file->sync()) {
 				return 1;
 			}
 			::raise(SIGKILL);
@@ -130,11 +130,11 @@ namespace {
 
 		auto const res = PRIVATEER_SANDBOX {
 			auto file = staged_file::create_in(dir.path, GetParam());
-			if (!file || !file->write(as_bytes("new recipe")) || !file->sync(sync_policy::full)) {
+			if (!file || !file->write(as_bytes("new recipe")) || !file->sync()) {
 				return 1;
 			}
 			auto const published = file->publish("recipe", publish_mode::replace);
-			if (!published.value_or(false) || !sync_directory(dir.path, sync_policy::full)) {
+			if (!published.value_or(false) || !sync_directory(dir.path)) {
 				return 1;
 			}
 			::raise(SIGKILL);

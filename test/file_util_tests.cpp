@@ -60,12 +60,12 @@ namespace {
 		auto file = staged_file::create_in(dir.path, GetParam());
 		ASSERT_TRUE(file.has_value()) << to_string(file.error());
 		ASSERT_TRUE(file->write(as_bytes("hello block")));
-		ASSERT_TRUE(file->sync(sync_policy::full));
+		ASSERT_TRUE(file->sync());
 
 		auto const published = file->publish("blob", publish_mode::fail_if_exists);
 		ASSERT_TRUE(published.has_value()) << to_string(published.error());
 		EXPECT_TRUE(*published);
-		ASSERT_TRUE(sync_directory(dir.path, sync_policy::full));
+		ASSERT_TRUE(sync_directory(dir.path));
 
 		EXPECT_EQ(slurp(dir.path / "blob"), "hello block");
 		EXPECT_EQ(entries(dir.path), std::vector<std::string>{"blob"});
@@ -118,7 +118,7 @@ namespace {
 		auto second = staged_file::create_in(dir.path, GetParam());
 		ASSERT_TRUE(second.has_value());
 		ASSERT_TRUE(second->write(as_bytes("new recipe")));
-		ASSERT_TRUE(second->sync(sync_policy::full));
+		ASSERT_TRUE(second->sync());
 		auto const published = second->publish("recipe", publish_mode::replace);
 		ASSERT_TRUE(published.has_value()) << to_string(published.error());
 		EXPECT_TRUE(*published);
@@ -167,7 +167,7 @@ namespace {
 		auto file = staged_file::create_in(dir.path, GetParam());
 		ASSERT_TRUE(file.has_value());
 		ASSERT_TRUE(file->write(as_bytes(payload)));
-		ASSERT_TRUE(file->sync(sync_policy::full));
+		ASSERT_TRUE(file->sync());
 		ASSERT_TRUE(file->publish("big", publish_mode::fail_if_exists).value_or(false));
 
 		EXPECT_EQ(slurp(dir.path / "big"), payload);
@@ -196,34 +196,32 @@ namespace {
 		EXPECT_FALSE(named->anonymous());
 	}
 
-	TEST(FileUtil, SyncPoliciesSucceedOnFileAndDirectory) {
+	TEST(FileUtil, SyncSucceedsOnFileAndDirectory) {
 		privateer::testing::temp_dir dir;
 		auto const file_path = dir.path / "f";
 		int const fd = ::open(file_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
 		ASSERT_GE(fd, 0);
 		ASSERT_TRUE(write_all(fd, as_bytes("x")));
 
-		for (auto const policy : {sync_policy::full, sync_policy::fsync_only}) {
-			EXPECT_TRUE(sync_file(fd, policy));
-			EXPECT_TRUE(sync_directory(dir.path, policy));
-		}
+		EXPECT_TRUE(sync_file(fd));
+		EXPECT_TRUE(sync_directory(dir.path));
 
 		int const dirfd = ::open(dir.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 		ASSERT_GE(dirfd, 0);
-		EXPECT_TRUE(sync_directory(dirfd, sync_policy::full));
+		EXPECT_TRUE(sync_directory(dirfd));
 		::close(dirfd);
 		::close(fd);
 	}
 
 	TEST(FileUtil, SyncFileReportsABadFd) {
-		auto const res = sync_file(-1, sync_policy::full);
+		auto const res = sync_file(-1);
 		ASSERT_FALSE(res.has_value());
 		EXPECT_EQ(res.error().code, errc::io_error);
 		EXPECT_EQ(res.error().sys_errno, EBADF);
 	}
 
 	TEST(FileUtil, SyncDirectoryReportsAMissingPath) {
-		auto const res = sync_directory(std::filesystem::path{"/nonexistent/privateer-test"}, sync_policy::full);
+		auto const res = sync_directory(std::filesystem::path{"/nonexistent/privateer-test"});
 		ASSERT_FALSE(res.has_value());
 		EXPECT_EQ(res.error().code, errc::io_error);
 		EXPECT_EQ(res.error().sys_errno, ENOENT);

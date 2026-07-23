@@ -12,23 +12,8 @@ namespace privateer {
 
 	namespace {
 
-		// fsync with EINTR retry; on Darwin under sync_policy::full it tries
-		// F_FULLFSYNC first and falls back to fsync where the filesystem does
-		// not support it
-		int barrier(int fd, sync_policy policy) noexcept {
-#ifdef __APPLE__
-			if (policy == sync_policy::full) {
-				int rc;
-				do {
-					rc = ::fcntl(fd, F_FULLFSYNC);
-				} while (rc == -1 && errno == EINTR);
-				if (rc != -1) {
-					return 0;
-				}
-			}
-#else
-			(void) policy;
-#endif
+		// fsync with EINTR retry
+		int fsync_retry(int fd) noexcept {
 			int rc;
 			do {
 				rc = ::fsync(fd);
@@ -38,9 +23,8 @@ namespace privateer {
 
 	}  // namespace
 
-	result<> sync_file(int fd, sync_policy policy) noexcept {
+	result<> sync_file(int fd) noexcept {
 #ifdef __linux__
-		(void) policy;
 		int rc;
 		do {
 			rc = ::fdatasync(fd);
@@ -50,26 +34,26 @@ namespace privateer {
 		}
 		return {};
 #else
-		if (barrier(fd, policy) != 0) {
+		if (fsync_retry(fd) != 0) {
 			return fail_errno(errc::io_error, "fsync");
 		}
 		return {};
 #endif
 	}
 
-	result<> sync_directory(int dirfd, sync_policy policy) noexcept {
-		if (barrier(dirfd, policy) != 0) {
+	result<> sync_directory(int dirfd) noexcept {
+		if (fsync_retry(dirfd) != 0) {
 			return fail_errno(errc::io_error, "fsync directory");
 		}
 		return {};
 	}
 
-	result<> sync_directory(std::filesystem::path const &dir, sync_policy policy) {
+	result<> sync_directory(std::filesystem::path const &dir) {
 		int const dirfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 		if (dirfd < 0) {
 			return fail_errno(errc::io_error, "open directory");
 		}
-		auto res = sync_directory(dirfd, policy);
+		auto res = sync_directory(dirfd);
 		::close(dirfd);
 		return res;
 	}
@@ -167,8 +151,8 @@ namespace privateer {
 		return write_all(fd_, data);
 	}
 
-	result<> staged_file::sync(sync_policy policy) const noexcept {
-		return sync_file(fd_, policy);
+	result<> staged_file::sync() const noexcept {
+		return sync_file(fd_);
 	}
 
 	result<bool> staged_file::publish(std::string const &name, publish_mode mode) {

@@ -14,21 +14,18 @@
 
 namespace privateer {
 
-	// Darwin flavor of the data barrier. On Linux both values behave the same:
-	// fdatasync for files, fsync for directories. On Darwin, full uses
-	// fcntl(F_FULLFSYNC), which flushes the drive write cache; plain fsync on
-	// Darwin does not, so fsync_only trades durability for speed.
-	enum struct sync_policy : int {
-		full,
-		fsync_only,
-	};
+	// Data barrier for one file: fdatasync on Linux, fsync on macOS.
+	// On Linux the barrier writes the data to the device and flushes the
+	// device write cache, so it is durable at power loss. On macOS fsync does
+	// not flush the device write cache; only fcntl(F_FULLFSYNC) (very slow)
+	// does. fsync still survives process and OS crashes, and macOS is not a
+	// production target, so plain fsync is used there.
+	result<> sync_file(int fd) noexcept;
 
-	// data barrier for one file
-	result<> sync_file(int fd, sync_policy policy) noexcept;
-
-	// entry barrier for one directory: makes renames and links in it durable
-	result<> sync_directory(int dirfd, sync_policy policy) noexcept;
-	result<> sync_directory(std::filesystem::path const &dir, sync_policy policy);
+	// Entry barrier for one directory: makes renames and links in it durable.
+	// fsync on both platforms, with the macOS caveat of sync_file.
+	result<> sync_directory(int dirfd) noexcept;
+	result<> sync_directory(std::filesystem::path const &dir);
 
 	// writes all bytes, retrying short writes and EINTR
 	result<> write_all(int fd, std::span<std::byte const> data) noexcept;
@@ -74,7 +71,7 @@ namespace privateer {
 		[[nodiscard]] bool anonymous() const noexcept { return anonymous_; }
 
 		result<> write(std::span<std::byte const> data) const noexcept;
-		result<> sync(sync_policy policy) const noexcept;
+		result<> sync() const noexcept;
 
 		// Links the file under name in its directory and spends this object.
 		// Returns false only in fail_if_exists mode when the name is already
