@@ -10,8 +10,12 @@ find_package(Threads REQUIRED)
 add_library(privateer STATIC
         src/version.cpp
         src/error.cpp
+        src/fault_handler.cpp
         src/file_util.cpp
         src/logger.cpp
+        src/mlocked.cpp
+        src/region_registry.cpp
+        src/rlimits.cpp
         src/asio_src.cpp
 )
 add_library(privateer::privateer ALIAS privateer)
