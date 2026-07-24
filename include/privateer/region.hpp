@@ -130,6 +130,17 @@ namespace privateer {
 		// size is persisted by the next commit.
 		result<> extend(uint64_t target_size);
 
+		// Frees the whole slots fully covered by [offset, offset + nbytes):
+		// each is remapped to fresh anonymous zeros now, its old block file
+		// becomes reclaimable at the next durable commit, and reads observe
+		// zeros. Partially covered slots stay untouched (a documented
+		// divergence: sub-slot frees reclaim nothing; metall's allocator
+		// never reads freed memory expecting content). Best-effort and safe
+		// against concurrent writers: a write racing the free either lands
+		// in the discarded pages or materializes the fresh zeros. Callable
+		// concurrently with commits; fails on read-only and closing regions.
+		result<> free_region(uint64_t offset, uint64_t nbytes);
+
 		// Commits the region's content: captures every dirty slot, freezes
 		// it, writes changed blocks to the store, and atomically replaces
 		// the recipe. durable adds the durability barrier before the rename
