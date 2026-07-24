@@ -11,6 +11,7 @@
 #include <privateer/vm.hpp>
 #include <privateer/word_wait.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <mutex>
 #include <new>
@@ -441,6 +442,73 @@ namespace privateer {
 			st.hot->table.publish(i, slot_state::empty);
 		}
 		st.hot->table.set_extended_size(target);
+		return {};
+	}
+
+	result<> region::free_region(uint64_t offset, uint64_t nbytes) {
+		auto &st = *state_;
+		if (st.read_only) {
+			return fail(errc::invalid_argument, "free_region on a read-only region");
+		}
+
+		// The shutdown handshake. Both sides are seq_cst: with weaker
+		// orderings the counter increment and the closing store could each
+		// miss the other (the store-buffer case) and the free would proceed
+		// into teardown. Close waits this counter to zero before unmapping.
+		st.hot->record.free_in_flight.fetch_add(1, std::memory_order_seq_cst);
+		struct counter_guard {
+			std::atomic<uint32_t> &counter;
+			~counter_guard() { counter.fetch_sub(1, std::memory_order_release); }
+		} const guard{st.hot->record.free_in_flight};
+		if (st.hot->closing.load(std::memory_order_seq_cst) != 0) {
+			return fail(errc::shutting_down, "free_region on a closing region");
+		}
+
+		auto &table = st.hot->table;
+		uint64_t const block_size = st.rec.block_size;
+		uint64_t const size = table.extended_size();
+		if (offset >= size || nbytes == 0) {
+			return {};
+		}
+		nbytes = std::min(nbytes, size - offset);
+		// only slots fully inside the range; partial slots stay untouched
+		uint64_t const first_slot = (offset + block_size - 1) / block_size;
+		uint64_t const end_slot = (offset + nbytes) / block_size;
+		auto *const segment_base = static_cast<std::byte *>(segment());
+
+		for (uint64_t slot = first_slot; slot < end_slot; ++slot) {
+			slot_state prior;
+			for (;;) {
+				slot_state const state = table.load(slot);
+				if (state == slot_state::poisoned) {
+					return fail(errc::region_poisoned, "a slot is dead after a failed protection change");
+				}
+				if (is_transient(state)) {
+					(void) table.wait_changed(slot, state);
+					continue;
+				}
+				if (table.try_claim(slot, state, slot_state::freeing)) {
+					prior = state;
+					break;
+				}
+			}
+			// The claim precedes the remap, so no write can land during the
+			// replacement: a first touch waits on freeing, and in-flight
+			// writers cannot exist for a freed range (the allocator freed it).
+			if (auto mapped = map_anonymous(segment_base + slot * block_size, block_size, page_access::read);
+				!mapped) {
+				table.publish(slot, slot_state::poisoned);
+				if (prior == slot_state::dirty) {
+					table.sub_dirty();
+				}
+				st.hot->error.store(1, std::memory_order_release);
+				return std::unexpected{mapped.error()};
+			}
+			table.publish(slot, slot_state::dirty_empty);
+			if (prior == slot_state::dirty) {
+				table.sub_dirty();
+			}
+		}
 		return {};
 	}
 
