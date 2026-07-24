@@ -21,6 +21,9 @@
 
 #include <pthread.h>
 #include <sys/mman.h>
+#include <unistd.h>
+
+#include <boost/unordered/unordered_flat_set.hpp>
 
 namespace privateer {
 
@@ -70,6 +73,7 @@ namespace privateer {
 
 		int (*mprotect_fn)(void *, size_t, int) = ::mprotect;
 		void (*commit_phase_hook)(int) = nullptr;
+		int (*link_fn)(char const *, char const *) = ::link;
 
 	}  // namespace detail_region
 #endif
@@ -91,6 +95,48 @@ namespace privateer {
 				detail_region::commit_phase_hook(phase);
 			}
 #endif
+		}
+
+		int link_for_staging(char const *from, char const *to) {
+#ifdef PRIVATEER_TEST_HOOKS
+			return detail_region::link_fn(from, to);
+#else
+			return ::link(from, to);
+#endif
+		}
+
+		// Stages a self-contained segment: the shard skeleton, one hard link
+		// per referenced block (per-file copy where link fails: EXDEV across
+		// devices, EMLINK on an exhausted link count; the fallback unshares
+		// the block, trading space for correctness), and the synced recipe
+		// copy. The skeleton and links are not fsynced here: metall fsyncs
+		// the whole staged tree before it publishes the datastore; the
+		// recipe copy's content is the engine's own obligation.
+		result<> stage_segment(recipe const &rec, block_store const &src_store, fs::path const &dst_dir) {
+			std::error_code ec;
+			fs::create_directories(dst_dir, ec);
+			if (ec) {
+				return std::unexpected{error{errc::io_error, ec.value(), "create the staging directory"}};
+			}
+			auto dst_store = block_store::create(dst_dir, false);
+			if (!dst_store) {
+				return std::unexpected{dst_store.error()};
+			}
+			boost::unordered_flat_set<block_digest, block_digest_hash> staged;
+			for (auto const &entry : rec.entries) {
+				if (entry.size == 0 || !staged.insert(entry).second) {
+					continue;
+				}
+				fs::path const src = src_store.block_path(entry);
+				fs::path const dst = dst_store->block_path(entry);
+				if (link_for_staging(src.c_str(), dst.c_str()) != 0) {
+					fs::copy_file(src, dst, ec);
+					if (ec) {
+						return std::unexpected{error{errc::io_error, ec.value(), "stage a block copy"}};
+					}
+				}
+			}
+			return rec.commit(dst_dir, true);
 		}
 
 	}  // namespace
@@ -521,6 +567,11 @@ namespace privateer {
 			return {};
 		}
 		std::lock_guard const commit_lock{st.commit_mutex};
+		return commit_impl(durable);
+	}
+
+	result<> region::commit_impl(bool durable) {
+		auto &st = *state_;
 		if (!check_sanity()) {
 			return fail(errc::datastore_inconsistent, "the region error flag is set");
 		}
@@ -696,6 +747,35 @@ namespace privateer {
 			commit_phase_done(5);
 		}
 		return {};
+	}
+
+	result<> region::snapshot_to(fs::path const &staging_segment_dir) {
+		auto &st = *state_;
+		// Held across the commit and the link pass: a durable commit in
+		// between could reclaim a block the just-committed recipe still
+		// references, and the links would hit ENOENT.
+		std::lock_guard const commit_lock{st.commit_mutex};
+		if (!st.read_only) {
+			if (auto committed = commit_impl(true); !committed) {
+				return committed;
+			}
+		}
+		return stage_segment(st.rec, *st.store, staging_segment_dir);
+	}
+
+	result<> region::copy(fs::path const &src_segment_dir, fs::path const &dst_segment_dir) {
+		auto rec = recipe::load(src_segment_dir);
+		if (!rec) {
+			return std::unexpected{rec.error()};
+		}
+		auto src_store = block_store::open(src_segment_dir);
+		if (!src_store) {
+			return std::unexpected{src_store.error()};
+		}
+		if (auto validated = validate_blocks(*rec, *src_store); !validated) {
+			return std::unexpected{validated.error()};
+		}
+		return stage_segment(*rec, *src_store, dst_segment_dir);
 	}
 
 #ifdef PRIVATEER_TEST_HOOKS

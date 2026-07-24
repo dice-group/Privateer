@@ -75,6 +75,10 @@ namespace privateer {
 		// Crash tests kill the process inside it.
 		extern void (*commit_phase_hook)(int completed_phase);
 
+		// The hard-link syscall of the snapshot staging. Tests replace it to
+		// force the per-file copy fallback or to kill mid-staging.
+		extern int (*link_fn)(char const *from, char const *to);
+
 	}  // namespace detail_region
 #endif  // PRIVATEER_TEST_HOOKS
 
@@ -153,11 +157,29 @@ namespace privateer {
 		// this is a no-op success.
 		result<> commit(bool durable);
 
+		// Stages a self-contained copy of the region's committed state into
+		// staging_segment_dir: a durable commit runs first, then every
+		// referenced block file is hard-linked (per-file copy fallback where
+		// link fails) and the recipe copy is written and synced. Both steps
+		// run under the commit mutex, so no commit in between can reclaim a
+		// block the staged recipe references. The caller (metall) fsyncs the
+		// staged tree and publishes the datastore with one atomic rename.
+		result<> snapshot_to(std::filesystem::path const &staging_segment_dir);
+
+		// Stages a self-contained copy of an on-disk datastore that no
+		// writer holds open (metall keeps a shared lock on the source). The
+		// source is never mutated; link only bumps inode link counts.
+		static result<> copy(std::filesystem::path const &src_segment_dir,
+							 std::filesystem::path const &dst_segment_dir);
+
 	private:
 		region();
 
 		static result<region> open_impl(std::filesystem::path const &segment_dir,
 										region_options const &options, bool read_only);
+
+		// the commit phases; the caller holds the commit mutex
+		result<> commit_impl(bool durable);
 
 		struct state;
 		std::unique_ptr<state> state_;
