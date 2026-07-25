@@ -20,6 +20,7 @@ namespace privateer::testing {
 	inline void build_committed_store(std::filesystem::path const &segment_dir, uint64_t block_size,
 									  std::vector<std::optional<char>> const &slots,
 									  uint64_t capacity_slots = 16) {
+		std::filesystem::create_directories(segment_dir);
 		auto store = block_store::create(segment_dir);
 		ASSERT_TRUE(store.has_value()) << to_string(store.error());
 		recipe rec;

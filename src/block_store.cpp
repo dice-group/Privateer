@@ -69,7 +69,7 @@ namespace privateer {
 
 	}  // namespace
 
-	result<block_store> block_store::create(fs::path const &segment_dir) {
+	result<block_store> block_store::create(fs::path const &segment_dir, bool durable) {
 		fs::path blocks_dir = segment_dir / "blocks";
 		if (::mkdir(blocks_dir.c_str(), 0755) != 0) {
 			if (errno == EEXIST) {
@@ -82,15 +82,19 @@ namespace privateer {
 			if (::mkdir(shard.c_str(), 0755) != 0) {
 				return fail_errno(errc::io_error, "mkdir shard");
 			}
-			if (auto synced = sync_directory(shard); !synced) {
-				return std::unexpected{synced.error()};
+			if (durable) {
+				if (auto synced = sync_directory(shard); !synced) {
+					return std::unexpected{synced.error()};
+				}
 			}
 		}
-		if (auto synced = sync_directory(blocks_dir); !synced) {
-			return std::unexpected{synced.error()};
-		}
-		if (auto synced = sync_directory(segment_dir); !synced) {
-			return std::unexpected{synced.error()};
+		if (durable) {
+			if (auto synced = sync_directory(blocks_dir); !synced) {
+				return std::unexpected{synced.error()};
+			}
+			if (auto synced = sync_directory(segment_dir); !synced) {
+				return std::unexpected{synced.error()};
+			}
 		}
 		return block_store{std::move(blocks_dir)};
 	}

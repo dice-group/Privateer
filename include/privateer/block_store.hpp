@@ -32,8 +32,11 @@
 namespace privateer {
 
 	struct block_store {
-		// creates <segment_dir>/blocks with all shard directories, durably
-		static result<block_store> create(std::filesystem::path const &segment_dir);
+		// Creates <segment_dir>/blocks with all shard directories. durable
+		// syncs the skeleton up front, so commits never create directories;
+		// snapshot staging skips the syncs because metall fsyncs the whole
+		// staged tree before publishing it.
+		static result<block_store> create(std::filesystem::path const &segment_dir, bool durable = true);
 
 		// opens an existing store; every shard directory must be present
 		static result<block_store> open(std::filesystem::path const &segment_dir);
