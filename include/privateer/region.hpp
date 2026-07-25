@@ -63,6 +63,48 @@ namespace privateer {
 		std::chrono::nanoseconds backoff_cap = std::chrono::seconds{30};
 	};
 
+	// The memory governor. All watermarks are byte values; 0 disables the
+	// budget they belong to. The dirty budget is per region; the resident
+	// budget is a process-level target by construction.
+	//
+	// The dirty budget is exact: dirty bytes are slots in dirty or
+	// materializing state times block_size. It needs the cleaner, because
+	// the cleaner is what drains dirty bytes between commits. Above
+	// dirty_soft the cleaner is woken and writes back cold-first until
+	// dirty bytes are at or below dirty_low. A write fault that would take
+	// dirty bytes above dirty_hard waits in the fault handler until a
+	// decrease brings it below, bounded by hard_timeout; on timeout the
+	// write proceeds and overshoots by one block, so the ceiling is
+	// dirty_hard plus one block per concurrently blocked writer. A region
+	// close while a writer is blocked at the hard mark forwards that
+	// writer's fault as a crash: close requires quiesced writers.
+	//
+	// The resident budget is advisory and Linux only (Darwin has no
+	// non-destructive userspace trim): one process-level sweep serves every
+	// open region with a resident budget. It reads the process Pss from
+	// /proc/self/smaps_rollup, and above resident_soft it pushes resident
+	// pages of clean and empty slots out with MADV_PAGEOUT until the
+	// estimated trim reaches resident_low, splitting the effort across
+	// regions by their trimmable resident bytes. Residency is
+	// reader-inflatable, so there is no hard mark: the sweep converges, it
+	// does not enforce. When several regions set resident budgets, the
+	// sweep uses the smallest watermarks and the shortest interval.
+	struct governor_options {
+		// dirty budget, bytes; dirty_soft 0 disables it
+		uint64_t dirty_soft = 0;
+		uint64_t dirty_low = 0;
+		// hard watermark, bytes; 0 means writers never wait
+		uint64_t dirty_hard = 0;
+		// longest a writer waits at the hard mark before it overshoots
+		std::chrono::nanoseconds hard_timeout = std::chrono::milliseconds{100};
+
+		// resident budget, bytes, Linux only; resident_soft 0 disables it
+		uint64_t resident_soft = 0;
+		uint64_t resident_low = 0;
+		// cadence of the resident sweep
+		std::chrono::nanoseconds sweep_interval = std::chrono::seconds{1};
+	};
+
 	struct region_options {
 		// Datastore constants, written into the recipe header at create and
 		// adopted from the header at open. Set on open they must match the
@@ -92,6 +134,10 @@ namespace privateer {
 		// each slot was first seen dirty. Read-only opens have no dirty
 		// slots and ignore this.
 		cleaner_options cleaner;
+
+		// Memory budgets. Read-only opens have no dirty pages and ignore
+		// this; their residency is the kernel's to reclaim.
+		governor_options governor;
 	};
 
 	struct region;
@@ -143,6 +189,19 @@ namespace privateer {
 		// override_backoff ignores the re-dirty backoff. Returns the number
 		// of slots written back.
 		size_t run_cleaner_batch(region &reg, bool override_backoff);
+
+		// The resident sweep's process residency probe. Tests replace it to
+		// feed synthetic Pss values; the default reads /proc/self/smaps_rollup.
+		extern result<uint64_t> (*resident_bytes_fn)();
+
+		// The resident sweep's trim syscall. Tests replace it to count and
+		// to suppress the real MADV_PAGEOUT.
+		extern int (*pageout_fn)(void *addr, size_t len);
+
+		// Runs one resident sweep pass synchronously on the calling thread,
+		// regardless of the sweep interval. Returns the bytes the pass asked
+		// the kernel to push out.
+		uint64_t run_resident_sweep();
 
 	}  // namespace detail_region
 #endif  // PRIVATEER_TEST_HOOKS

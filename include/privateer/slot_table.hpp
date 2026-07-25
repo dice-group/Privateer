@@ -90,7 +90,9 @@ namespace privateer {
 		// faulting writer wins its materializing claim until it leaves dirty
 		// or materializing for a terminal state.
 		[[nodiscard]] uint64_t dirty_slots() const noexcept;
-		void add_dirty() noexcept;
+		// Increments and returns the new count, so the caller can detect
+		// the exact crossing of a watermark.
+		uint64_t add_dirty() noexcept;
 		// Decrements, then bumps the governor word and wakes it: writers
 		// blocked on the dirty budget recheck on every decrease.
 		void sub_dirty() noexcept;
@@ -98,6 +100,12 @@ namespace privateer {
 		// The word the governor's waiters park on. Waiting and waking go
 		// through word_wait and word_wake_all with a value read from here.
 		[[nodiscard]] std::atomic<uint32_t> &governor_word() noexcept;
+
+		// Bumps the governor word and wakes its waiters: the soft-mark
+		// crossing in the handler, and close releasing blocked waiters. The
+		// bump makes a wake between a waiter's value read and its park
+		// visible as a changed value.
+		void wake_governor() noexcept;
 
 		// The extended region size in bytes, a slot multiple. The fault
 		// handler gates on it before it reads any slot state, so it lives in

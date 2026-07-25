@@ -26,6 +26,7 @@ add_library(privateer STATIC
         src/recipe.cpp
         src/region.cpp
         src/region_registry.cpp
+        src/resident.cpp
         src/rlimits.cpp
         src/slot_table.cpp
         src/vm.cpp
