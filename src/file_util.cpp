@@ -10,7 +10,21 @@
 
 namespace privateer {
 
+#ifdef PRIVATEER_TEST_HOOKS
+	namespace detail_file_util {
+
+		std::atomic<uint64_t> sync_calls{0};
+
+	}  // namespace detail_file_util
+#endif
+
 	namespace {
+
+		void count_sync() noexcept {
+#ifdef PRIVATEER_TEST_HOOKS
+			detail_file_util::sync_calls.fetch_add(1, std::memory_order_relaxed);
+#endif
+		}
 
 		// fsync with EINTR retry
 		int fsync_retry(int fd) noexcept {
@@ -24,6 +38,7 @@ namespace privateer {
 	}  // namespace
 
 	result<> sync_file(int fd) noexcept {
+		count_sync();
 #ifdef __linux__
 		int rc;
 		do {
@@ -42,6 +57,7 @@ namespace privateer {
 	}
 
 	result<> sync_directory(int dirfd) noexcept {
+		count_sync();
 		if (fsync_retry(dirfd) != 0) {
 			return fail_errno(errc::io_error, "fsync directory");
 		}

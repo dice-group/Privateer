@@ -82,6 +82,8 @@ namespace privateer {
 		int (*mprotect_fn)(void *, size_t, int) = ::mprotect;
 		void (*commit_phase_hook)(int) = nullptr;
 		int (*link_fn)(char const *, char const *) = ::link;
+		int64_t (*clock_fn)() = monotonic_now_ns;
+		void (*cleaner_slot_hook)(size_t) = nullptr;
 
 	}  // namespace detail_region
 #endif
@@ -110,6 +112,23 @@ namespace privateer {
 			return detail_region::link_fn(from, to);
 #else
 			return ::link(from, to);
+#endif
+		}
+
+		// the cleaner's time source; tests replace it for deterministic backoff
+		int64_t cleaner_now_ns() {
+#ifdef PRIVATEER_TEST_HOOKS
+			return detail_region::clock_fn();
+#else
+			return monotonic_now_ns();
+#endif
+		}
+
+		void cleaner_slot_done([[maybe_unused]] size_t slot) {
+#ifdef PRIVATEER_TEST_HOOKS
+			if (detail_region::cleaner_slot_hook != nullptr) {
+				detail_region::cleaner_slot_hook(slot);
+			}
 #endif
 		}
 
@@ -251,6 +270,7 @@ namespace privateer {
 		size_t header_bytes = 0;
 		size_t vma_headroom = 0;
 		size_t commit_workers = 1;
+		cleaner_options cleaner;
 		bool read_only = false;
 		std::mutex region_mutex;  // serializes extend and close bookkeeping
 		std::mutex commit_mutex;  // one commit at a time; owns the recipe table and the store bookkeeping
@@ -361,6 +381,173 @@ namespace privateer {
 			}
 		}
 
+		[[nodiscard]] std::byte *segment_base() const noexcept {
+			return static_cast<std::byte *>(reservation.addr()) + header_bytes;
+		}
+
+		// Per-slot write-back bookkeeping, owned by the cleaner and guarded
+		// by the commit mutex. Times come from the cleaner's clock.
+		struct cleaner_slot_meta {
+			int64_t first_dirty_ns = -1;  // when the sweep first saw the slot dirty; -1 while not dirty
+			int64_t cleaned_at_ns = -1;   // when the cleaner last wrote the slot back; -1 never
+			int64_t backoff_ns = 0;       // the current re-dirty backoff; 0 none
+			int64_t eligible_at_ns = 0;   // not written back before this time, unless overridden
+		};
+		std::vector<cleaner_slot_meta> cleaner_meta;
+
+		// One write-back batch: scans for dirty slots, orders them coldest
+		// first, and runs the commit's capture and write-out for each, one
+		// slot at a time. The on-disk recipe is untouched; the recipe table
+		// entries the batch updates are picked up by the next commit, so a
+		// crash anywhere in here leaves only sweepable block files behind.
+		// override_backoff takes every dirty slot regardless of its backoff:
+		// the hard-watermark drain, where cleaner throughput must not wait
+		// out backoff timers. Returns the number of slots written back.
+		size_t clean_batch(bool override_backoff) {
+			std::lock_guard const commit_lock{commit_mutex};
+			if (hot->error.load(std::memory_order_acquire) != 0) {
+				return 0;
+			}
+			auto &table = hot->table;
+			uint64_t const block_size = rec.block_size;
+			int64_t const now = cleaner_now_ns();
+			size_t const slots = table.extended_size() / block_size;
+			if (cleaner_meta.size() < slots) {
+				cleaner_meta.resize(slots);
+			}
+			if (rec.entries.size() < slots) {
+				rec.entries.resize(slots);
+			}
+
+			// The sweep: record first-dirty times, apply the re-dirty rule,
+			// and collect the eligible victims. A slot that turns dirty again
+			// within backoff_cap of its last write-back waits backoff_base
+			// before it is eligible, doubling per repeat up to backoff_cap;
+			// a longer quiet period clears the backoff.
+			std::vector<size_t> victims;
+			for (size_t slot = 0; slot < slots; ++slot) {
+				auto &meta = cleaner_meta[slot];
+				if (table.load(slot) != slot_state::dirty) {
+					meta.first_dirty_ns = -1;
+					continue;
+				}
+				if (meta.first_dirty_ns < 0) {
+					meta.first_dirty_ns = now;
+					if (meta.cleaned_at_ns >= 0 && now - meta.cleaned_at_ns < cleaner.backoff_cap.count()) {
+						meta.backoff_ns = meta.backoff_ns == 0
+												  ? cleaner.backoff_base.count()
+												  : std::min(meta.backoff_ns * 2, cleaner.backoff_cap.count());
+					} else {
+						meta.backoff_ns = 0;
+					}
+					meta.eligible_at_ns = now + meta.backoff_ns;
+				}
+				if (override_backoff || now >= meta.eligible_at_ns) {
+					victims.push_back(slot);
+				}
+			}
+			std::sort(victims.begin(), victims.end(), [&](size_t a, size_t b) {
+				return cleaner_meta[a].first_dirty_ns < cleaner_meta[b].first_dirty_ns;
+			});
+			if (victims.size() > cleaner.batch_slots) {
+				victims.resize(cleaner.batch_slots);
+			}
+
+			size_t cleaned = 0;
+			std::vector<block_digest> written;
+			for (size_t const slot : victims) {
+				if (hot->closing.load(std::memory_order_acquire) != 0) {
+					break;
+				}
+				if (!table.try_claim(slot, slot_state::dirty, slot_state::syncing)) {
+					continue;  // the slot moved since the scan; its new owner has it
+				}
+				auto *const addr = segment_base() + slot * block_size;
+				// freeze: when mprotect returns, no core holds a stale
+				// writable entry, so the content below is what gets hashed
+				if (::mprotect(addr, block_size, PROT_READ) != 0) {
+					table.publish(slot, slot_state::poisoned);
+					table.sub_dirty();
+					hot->error.store(1, std::memory_order_release);
+					PRIVATEER_LOG(log_level::error, "cleaner cannot freeze slot {} (errno {})", slot, errno);
+					break;
+				}
+				std::span<std::byte const> const content{addr, block_size};
+				auto const name = hash_block(rec.algorithm, content);
+				auto &entry = rec.entries[slot];
+				if (name != entry) {
+					if (auto published = store->publish(name, content); !published) {
+						// Nothing is lost: the slot goes back to dirty and the
+						// next commit retries the write-out and reports the
+						// failure to a caller.
+						PRIVATEER_LOG(log_level::warning, "cleaner cannot write slot {} back: {}", slot,
+									  to_string(published.error()));
+						if (::mprotect(addr, block_size, PROT_READ | PROT_WRITE) != 0) {
+							table.publish(slot, slot_state::poisoned);
+							table.sub_dirty();
+							hot->error.store(1, std::memory_order_release);
+						} else {
+							table.publish(slot, slot_state::dirty);
+						}
+						break;
+					}
+					if (entry.size != 0) {
+						store->drop_reference(entry);
+					}
+					store->add_reference(name);
+					entry = name;
+				}
+				if (auto mapped = map_block_file(addr, block_size, store->block_path(entry)); !mapped) {
+					table.publish(slot, slot_state::poisoned);
+					table.sub_dirty();
+					hot->error.store(1, std::memory_order_release);
+					PRIVATEER_LOG(log_level::error, "cleaner cannot remap slot {}: {}", slot,
+								  to_string(mapped.error()));
+					break;
+				}
+				table.publish(slot, slot_state::clean);
+				table.sub_dirty();
+				auto &meta = cleaner_meta[slot];
+				meta.cleaned_at_ns = now;
+				meta.first_dirty_ns = -1;
+				written.push_back(entry);
+				++cleaned;
+				cleaner_slot_done(slot);
+			}
+
+			// Eager durability: the full durable-name contract for what the
+			// batch wrote, both halves batched (the file contents, then the
+			// shard directory entries). A name recorded after only the file
+			// sync would let a later durable commit skip the directory sync.
+			if (cleaner.mode == cleaner_mode::eager_durable && !written.empty()) {
+				if (auto synced = store->make_durable(written); !synced) {
+					// A failed sync leaves the durability of the written
+					// blocks unknown, and a retried sync cannot be trusted
+					// once the kernel may have dropped the dirty pages.
+					hot->error.store(1, std::memory_order_release);
+					PRIVATEER_LOG(log_level::error, "cleaner durability barrier failed: {}",
+								  to_string(synced.error()));
+				}
+			}
+			return cleaned;
+		}
+
+		// The background write-back chain: a timer tick posts one batch on
+		// the work pool, and the batch re-arms the timer. Both links refuse
+		// to run once closing is set, so the chain ends at close, and every
+		// link is counted and joined there.
+		void schedule_cleaner() {
+			start_timer(cleaner.interval, [this](bool aborted) {
+				if (aborted) {
+					return;
+				}
+				post_task([this] {
+					(void) clean_batch(false);
+					schedule_cleaner();
+				});
+			});
+		}
+
 		~state() {
 			if (hot != nullptr) {
 				// New faults forward as crashes from here on; the
@@ -443,6 +630,15 @@ namespace privateer {
 		if (rec->block_size % page_size() != 0) {
 			return fail(errc::option_mismatch, "block_size is not a multiple of this host's page size");
 		}
+		if (options.cleaner.mode != cleaner_mode::off) {
+			if (options.cleaner.interval.count() <= 0 || options.cleaner.batch_slots == 0) {
+				return fail(errc::invalid_argument, "the cleaner needs a positive interval and batch size");
+			}
+			if (options.cleaner.backoff_base.count() < 0 ||
+				options.cleaner.backoff_base > options.cleaner.backoff_cap) {
+				return fail(errc::invalid_argument, "cleaner backoff_base must lie within [0, backoff_cap]");
+			}
+		}
 		uint64_t const slot_count = rec->capacity / rec->block_size;
 		if (slot_count == 0) {
 			return fail(errc::datastore_inconsistent, "capacity is smaller than one slot");
@@ -495,6 +691,7 @@ namespace privateer {
 		st.commit_workers = options.commit_workers != 0
 									? options.commit_workers
 									: std::max<size_t>(1, std::thread::hardware_concurrency());
+		st.cleaner = options.cleaner;
 		st.read_only = read_only;
 		st.store = std::move(*store);
 
@@ -562,6 +759,10 @@ namespace privateer {
 				return std::unexpected{added.error()};
 			}
 			st.registered = true;
+
+			if (st.cleaner.mode != cleaner_mode::off) {
+				st.schedule_cleaner();
+			}
 		}
 		return reg;
 	}
@@ -1040,6 +1241,10 @@ namespace privateer {
 		void start_timer(region &reg, std::chrono::nanoseconds delay,
 						 std::function<void(bool aborted)> handler) {
 			reg.state_->start_timer(delay, std::move(handler));
+		}
+
+		size_t run_cleaner_batch(region &reg, bool override_backoff) {
+			return reg.state_->clean_batch(override_backoff);
 		}
 
 	}  // namespace detail_region
