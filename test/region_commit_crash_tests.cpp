@@ -28,7 +28,9 @@ namespace {
 	// 3 barrier, 4 rename, 5 reclaim)
 	int g_kill_after_phase = 0;
 
-	struct RegionCommitCrashTest : ::testing::Test {
+	// parameter: the commit worker count, covering the single-threaded and
+	// the fanned-out write-out
+	struct RegionCommitCrashTest : ::testing::TestWithParam<size_t> {
 		privateer::testing::temp_dir dir;
 		uint64_t const bs = page_size();
 
@@ -47,7 +49,7 @@ namespace {
 						::raise(SIGKILL);
 					}
 				};
-				auto reg = region::open(dir.path);
+				auto reg = region::open(dir.path, {.commit_workers = GetParam()});
 				if (!reg) {
 					return 10;
 				}
@@ -71,41 +73,44 @@ namespace {
 		}
 	};
 
-	TEST_F(RegionCommitCrashTest, DurableKilledAfterCaptureChangesNothing) {
+	TEST_P(RegionCommitCrashTest, DurableKilledAfterCaptureChangesNothing) {
 		run_killed_at(1, true);
 		check_state('b', 2, 2);
 	}
 
-	TEST_F(RegionCommitCrashTest, DurableKilledAfterWriteOutKeepsTheOldRecipe) {
+	TEST_P(RegionCommitCrashTest, DurableKilledAfterWriteOutKeepsTheOldRecipe) {
 		run_killed_at(2, true);
 		check_state('b', 3, 2);  // the block holding 'c' is swept garbage
 	}
 
-	TEST_F(RegionCommitCrashTest, DurableKilledAfterTheBarrierKeepsTheOldRecipe) {
+	TEST_P(RegionCommitCrashTest, DurableKilledAfterTheBarrierKeepsTheOldRecipe) {
 		run_killed_at(3, true);
 		check_state('b', 3, 2);  // durable but unreferenced: still swept
 	}
 
-	TEST_F(RegionCommitCrashTest, DurableKilledAfterTheRenameShowsTheNewContent) {
+	TEST_P(RegionCommitCrashTest, DurableKilledAfterTheRenameShowsTheNewContent) {
 		run_killed_at(4, true);
 		check_state('c', 3, 2);  // the retired 'b' block is not yet reclaimed
 	}
 
-	TEST_F(RegionCommitCrashTest, DurableKilledAfterReclaimLeavesNoGarbage) {
+	TEST_P(RegionCommitCrashTest, DurableKilledAfterReclaimLeavesNoGarbage) {
 		run_killed_at(5, true);
 		check_state('c', 2, 2);
 	}
 
-	TEST_F(RegionCommitCrashTest, NonDurableKilledAfterWriteOutKeepsTheOldRecipe) {
+	TEST_P(RegionCommitCrashTest, NonDurableKilledAfterWriteOutKeepsTheOldRecipe) {
 		run_killed_at(2, false);
 		check_state('b', 3, 2);
 	}
 
-	TEST_F(RegionCommitCrashTest, NonDurableKilledAfterTheRenameShowsTheNewContent) {
+	TEST_P(RegionCommitCrashTest, NonDurableKilledAfterTheRenameShowsTheNewContent) {
 		// a non-durable commit never unlinks, so the retired 'b' block
 		// survives as sweepable garbage
 		run_killed_at(4, false);
 		check_state('c', 3, 2);
 	}
+
+	INSTANTIATE_TEST_SUITE_P(CommitWorkers, RegionCommitCrashTest,
+							 ::testing::Values(size_t{1}, size_t{4}));
 
 }  // namespace

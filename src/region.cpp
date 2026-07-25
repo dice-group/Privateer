@@ -1,6 +1,7 @@
 #include <privateer/region.hpp>
 
 #include <privateer/block_store.hpp>
+#include <privateer/executor.hpp>
 #include <privateer/fault_handler.hpp>
 #include <privateer/handler_text.hpp>
 #include <privateer/logger.hpp>
@@ -13,11 +14,18 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <span>
+#include <thread>
 #include <utility>
 #include <vector>
+
+#include <asio/post.hpp>
+#include <asio/steady_timer.hpp>
 
 #include <pthread.h>
 #include <sys/mman.h>
@@ -204,12 +212,18 @@ namespace privateer {
 			}
 		}
 
+		// Set in the fork child. The executor pools' threads do not survive
+		// a fork, so a region opened in the child must never wait on a
+		// posted task; its commits run on the committing thread.
+		std::atomic<bool> g_fork_child{false};
+
 		// The engine is fork-unsafe: memory locks are not inherited, no
 		// executor thread survives into the child, and held mutexes stay
 		// locked. The child handler marks every open region so misuse fails
 		// loudly instead of hanging or corrupting. Lock-free, because the
 		// parent may fork while another thread holds the registry mutex.
 		void poison_regions_in_fork_child() noexcept {
+			g_fork_child.store(true, std::memory_order_release);
 			global_registry().visit([](region_record &rec) {
 				if (rec.fork_poison != nullptr) {
 					rec.fork_poison->store(1, std::memory_order_release);
@@ -236,17 +250,129 @@ namespace privateer {
 		vm_reservation reservation;
 		size_t header_bytes = 0;
 		size_t vma_headroom = 0;
+		size_t commit_workers = 1;
 		bool read_only = false;
 		std::mutex region_mutex;  // serializes extend and close bookkeeping
 		std::mutex commit_mutex;  // one commit at a time; owns the recipe table and the store bookkeeping
 
+		// Detached tasks the region owns on the executor: counted here,
+		// joined at close. The commit write-out workers are not detached;
+		// the commit itself joins them before it returns. The counter is
+		// heap-shared with every task: the final decrement releases the
+		// joiner, so the wake after it must touch memory the task co-owns,
+		// not the region state the joiner may already be destroying.
+		std::shared_ptr<std::atomic<uint32_t>> outstanding_tasks{
+				std::make_shared<std::atomic<uint32_t>>(0)};
+		std::mutex timer_mutex;
+		std::vector<std::shared_ptr<asio::steady_timer>> timers;
+
+		// the task's last action; only the co-owned counter is touched
+		static void count_task_out(std::shared_ptr<std::atomic<uint32_t>> const &counter) {
+			if (counter->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+				word_wake_all(*counter);
+			}
+		}
+
+		// Posts a region-owned task on the work pool. A task that starts
+		// after closing is set runs as a no-op; a throwing body records the
+		// error flag. Both ways the task is counted out, so close never
+		// waits on a task that will not signal.
+		void post_task(std::function<void()> fn) {
+			outstanding_tasks->fetch_add(1, std::memory_order_relaxed);
+			try {
+				asio::post(work_pool(), [this, counter = outstanding_tasks, fn = std::move(fn)] {
+					if (hot->closing.load(std::memory_order_acquire) == 0) {
+						try {
+							fn();
+						} catch (...) {
+							hot->error.store(1, std::memory_order_release);
+						}
+					}
+					count_task_out(counter);
+				});
+			} catch (...) {
+				count_task_out(outstanding_tasks);
+				throw;
+			}
+		}
+
+		// Arms a one-shot timer on the timer pool. The handler always runs
+		// exactly once and is counted like a task; aborted is true when the
+		// wait was cancelled or closing began before the handler ran, and
+		// the handler must not touch the region beyond its own bookkeeping
+		// then.
+		void start_timer(std::chrono::nanoseconds delay, std::function<void(bool aborted)> handler) {
+			auto timer = std::make_shared<asio::steady_timer>(timer_pool(), delay);
+			{
+				std::lock_guard const lock{timer_mutex};
+				if (hot->closing.load(std::memory_order_acquire) != 0) {
+					return;  // close has already cancelled the registered timers
+				}
+				timers.push_back(timer);
+			}
+			outstanding_tasks->fetch_add(1, std::memory_order_relaxed);
+			try {
+				timer->async_wait([this, timer, counter = outstanding_tasks,
+								   handler = std::move(handler)](std::error_code const &ec) {
+					bool const aborted =
+							static_cast<bool>(ec) || hot->closing.load(std::memory_order_acquire) != 0;
+					try {
+						handler(aborted);
+					} catch (...) {
+						hot->error.store(1, std::memory_order_release);
+					}
+					{
+						std::lock_guard const lock{timer_mutex};
+						std::erase(timers, timer);
+					}
+					count_task_out(counter);
+				});
+			} catch (...) {
+				{
+					std::lock_guard const lock{timer_mutex};
+					std::erase(timers, timer);
+				}
+				count_task_out(outstanding_tasks);
+				throw;
+			}
+		}
+
+		// Cancels every registered timer. The cancel is posted to the timer
+		// pool because a timer object is not safe against concurrent calls;
+		// the one timer thread serializes the cancel with the handlers.
+		void cancel_timers() {
+			std::vector<std::shared_ptr<asio::steady_timer>> snapshot;
+			{
+				std::lock_guard const lock{timer_mutex};
+				snapshot = timers;
+			}
+			for (auto const &timer : snapshot) {
+				asio::post(timer_pool(), [timer] { timer->cancel(); });
+			}
+		}
+
+		void join_tasks() {
+			for (;;) {
+				uint32_t const outstanding = outstanding_tasks->load(std::memory_order_acquire);
+				if (outstanding == 0) {
+					return;
+				}
+				(void) word_wait(*outstanding_tasks, outstanding);
+			}
+		}
+
 		~state() {
 			if (hot != nullptr) {
+				// New faults forward as crashes from here on; the
+				// application has quiesced its readers and writers.
+				hot->closing.store(1, std::memory_order_seq_cst);
+				word_wake_all(hot->table.governor_word());
+				// Tasks that have not started yet run as no-ops; timer
+				// handlers complete with aborted set. The join waits both
+				// kinds out, so nothing touches the region past this point.
+				cancel_timers();
+				join_tasks();
 				if (registered) {
-					// New faults forward as crashes from here on; the
-					// application has quiesced its readers and writers.
-					hot->closing.store(1, std::memory_order_seq_cst);
-					word_wake_all(hot->table.governor_word());
 					global_registry().remove(hot->record);
 				}
 				hot->~region_hot();
@@ -366,6 +492,9 @@ namespace privateer {
 		st.reservation = std::move(*reservation);
 		st.header_bytes = header_bytes;
 		st.vma_headroom = options.vma_headroom;
+		st.commit_workers = options.commit_workers != 0
+									? options.commit_workers
+									: std::max<size_t>(1, std::thread::hardware_concurrency());
 		st.read_only = read_only;
 		st.store = std::move(*store);
 
@@ -410,6 +539,12 @@ namespace privateer {
 			if (*swept > 0) {
 				PRIVATEER_LOG(log_level::info, "open-time sweep removed {} unreferenced files", *swept);
 			}
+
+			// Construct the process-wide pools before the region exists, so
+			// a region owned by a static object constructed after this call
+			// finds them alive when it is destroyed at static teardown.
+			(void) work_pool();
+			(void) timer_pool();
 
 			// arm the write barrier
 			if (auto installed = install_fault_handler(); !installed) {
@@ -674,46 +809,155 @@ namespace privateer {
 		}
 		commit_phase_done(1);
 
-		// Phase 2: write-out with per-slot release. A writer parked on a
-		// captured slot resumes as soon as its own slot publishes.
-		for (size_t idx = 0; idx < captured.size(); ++idx) {
-			auto const &cap = captured[idx];
-			auto &entry = st.rec.entries[cap.slot];
-			if (cap.empty) {
-				if (entry.size != 0) {
-					st.store->drop_reference(entry);
-					entry = block_digest{};
-				}
-				// the fresh anonymous zero mapping is already in place
-				table.publish(cap.slot, slot_state::empty);
-				continue;
+		// Phase 2: write-out with per-slot release, fanned out over the
+		// commit workers. Each worker pulls the next captured slot, hashes,
+		// publishes, remaps, and releases it; a writer parked on a captured
+		// slot resumes as soon as its own slot publishes. A worker writes
+		// only its own slot's recipe entry; the reference bookkeeping is
+		// recorded per worker and applied after the join, so the store's
+		// bookkeeping keeps a single owner.
+		struct ref_delta {
+			block_digest drop{};  // size zero: nothing to drop
+			block_digest add{};   // size zero: nothing to add
+		};
+		struct worker_result {
+			std::vector<ref_delta> deltas;
+			std::optional<error> err;
+		};
+		// The pools' threads do not survive a fork; in a fork child the
+		// write-out stays on the committing thread.
+		size_t const configured_workers =
+				g_fork_child.load(std::memory_order_acquire) ? 1 : st.commit_workers;
+		size_t const worker_count = std::max<size_t>(1, std::min(configured_workers, captured.size()));
+		std::vector<worker_result> results(worker_count);
+		std::atomic<size_t> next_capture{0};
+		std::atomic<uint32_t> write_out_failed{0};
+		// Heap-shared join counter: the final decrement releases the
+		// committing thread, whose frame may be gone by the time the wake
+		// after it runs, so nothing past the decrement may touch the frame.
+		auto const workers_left =
+				std::make_shared<std::atomic<uint32_t>>(static_cast<uint32_t>(worker_count));
+		auto const count_worker_out = [workers_left] {
+			if (workers_left->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+				word_wake_all(*workers_left);
 			}
-			std::span<std::byte const> const content{slot_addr(cap.slot), block_size};
-			auto const name = hash_block(st.rec.algorithm, content);
-			if (name != entry) {
-				if (auto published = st.store->publish(name, content); !published) {
-					restore_range(idx, captured.size());
-					return std::unexpected{published.error()};
+		};
+
+		auto const write_out = [&](worker_result &res) {
+			for (;;) {
+				if (write_out_failed.load(std::memory_order_acquire) != 0) {
+					return;
 				}
-				if (entry.size != 0) {
-					st.store->drop_reference(entry);
+				size_t const idx = next_capture.fetch_add(1, std::memory_order_relaxed);
+				if (idx >= captured.size()) {
+					return;
 				}
-				st.store->add_reference(name);
-				entry = name;
-			}
-			// One MAP_FIXED call replaces the private pages with the named
-			// block file; a concurrent reader either reads the old identical
-			// bytes or blocks inside its fault, never an unmapped window.
-			if (auto mapped = map_block_file(slot_addr(cap.slot), block_size, st.store->block_path(entry));
-				!mapped) {
-				table.publish(cap.slot, slot_state::poisoned);
+				auto const &cap = captured[idx];
+				auto &entry = st.rec.entries[cap.slot];
+				if (cap.empty) {
+					if (entry.size != 0) {
+						res.deltas.push_back({entry, block_digest{}});
+						entry = block_digest{};
+					}
+					// the fresh anonymous zero mapping is already in place
+					table.publish(cap.slot, slot_state::empty);
+					continue;
+				}
+				std::span<std::byte const> const content{slot_addr(cap.slot), block_size};
+				auto const name = hash_block(st.rec.algorithm, content);
+				if (name != entry) {
+					if (auto published = st.store->publish(name, content); !published) {
+						res.err = published.error();
+						write_out_failed.store(1, std::memory_order_release);
+						return;
+					}
+					res.deltas.push_back({entry, name});
+					entry = name;
+				}
+				// One MAP_FIXED call replaces the private pages with the
+				// named block file; a concurrent reader either reads the old
+				// identical bytes or blocks inside its fault, never an
+				// unmapped window.
+				if (auto mapped =
+							map_block_file(slot_addr(cap.slot), block_size, st.store->block_path(entry));
+					!mapped) {
+					table.publish(cap.slot, slot_state::poisoned);
+					table.sub_dirty();
+					st.hot->error.store(1, std::memory_order_release);
+					res.err = mapped.error();
+					write_out_failed.store(1, std::memory_order_release);
+					return;
+				}
+				table.publish(cap.slot, slot_state::clean);
 				table.sub_dirty();
-				st.hot->error.store(1, std::memory_order_release);
-				restore_range(idx + 1, captured.size());
-				return std::unexpected{mapped.error()};
 			}
-			table.publish(cap.slot, slot_state::clean);
-			table.sub_dirty();
+		};
+		auto const run_worker = [&](worker_result &res) {
+			try {
+				write_out(res);
+			} catch (...) {
+				// allocation failure in the delta recording; the slot in
+				// flight stays syncing and is restored after the join
+				if (!res.err) {
+					res.err = error{errc::io_error, ENOMEM, "commit write-out worker"};
+				}
+				write_out_failed.store(1, std::memory_order_release);
+			}
+		};
+
+		for (size_t w = 1; w < worker_count; ++w) {
+			asio::post(work_pool(), [&run_worker, &results, w, count_worker_out] {
+				run_worker(results[w]);
+				count_worker_out();
+			});
+		}
+		run_worker(results[0]);
+		count_worker_out();
+		for (;;) {
+			uint32_t const left = workers_left->load(std::memory_order_acquire);
+			if (left == 0) {
+				break;
+			}
+			(void) word_wait(*workers_left, left);
+		}
+
+		for (auto const &res : results) {
+			for (auto const &delta : res.deltas) {
+				if (delta.drop.size != 0) {
+					st.store->drop_reference(delta.drop);
+				}
+				if (delta.add.size != 0) {
+					st.store->add_reference(delta.add);
+				}
+			}
+		}
+		if (write_out_failed.load(std::memory_order_acquire) != 0) {
+			// Restore every captured slot the write-out did not release, so
+			// no waiter parks forever; released slots keep their release.
+			// Only this commit moves a slot out of syncing, so the state
+			// identifies the unreleased ones exactly.
+			for (auto const &cap : captured) {
+				if (table.load(cap.slot) != slot_state::syncing) {
+					continue;
+				}
+				if (cap.empty) {
+					table.publish(cap.slot, slot_state::dirty_empty);
+					continue;
+				}
+				if (::mprotect(slot_addr(cap.slot), block_size, PROT_READ | PROT_WRITE) != 0) {
+					table.publish(cap.slot, slot_state::poisoned);
+					table.sub_dirty();
+					st.hot->error.store(1, std::memory_order_release);
+					continue;
+				}
+				table.publish(cap.slot, slot_state::dirty);
+			}
+			for (auto const &res : results) {
+				if (res.err) {
+					return std::unexpected{*res.err};
+				}
+			}
+			return fail(errc::io_error, "commit write-out failed");
 		}
 		commit_phase_done(2);
 
@@ -787,6 +1031,15 @@ namespace privateer {
 
 		bool deliver_fault(region &reg, uintptr_t addr, int signo) noexcept {
 			return region_on_fault(reg.state_->hot->record, addr, signo);
+		}
+
+		void post_task(region &reg, std::function<void()> fn) {
+			reg.state_->post_task(std::move(fn));
+		}
+
+		void start_timer(region &reg, std::chrono::nanoseconds delay,
+						 std::function<void(bool aborted)> handler) {
+			reg.state_->start_timer(delay, std::move(handler));
 		}
 
 	}  // namespace detail_region

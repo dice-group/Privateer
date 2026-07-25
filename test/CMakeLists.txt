@@ -23,6 +23,7 @@ add_executable(privateer_unit_tests
         recipe_tests.cpp
         region_commit_crash_tests.cpp
         region_commit_tests.cpp
+        region_executor_tests.cpp
         region_free_tests.cpp
         region_snapshot_tests.cpp
         region_tests.cpp
