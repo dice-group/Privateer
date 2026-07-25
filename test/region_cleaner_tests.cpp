@@ -427,16 +427,19 @@ namespace {
 			}
 			last.store(v, std::memory_order_release);
 		}};
-		// batches race the writer's first two thousand iterations; the
-		// writer always makes progress because a fault waits out at most
-		// one write-back of its own slot
+		// Wait until the writer is live, then keep racing until twenty
+		// write-backs happened mid-stream. Both sides always progress: the
+		// writer re-dirties the slot right after every clean, and a fault
+		// waits out at most one write-back of its own slot.
+		while (iterations.load(std::memory_order_acquire) == 0) {
+			std::this_thread::yield();
+		}
 		size_t cleaned = 0;
-		while (iterations.load(std::memory_order_acquire) < 2000) {
+		while (cleaned < 20) {
 			cleaned += detail_region::run_cleaner_batch(*reg, true);
 		}
 		stop.store(true, std::memory_order_release);
 		writer.join();
-		EXPECT_GT(cleaned, 0u);  // the race was real: write-backs happened mid-stream
 
 		ASSERT_TRUE(reg->commit(true));
 		auto reopened = region::open(dir.path);
