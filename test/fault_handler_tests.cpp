@@ -238,9 +238,11 @@ namespace {
 		anon_mapping placeholder{page_size(), PROT_NONE};
 
 		std::atomic<bool> stop{false};
+		std::atomic<bool> storm_dead{false};
 		std::atomic<uint64_t> faults{0};
 		std::thread storm{[&] {
 			if (!arm_thread_fault_stack()) {
+				storm_dead.store(true, std::memory_order_release);
 				return;
 			}
 			while (!stop.load(std::memory_order_acquire)) {
@@ -249,6 +251,19 @@ namespace {
 				faults.fetch_add(1, std::memory_order_relaxed);
 			}
 		}};
+
+		// The churn must overlap live faults, so it starts only after the
+		// storm took its first one; without this wait the 200 add/remove
+		// pairs can finish before the storm thread is even scheduled.
+		while (faults.load(std::memory_order_acquire) == 0 &&
+			   !storm_dead.load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+		}
+		if (storm_dead.load(std::memory_order_acquire)) {
+			storm.join();
+			global_registry().remove(storm_rec);
+			FAIL() << "the storm thread could not arm its fault stack";
+		}
 
 		// every remove flips the gate epoch and must drain despite the storm
 		region_record churn_rec;
