@@ -22,9 +22,11 @@
 #include <privateer/error.hpp>
 #include <privateer/slot_table.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -51,6 +53,11 @@ namespace privateer {
 		// mlock the slot state array; the override for swapless deployments,
 		// where anonymous pages are never reclaimed
 		bool lock_state_array = true;
+
+		// Worker count of the commit write-out fan-out on the process-wide
+		// executor. 0 selects the hardware concurrency; 1 keeps the
+		// write-out on the committing thread.
+		size_t commit_workers = 0;
 	};
 
 	struct region;
@@ -78,6 +85,16 @@ namespace privateer {
 		// The hard-link syscall of the snapshot staging. Tests replace it to
 		// force the per-file copy fallback or to kill mid-staging.
 		extern int (*link_fn)(char const *from, char const *to);
+
+		// Posts fn as a region-owned executor task: the closing no-op
+		// wrapper, the catch-all, and the outstanding-task counter apply.
+		void post_task(region &reg, std::function<void()> fn);
+
+		// Arms a one-shot region-owned timer on the timer pool. The handler
+		// runs on the timer thread; aborted is true when close cancelled the
+		// wait, or when closing began before the handler ran.
+		void start_timer(region &reg, std::chrono::nanoseconds delay,
+						 std::function<void(bool aborted)> handler);
 
 	}  // namespace detail_region
 #endif  // PRIVATEER_TEST_HOOKS
@@ -187,6 +204,9 @@ namespace privateer {
 #ifdef PRIVATEER_TEST_HOOKS
 		friend slot_table &detail_region::table_of(region &reg) noexcept;
 		friend bool detail_region::deliver_fault(region &reg, uintptr_t addr, int signo) noexcept;
+		friend void detail_region::post_task(region &reg, std::function<void()> fn);
+		friend void detail_region::start_timer(region &reg, std::chrono::nanoseconds delay,
+											   std::function<void(bool aborted)> handler);
 #endif
 	};
 
