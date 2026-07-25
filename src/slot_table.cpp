@@ -79,13 +79,17 @@ namespace privateer {
 		return head()->dirty.load(std::memory_order_acquire);
 	}
 
-	PRIVATEER_HANDLER_TEXT void slot_table::add_dirty() noexcept {
-		head()->dirty.fetch_add(1, std::memory_order_acq_rel);
+	PRIVATEER_HANDLER_TEXT uint64_t slot_table::add_dirty() noexcept {
+		return head()->dirty.fetch_add(1, std::memory_order_acq_rel) + 1;
 	}
 
 	PRIVATEER_HANDLER_TEXT void slot_table::sub_dirty() noexcept {
 		[[maybe_unused]] uint64_t const previous = head()->dirty.fetch_sub(1, std::memory_order_acq_rel);
 		assert(previous > 0);
+		wake_governor();
+	}
+
+	PRIVATEER_HANDLER_TEXT void slot_table::wake_governor() noexcept {
 		head()->governor.fetch_add(1, std::memory_order_release);
 		word_wake_all(head()->governor);
 	}

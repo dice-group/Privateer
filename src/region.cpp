@@ -7,6 +7,7 @@
 #include <privateer/logger.hpp>
 #include <privateer/recipe.hpp>
 #include <privateer/region_registry.hpp>
+#include <privateer/resident.hpp>
 #include <privateer/rlimits.hpp>
 #include <privateer/slot_table.hpp>
 #include <privateer/vm.hpp>
@@ -72,7 +73,34 @@ namespace privateer {
 			std::atomic<uint32_t> closing{0};
 			uintptr_t segment_start = 0;
 			uint64_t block_size = 0;
+			// Dirty budget thresholds the handler reads on every fault.
+			// gov_soft_cross is the dirty-slot count whose reach crosses the
+			// soft watermark; 0 means no dirty budget. gov_hard_bytes is the
+			// hard watermark; 0 means writers never wait.
+			uint64_t gov_soft_cross = 0;
+			uint64_t gov_hard_bytes = 0;
+			int64_t gov_hard_timeout_ns = 0;
 		};
+
+		// the resident sweep's default probe: the process Pss
+		result<uint64_t> resident_pss_bytes() {
+			auto const usage = read_resident_usage();
+			if (!usage) {
+				return std::unexpected{usage.error()};
+			}
+			return usage->pss;
+		}
+
+		// The resident sweep's default trim syscall. PAGEOUT is
+		// non-destructive under every race: at worst it pushes pages of a
+		// just-dirtied slot to swap, wasted I/O but never a lost write.
+		int pageout_range([[maybe_unused]] void *addr, [[maybe_unused]] size_t len) {
+#ifdef __linux__
+			return ::madvise(addr, len, MADV_PAGEOUT);
+#else
+			return 0;
+#endif
+		}
 
 	}  // namespace
 
@@ -84,6 +112,8 @@ namespace privateer {
 		int (*link_fn)(char const *, char const *) = ::link;
 		int64_t (*clock_fn)() = monotonic_now_ns;
 		void (*cleaner_slot_hook)(size_t) = nullptr;
+		result<uint64_t> (*resident_bytes_fn)() = resident_pss_bytes;
+		int (*pageout_fn)(void *, size_t) = pageout_range;
 
 	}  // namespace detail_region
 #endif
@@ -129,6 +159,23 @@ namespace privateer {
 			if (detail_region::cleaner_slot_hook != nullptr) {
 				detail_region::cleaner_slot_hook(slot);
 			}
+#endif
+		}
+
+		// the resident sweep's probe and trim; tests reroute both seams
+		result<uint64_t> resident_bytes_now() {
+#ifdef PRIVATEER_TEST_HOOKS
+			return detail_region::resident_bytes_fn();
+#else
+			return resident_pss_bytes();
+#endif
+		}
+
+		int pageout(void *addr, size_t len) {
+#ifdef PRIVATEER_TEST_HOOKS
+			return detail_region::pageout_fn(addr, len);
+#else
+			return pageout_range(addr, len);
 #endif
 		}
 
@@ -183,16 +230,47 @@ namespace privateer {
 				return false;  // beyond the extended size: a genuine wild access
 			}
 			size_t const slot = offset / hot.block_size;
+			// One deadline bounds the total hard-mark wait of this fault,
+			// across re-loops and spurious wakeups.
+			int64_t gate_deadline = -1;
 			for (;;) {
 				slot_state const state = hot.table.load(slot);
 				switch (state) {
 					case slot_state::empty:
 					case slot_state::clean:
 					case slot_state::dirty_empty: {
+						// The hard-mark gate: materializing this slot must not
+						// take dirty bytes above the hard watermark. The wait
+						// parks on the governor word, which every counter
+						// decrease bumps; the drain (cleaner, committer,
+						// freer) runs independently of this thread, so the
+						// wait is backpressure, not a deadlock risk. After
+						// the timeout the write proceeds and overshoots by
+						// one block.
+						while (hot.gov_hard_bytes != 0) {
+							// value first, condition second: a decrease after
+							// this load changes the word and the wait returns
+							uint32_t const observed =
+									hot.table.governor_word().load(std::memory_order_acquire);
+							if (hot.closing.load(std::memory_order_acquire) != 0) {
+								return false;  // close released the waiters; not quiesced
+							}
+							uint64_t const dirty = hot.table.dirty_slots();
+							if ((dirty + 1) * hot.block_size <= hot.gov_hard_bytes) {
+								break;
+							}
+							int64_t const now = monotonic_now_ns();
+							if (gate_deadline < 0) {
+								gate_deadline = now + hot.gov_hard_timeout_ns;
+							} else if (now >= gate_deadline) {
+								break;  // bounded stall: overshoot by one block
+							}
+							(void) word_wait_for(hot.table.governor_word(), observed, gate_deadline - now);
+						}
 						if (!hot.table.try_claim(slot, state, slot_state::materializing)) {
 							continue;  // the slot moved; re-examine
 						}
-						hot.table.add_dirty();
+						uint64_t const dirty_now = hot.table.add_dirty();
 						void *const slot_addr =
 								reinterpret_cast<void *>(hot.segment_start + slot * hot.block_size);
 						if (protect_slot_for_write(slot_addr, hot.block_size) != 0) {
@@ -205,6 +283,24 @@ namespace privateer {
 							return false;
 						}
 						hot.table.publish(slot, slot_state::dirty);
+						if (hot.gov_soft_cross != 0 && dirty_now >= hot.gov_soft_cross) {
+							// At or above the soft watermark every new dirty
+							// slot wakes the governor word; the first of
+							// these is the crossing that activates the
+							// cleaner. The wake comes after the terminal
+							// publish: a cleaner that scanned this slot as
+							// materializing and found nothing to write back
+							// either parks after this bump and is woken, or
+							// parks before it and its compare-value wait
+							// refuses; both ways its rescan sees the slot
+							// dirty. A wake before the publish would leave a
+							// window where the cleaner parks for a full
+							// interval while counted dirt exists but no slot
+							// reads dirty, and writers blocked at the hard
+							// mark would then drain only through their
+							// timeouts.
+							hot.table.wake_governor();
+						}
 						return true;  // the retried store lands
 					}
 					case slot_state::materializing:
@@ -257,6 +353,13 @@ namespace privateer {
 						   [] { ::pthread_atfork(nullptr, nullptr, poison_regions_in_fork_child); });
 		}
 
+		// The process-level resident sweep (defined after region::state).
+		// Registration keys on the owning state object.
+		void resident_sweeper_register(void const *owner, region_hot *hot,
+									   governor_options const &governor);
+		void resident_sweeper_unregister(void const *owner) noexcept;
+		void touch_resident_sweeper();
+
 	}  // namespace
 
 	struct region::state {
@@ -271,6 +374,7 @@ namespace privateer {
 		size_t vma_headroom = 0;
 		size_t commit_workers = 1;
 		cleaner_options cleaner;
+		governor_options governor;
 		bool read_only = false;
 		std::mutex region_mutex;  // serializes extend and close bookkeeping
 		std::mutex commit_mutex;  // one commit at a time; owns the recipe table and the store bookkeeping
@@ -535,7 +639,8 @@ namespace privateer {
 		// The background write-back chain: a timer tick posts one batch on
 		// the work pool, and the batch re-arms the timer. Both links refuse
 		// to run once closing is set, so the chain ends at close, and every
-		// link is counted and joined there.
+		// link is counted and joined there. This is the cleaner without a
+		// dirty budget; with one, governor_cleaner_loop replaces it.
 		void schedule_cleaner() {
 			start_timer(cleaner.interval, [this](bool aborted) {
 				if (aborted) {
@@ -548,17 +653,66 @@ namespace privateer {
 			});
 		}
 
+		// The cleaner under a dirty budget: a self-re-posting work-pool
+		// task. Each step parks on the governor word, so the handler's
+		// soft-mark crossing wake activates it immediately, with the
+		// cleaner interval as the timeout fallback for the periodic sweep.
+		// Above the soft watermark it drains cold-first until the low
+		// target; while a new fault would block at the hard mark it ignores
+		// the re-dirty backoff, so drain throughput is cleaner throughput,
+		// never backoff timers. One step blocks its pool thread for at most
+		// one wait plus one batch, then re-posts, so queued work (commit
+		// write-out workers) is never starved behind the cleaner. Close
+		// bumps and wakes the governor word and the re-post runs as a
+		// counted no-op, so the chain ends at close and the join covers it.
+		void governor_cleaner_step(bool draining) {
+			// value first, closing second, budget third: a close or a
+			// counter change after the value load wakes the wait below
+			// immediately, and closing stored before the close-side bump is
+			// visible here
+			uint32_t const observed = hot->table.governor_word().load(std::memory_order_acquire);
+			if (hot->closing.load(std::memory_order_acquire) != 0) {
+				return;
+			}
+			uint64_t const block_size = rec.block_size;
+			uint64_t const dirty_bytes = hot->table.dirty_slots() * block_size;
+			if (dirty_bytes > (draining ? governor.dirty_low : governor.dirty_soft)) {
+				bool const writers_blocked =
+						governor.dirty_hard != 0 && dirty_bytes + block_size > governor.dirty_hard;
+				if (clean_batch(writers_blocked) == 0) {
+					// nothing eligible (transients, backoff below the hard
+					// mark, or the error flag): wait for a change instead
+					// of spinning
+					(void) word_wait_for(hot->table.governor_word(), observed, cleaner.interval.count());
+				}
+				post_task([this] { governor_cleaner_step(true); });
+				return;
+			}
+			if (word_wait_for(hot->table.governor_word(), observed, cleaner.interval.count()) == observed) {
+				// a full interval without governor activity: the periodic
+				// backoff-respecting sweep
+				(void) clean_batch(false);
+			}
+			post_task([this] { governor_cleaner_step(false); });
+		}
+
 		~state() {
 			if (hot != nullptr) {
 				// New faults forward as crashes from here on; the
-				// application has quiesced its readers and writers.
+				// application has quiesced its readers and writers. The
+				// governor wake bumps the word, so a waiter about to park on
+				// a stale value re-checks instead of sleeping through it; a
+				// writer still parked at the hard mark wakes, sees closing,
+				// and crashes with the forwarded fault (the documented
+				// contract violation).
 				hot->closing.store(1, std::memory_order_seq_cst);
-				word_wake_all(hot->table.governor_word());
+				hot->table.wake_governor();
 				// Tasks that have not started yet run as no-ops; timer
 				// handlers complete with aborted set. The join waits both
 				// kinds out, so nothing touches the region past this point.
 				cancel_timers();
 				join_tasks();
+				resident_sweeper_unregister(this);
 				if (registered) {
 					global_registry().remove(hot->record);
 				}
@@ -567,6 +721,220 @@ namespace privateer {
 			}
 		}
 	};
+
+	namespace {
+
+		// resident page count of one slot, via mincore; the resident budget
+		// registers on Linux only, so elsewhere this never runs
+		uint64_t resident_bytes_of([[maybe_unused]] void *addr, [[maybe_unused]] size_t len,
+								   [[maybe_unused]] std::vector<unsigned char> &vec) {
+#ifdef __linux__
+			size_t const psize = page_size();
+			vec.resize(len / psize);
+			if (::mincore(addr, len, vec.data()) != 0) {
+				return 0;
+			}
+			uint64_t pages = 0;
+			for (unsigned char const flags : vec) {
+				pages += flags & 1;
+			}
+			return pages * psize;
+#else
+			return 0;
+#endif
+		}
+
+		// The process-level resident sweep: one periodic task serving every
+		// region with a resident budget. One mutex guards the entry set and
+		// the whole pass, so a region's close removing its entry under the
+		// mutex is the shutdown handshake: once unregister returns, the
+		// sweep no longer touches the region.
+		//
+		// The budget is advisory, soft watermark and low target only:
+		// residency is reader-inflatable, so the sweep converges toward the
+		// target instead of enforcing it. Accounting is the process Pss,
+		// one smaps_rollup read per pass; mincore is used only to pick
+		// victims (it counts page-cache residency, an over-count under
+		// other openers). Victims are resident pages of clean and empty
+		// slots, taken in slot order, and the trim effort is split across
+		// regions in proportion to their trimmable resident bytes.
+		struct resident_sweeper {
+			struct entry {
+				void const *owner;
+				region_hot *hot;
+				uint64_t soft;
+				uint64_t low;
+				int64_t interval_ns;
+			};
+
+			std::mutex mutex;
+			std::vector<entry> entries;
+			bool armed = false;
+
+			static resident_sweeper &instance() {
+				static resident_sweeper sweeper;
+				return sweeper;
+			}
+
+			void register_entry(void const *owner, region_hot *hot, governor_options const &governor) {
+				std::lock_guard const lock{mutex};
+				entries.push_back({owner, hot, governor.resident_soft, governor.resident_low,
+								   governor.sweep_interval.count()});
+				if (!armed) {
+					armed = true;
+					arm(min_interval_ns());
+				}
+			}
+
+			void unregister_entry(void const *owner) noexcept {
+				std::lock_guard const lock{mutex};
+				std::erase_if(entries, [owner](entry const &e) { return e.owner == owner; });
+			}
+
+			[[nodiscard]] int64_t min_interval_ns() const {
+				int64_t interval = INT64_MAX;
+				for (auto const &e : entries) {
+					interval = std::min(interval, e.interval_ns);
+				}
+				return interval;
+			}
+
+			// One-shot timer; the pass re-arms while entries exist. The
+			// timer is owned by its own completion handler, the same
+			// pattern as the region timers; nothing cancels it, and a fire
+			// after the last unregister finds the set empty and stops the
+			// chain. On allocation failure the chain ends and the kernel's
+			// own reclaim remains (the budget is advisory).
+			void arm(int64_t delay_ns) {
+				try {
+					auto timer = std::make_shared<asio::steady_timer>(timer_pool(),
+																	  std::chrono::nanoseconds{delay_ns});
+					timer->async_wait([timer](std::error_code const &ec) {
+						if (ec) {
+							return;
+						}
+						try {
+							asio::post(work_pool(), [] { instance().pass(true); });
+						} catch (...) {
+							std::lock_guard const lock{instance().mutex};
+							instance().armed = false;
+						}
+					});
+				} catch (...) {
+					armed = false;
+				}
+			}
+
+			// one sweep pass; returns the bytes it asked the kernel to push out
+			uint64_t pass(bool rearm) {
+				std::lock_guard const lock{mutex};
+				if (entries.empty()) {
+					armed = false;
+					return 0;
+				}
+				uint64_t const asked = sweep_locked();
+				if (rearm) {
+					arm(min_interval_ns());
+				}
+				return asked;
+			}
+
+			uint64_t sweep_locked() {
+				uint64_t soft = UINT64_MAX;
+				uint64_t low = UINT64_MAX;
+				for (auto const &e : entries) {
+					soft = std::min(soft, e.soft);
+					low = std::min(low, e.low);
+				}
+				auto const resident = resident_bytes_now();
+				if (!resident) {
+					PRIVATEER_LOG(log_level::warning, "resident sweep cannot read residency: {}",
+								  to_string(resident.error()));
+					return 0;
+				}
+				if (*resident <= soft) {
+					return 0;
+				}
+				uint64_t const needed = *resident - low;
+
+				// pass 1: the trimmable resident bytes per region, victims
+				// in slot order
+				struct victim {
+					void *addr;
+					uint64_t bytes;
+				};
+				struct plan {
+					uint64_t block_size;
+					uint64_t trimmable = 0;
+					std::vector<victim> victims;
+				};
+				std::vector<plan> plans(entries.size());
+				std::vector<unsigned char> vec;
+				uint64_t total_trimmable = 0;
+				for (size_t i = 0; i < entries.size(); ++i) {
+					auto const &e = entries[i];
+					auto &p = plans[i];
+					p.block_size = e.hot->block_size;
+					size_t const slots = e.hot->table.extended_size() / p.block_size;
+					for (size_t slot = 0; slot < slots; ++slot) {
+						slot_state const state = e.hot->table.load(slot);
+						if (state != slot_state::clean && state != slot_state::empty) {
+							continue;
+						}
+						auto *const addr =
+								reinterpret_cast<void *>(e.hot->segment_start + slot * p.block_size);
+						uint64_t const bytes = resident_bytes_of(addr, p.block_size, vec);
+						if (bytes == 0) {
+							continue;
+						}
+						p.victims.push_back({addr, bytes});
+						p.trimmable += bytes;
+					}
+					total_trimmable += p.trimmable;
+				}
+				if (total_trimmable == 0) {
+					return 0;
+				}
+
+				// pass 2: PAGEOUT until each region's share of the needed
+				// trim is reached. A stale state race is harmless: PAGEOUT
+				// on a just-dirtied slot pushes fresh private pages to swap
+				// and they swap back in on access, wasted I/O, never a lost
+				// write.
+				uint64_t asked = 0;
+				for (auto const &p : plans) {
+					auto const share = static_cast<uint64_t>(
+							(static_cast<unsigned __int128>(needed) * p.trimmable + total_trimmable - 1) /
+							total_trimmable);
+					uint64_t trimmed = 0;
+					for (auto const &v : p.victims) {
+						if (trimmed >= share) {
+							break;
+						}
+						if (pageout(v.addr, p.block_size) == 0) {
+							trimmed += v.bytes;
+						}
+					}
+					asked += trimmed;
+				}
+				return asked;
+			}
+		};
+
+		void resident_sweeper_register(void const *owner, region_hot *hot,
+									   governor_options const &governor) {
+			resident_sweeper::instance().register_entry(owner, hot, governor);
+		}
+
+		void resident_sweeper_unregister(void const *owner) noexcept {
+			resident_sweeper::instance().unregister_entry(owner);
+		}
+
+		void touch_resident_sweeper() {
+			(void) resident_sweeper::instance();
+		}
+
+	}  // namespace
 
 	region::region() : state_{std::make_unique<state>()} {}
 	region::region(region &&) noexcept = default;
@@ -639,6 +1007,38 @@ namespace privateer {
 				return fail(errc::invalid_argument, "cleaner backoff_base must lie within [0, backoff_cap]");
 			}
 		}
+		auto const &gov = options.governor;
+		if (gov.dirty_soft != 0) {
+			if (options.cleaner.mode == cleaner_mode::off) {
+				return fail(errc::invalid_argument,
+							"the dirty budget requires the cleaner: nothing else drains between commits");
+			}
+			if (gov.dirty_low > gov.dirty_soft) {
+				return fail(errc::invalid_argument, "dirty_low must not exceed dirty_soft");
+			}
+			if (gov.dirty_hard != 0 && gov.dirty_hard < gov.dirty_soft) {
+				return fail(errc::invalid_argument, "dirty_hard must be at least dirty_soft");
+			}
+			if (gov.dirty_hard != 0 && gov.hard_timeout.count() <= 0) {
+				return fail(errc::invalid_argument, "the hard watermark needs a positive hard_timeout");
+			}
+		} else if (gov.dirty_hard != 0 || gov.dirty_low != 0) {
+			return fail(errc::invalid_argument, "the dirty budget needs a soft watermark");
+		}
+		if (gov.resident_soft != 0) {
+#ifndef __linux__
+			return fail(errc::invalid_argument, "the resident budget is Linux-only");
+#else
+			if (gov.resident_low > gov.resident_soft) {
+				return fail(errc::invalid_argument, "resident_low must not exceed resident_soft");
+			}
+			if (gov.sweep_interval.count() <= 0) {
+				return fail(errc::invalid_argument, "the resident budget needs a positive sweep_interval");
+			}
+#endif
+		} else if (gov.resident_low != 0) {
+			return fail(errc::invalid_argument, "the resident budget needs a soft watermark");
+		}
 		uint64_t const slot_count = rec->capacity / rec->block_size;
 		if (slot_count == 0) {
 			return fail(errc::datastore_inconsistent, "capacity is smaller than one slot");
@@ -692,8 +1092,15 @@ namespace privateer {
 									? options.commit_workers
 									: std::max<size_t>(1, std::thread::hardware_concurrency());
 		st.cleaner = options.cleaner;
+		st.governor = options.governor;
 		st.read_only = read_only;
 		st.store = std::move(*store);
+		if (!read_only && st.governor.dirty_soft != 0) {
+			// the dirty-slot count whose reach crosses the soft watermark
+			st.hot->gov_soft_cross = st.governor.dirty_soft / st.rec.block_size + 1;
+			st.hot->gov_hard_bytes = st.governor.dirty_hard;
+			st.hot->gov_hard_timeout_ns = st.governor.hard_timeout.count();
+		}
 
 		auto *const base = static_cast<std::byte *>(st.reservation.addr());
 		if (header_bytes > 0) {
@@ -737,9 +1144,12 @@ namespace privateer {
 				PRIVATEER_LOG(log_level::info, "open-time sweep removed {} unreferenced files", *swept);
 			}
 
-			// Construct the process-wide pools before the region exists, so
+			// Construct the process-wide state before the region exists, so
 			// a region owned by a static object constructed after this call
-			// finds them alive when it is destroyed at static teardown.
+			// finds it alive when it is destroyed at static teardown. The
+			// sweeper comes first: it must outlive the pools, because a
+			// sweep task queued at teardown still locks its mutex.
+			touch_resident_sweeper();
 			(void) work_pool();
 			(void) timer_pool();
 
@@ -761,7 +1171,14 @@ namespace privateer {
 			st.registered = true;
 
 			if (st.cleaner.mode != cleaner_mode::off) {
-				st.schedule_cleaner();
+				if (st.governor.dirty_soft != 0) {
+					st.post_task([&st] { st.governor_cleaner_step(false); });
+				} else {
+					st.schedule_cleaner();
+				}
+			}
+			if (st.governor.resident_soft != 0) {
+				resident_sweeper_register(&st, st.hot, st.governor);
 			}
 		}
 		return reg;
@@ -931,7 +1348,9 @@ namespace privateer {
 		// Restores captured but unwritten slots after a failure, so no waiter
 		// parks on a syncing slot forever. A write capture may already be
 		// read-only; it must be writable again before dirty reappears, and
-		// re-protecting a still-writable page is harmless.
+		// re-protecting a still-writable page is harmless. The governor wake
+		// covers the republished dirt: it changed no counter, so without the
+		// wake a parked cleaner would sleep a full interval on it.
 		auto const restore_range = [&](size_t from, size_t to) {
 			for (size_t i = from; i < to; ++i) {
 				auto const &cap = captured[i];
@@ -946,6 +1365,9 @@ namespace privateer {
 					continue;
 				}
 				table.publish(cap.slot, slot_state::dirty);
+			}
+			if (from < to) {
+				table.wake_governor();
 			}
 		};
 
@@ -1153,6 +1575,8 @@ namespace privateer {
 				}
 				table.publish(cap.slot, slot_state::dirty);
 			}
+			// republished dirt changed no counter; wake a parked cleaner
+			table.wake_governor();
 			for (auto const &res : results) {
 				if (res.err) {
 					return std::unexpected{*res.err};
@@ -1245,6 +1669,10 @@ namespace privateer {
 
 		size_t run_cleaner_batch(region &reg, bool override_backoff) {
 			return reg.state_->clean_batch(override_backoff);
+		}
+
+		uint64_t run_resident_sweep() {
+			return resident_sweeper::instance().pass(false);
 		}
 
 	}  // namespace detail_region
