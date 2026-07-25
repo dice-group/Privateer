@@ -224,25 +224,54 @@ namespace {
 
 	TEST_F(RegionWriteTest, WritesAfterCloseDie) {
 		privateer::testing::build_committed_store(dir.path, bs, {'a'});
-		auto const res = PRIVATEER_SANDBOX {
-			// fresh dispositions: the sandbox cleared the inherited handler
-			privateer::detail_fault_handler::uninstall_for_tests();
-			auto reg = region::open(dir.path);
-			if (!reg) {
-				return 10;
+		// Close frees the reservation, so another thread's mapping (an
+		// executor pool, the sanitizer runtime) can legitimately reuse the
+		// address before the probe write lands. The child claims the page
+		// with PROT_NONE first: a successful claim proves close released it
+		// and pins where the write goes; a failed claim marks the attempt
+		// occupied, and the parent retries. A close that stopped releasing
+		// the reservation fails every attempt.
+		fs::path const occupied = dir.path / "occupied";
+		for (int attempt = 0; attempt < 5; ++attempt) {
+			fs::remove(occupied);
+			auto const res = PRIVATEER_SANDBOX {
+				// fresh dispositions: the sandbox cleared the inherited handler
+				privateer::detail_fault_handler::uninstall_for_tests();
+				auto reg = region::open(dir.path);
+				if (!reg) {
+					return 10;
+				}
+				auto *const raw = static_cast<unsigned char volatile *>(reg->segment());
+				raw[0] = 'x';
+				if (raw[0] != 'x') {
+					return 11;
+				}
+				{
+					region closed = std::move(*reg);
+				}
+				void *const base = const_cast<unsigned char *>(raw);
+				int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_FIXED_NOREPLACE
+				flags |= MAP_FIXED_NOREPLACE;
+#endif
+				void *const claimed = ::mmap(base, page_size(), PROT_NONE, flags, -1, 0);
+				if (claimed == MAP_FAILED || claimed != base) {
+					if (claimed != MAP_FAILED) {
+						::munmap(claimed, page_size());
+					}
+					std::ofstream{dir.path / "occupied"};
+					return 13;
+				}
+				raw[0] = 'y';  // faults on the PROT_NONE claim; this must die
+				return 12;
+			};
+			if (fs::exists(occupied)) {
+				continue;  // a bystander mapping held the address; try again
 			}
-			auto *const raw = static_cast<unsigned char volatile *>(reg->segment());
-			raw[0] = 'x';
-			if (raw[0] != 'x') {
-				return 11;
-			}
-			{
-				region closed = std::move(*reg);
-			}
-			raw[0] = 'y';  // the reservation is gone; this must die
-			return 12;
-		};
-		EXPECT_TRUE(is_fault_signal(res));
+			EXPECT_TRUE(is_fault_signal(res));
+			return;
+		}
+		FAIL() << "the closed region's address range was still occupied after five attempts";
 	}
 
 }  // namespace
