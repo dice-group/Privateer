@@ -34,6 +34,35 @@ namespace privateer {
 
 	inline constexpr uint64_t default_block_size = 8ull * 1024 * 1024;
 
+	// Background write-back of dirty slots ahead of commits. off disables
+	// it. non_durable writes and remaps blocks; their durability stays with
+	// the next durable commit. eager_durable additionally syncs each batch's
+	// block files and shard directory entries, so a later durable commit
+	// pays only for dirt the cleaner has not reached yet.
+	enum struct cleaner_mode : uint8_t {
+		off,
+		non_durable,
+		eager_durable,
+	};
+
+	struct cleaner_options {
+		cleaner_mode mode = cleaner_mode::off;
+
+		// cadence of the background sweep
+		std::chrono::nanoseconds interval = std::chrono::seconds{1};
+
+		// most slots written back per batch; bounds one commit-mutex hold
+		size_t batch_slots = 8;
+
+		// Re-dirty backoff. A slot that turns dirty again within backoff_cap
+		// of its last write-back becomes eligible only after backoff_base,
+		// doubling per repeat up to backoff_cap, so hot slots stop being
+		// written back. A quiet period longer than backoff_cap clears the
+		// backoff.
+		std::chrono::nanoseconds backoff_base = std::chrono::milliseconds{500};
+		std::chrono::nanoseconds backoff_cap = std::chrono::seconds{30};
+	};
+
 	struct region_options {
 		// Datastore constants, written into the recipe header at create and
 		// adopted from the header at open. Set on open they must match the
@@ -58,6 +87,11 @@ namespace privateer {
 		// executor. 0 selects the hardware concurrency; 1 keeps the
 		// write-out on the committing thread.
 		size_t commit_workers = 0;
+
+		// Background write-back. Victims are picked cold first, by the time
+		// each slot was first seen dirty. Read-only opens have no dirty
+		// slots and ignore this.
+		cleaner_options cleaner;
 	};
 
 	struct region;
@@ -95,6 +129,20 @@ namespace privateer {
 		// wait, or when closing began before the handler ran.
 		void start_timer(region &reg, std::chrono::nanoseconds delay,
 						 std::function<void(bool aborted)> handler);
+
+		// The cleaner's time source, monotonic nanoseconds. Tests replace it
+		// for deterministic backoff decisions.
+		extern int64_t (*clock_fn)();
+
+		// When set, called after each slot the cleaner writes back. Crash
+		// tests kill the process inside it.
+		extern void (*cleaner_slot_hook)(size_t slot);
+
+		// Runs one cleaner batch synchronously on the calling thread,
+		// regardless of the region's cleaner mode and interval.
+		// override_backoff ignores the re-dirty backoff. Returns the number
+		// of slots written back.
+		size_t run_cleaner_batch(region &reg, bool override_backoff);
 
 	}  // namespace detail_region
 #endif  // PRIVATEER_TEST_HOOKS
@@ -207,6 +255,7 @@ namespace privateer {
 		friend void detail_region::post_task(region &reg, std::function<void()> fn);
 		friend void detail_region::start_timer(region &reg, std::chrono::nanoseconds delay,
 											   std::function<void(bool aborted)> handler);
+		friend size_t detail_region::run_cleaner_batch(region &reg, bool override_backoff);
 #endif
 	};
 

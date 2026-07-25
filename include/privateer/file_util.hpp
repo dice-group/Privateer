@@ -12,7 +12,22 @@
 #include <span>
 #include <string>
 
+#ifdef PRIVATEER_TEST_HOOKS
+#include <atomic>
+#endif
+
 namespace privateer {
+
+#ifdef PRIVATEER_TEST_HOOKS
+	// Test-only hooks, compiled in when the build includes the tests.
+	namespace detail_file_util {
+
+		// Counts every file and directory data barrier. Tests reset and read
+		// it to observe what a durability path paid.
+		extern std::atomic<uint64_t> sync_calls;
+
+	}  // namespace detail_file_util
+#endif  // PRIVATEER_TEST_HOOKS
 
 	// Data barrier for one file: fdatasync on Linux, fsync on macOS.
 	// On Linux the barrier writes the data to the device and flushes the
