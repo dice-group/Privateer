@@ -25,6 +25,8 @@
 #include <stdexcept>
 #include <thread>
 
+#include <sys/resource.h>
+
 using namespace privateer;
 using namespace std::chrono_literals;
 using privateer::testing::count_block_files;
@@ -33,7 +35,10 @@ namespace fs = std::filesystem;
 
 namespace {
 
-	bool eventually(std::function<bool()> const &condition, std::chrono::seconds timeout = 10s) {
+	// Patient by default: these waits assert that something happens at all,
+	// not how fast. A sanitizer build on a small oversubscribed runner needs
+	// the room, and the wait returns as soon as the condition holds.
+	bool eventually(std::function<bool()> const &condition, std::chrono::seconds timeout = 60s) {
 		auto const deadline = std::chrono::steady_clock::now() + timeout;
 		while (std::chrono::steady_clock::now() < deadline) {
 			if (condition()) {
@@ -47,6 +52,10 @@ namespace {
 	struct RegionExecutorTest : ::testing::Test {
 		privateer::testing::temp_dir dir;
 		uint64_t const bs = page_size();
+
+		void TearDown() override {
+			detail_region::commit_post_fails_fn = nullptr;
+		}
 
 		static unsigned char volatile *bytes(region &reg) {
 			return static_cast<unsigned char volatile *>(reg.segment());
@@ -160,6 +169,64 @@ namespace {
 
 		// No task this test posted still holds a work-pool thread.
 		EXPECT_TRUE(eventually([&] { return blockers->finished.load() == workers; }, 30s));
+	}
+
+	// The write-out fan-out posts one task per worker, and every posted
+	// worker reads the committing thread's frame. A post that fails must not
+	// leave a captured slot claimed, must not leave the join counter waiting
+	// for a worker that never runs, and must not let the frame die under the
+	// workers that do run.
+	TEST_F(RegionExecutorTest, AFailedWorkerPostFailsTheCommitAndCapturesNothing) {
+		privateer::testing::build_committed_store(dir.path, bs, {'a', 'b', 'c', 'd'});
+		auto reg = region::open(dir.path, {.commit_workers = 4});
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		auto &table = detail_region::table_of(*reg);
+		for (size_t slot = 0; slot < 4; ++slot) {
+			bytes(*reg)[slot * bs] = static_cast<unsigned char>('A' + slot);
+		}
+		ASSERT_EQ(table.dirty_slots(), 4u);
+
+		detail_region::commit_post_fails_fn = [](size_t worker) { return worker == 2; };
+		auto const committed = reg->commit(true);
+		detail_region::commit_post_fails_fn = nullptr;
+		ASSERT_FALSE(committed.has_value());
+		EXPECT_EQ(committed.error().code, errc::io_error);
+
+		for (size_t slot = 0; slot < 4; ++slot) {
+			slot_state const state = table.load(slot);
+			EXPECT_FALSE(is_transient(state)) << "slot " << slot << " stayed " << to_string(state);
+		}
+		EXPECT_TRUE(reg->check_sanity());  // a failed post does not kill the region
+		ASSERT_TRUE(reg->commit(true));    // and the retry commits every slot
+
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		for (size_t slot = 0; slot < 4; ++slot) {
+			EXPECT_EQ(bytes(*reopened)[slot * bs], static_cast<unsigned char>('A' + slot));
+		}
+	}
+
+	// A host with no thread budget left must get an answer from the executor.
+	// asio's own thread_pool joins the threads it created when a later
+	// creation fails, without stopping their scheduler, so that join never
+	// returns and the failure becomes a deadlock in a function-local static.
+	TEST(ExecutorThreadBudget, AStartWithoutThreadBudgetReportsInsteadOfHanging) {
+		auto const res = PRIVATEER_SANDBOX {
+			::alarm(60);  // a deadlock here must not sit until ctest's ceiling
+			rlimit limit{};
+			if (::getrlimit(RLIMIT_NPROC, &limit) != 0) {
+				return 10;
+			}
+			limit.rlim_cur = 2;  // fewer than any pool of this size needs
+			if (::setrlimit(RLIMIT_NPROC, &limit) != 0) {
+				return 11;
+			}
+			// Either a degraded pool that runs the task, or no pool at all.
+			// Both are answers; a hang is the defect this test exists for.
+			return detail_executor::start_pool_and_run_task(16) == 0 ? 20 : 0;
+		};
+		EXPECT_TRUE(res == subprocess_result::exit_success || res == subprocess_result::exit_failure)
+				<< "the executor start never reported back, signal " << static_cast<int>(res);
 	}
 
 	TEST_F(RegionExecutorTest, CloseCancelsAPendingTimer) {

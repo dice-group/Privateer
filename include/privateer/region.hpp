@@ -203,6 +203,11 @@ namespace privateer {
 		// the kernel to push out.
 		uint64_t run_resident_sweep();
 
+		// When set, decides whether posting the commit write-out worker with
+		// this index fails, the way an allocation failure would. Tests use it
+		// to exercise the fan-out's failure path.
+		extern bool (*commit_post_fails_fn)(size_t worker);
+
 	}  // namespace detail_region
 #endif  // PRIVATEER_TEST_HOOKS
 

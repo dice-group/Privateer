@@ -44,6 +44,24 @@ namespace privateer {
 			return (value + multiple - 1) / multiple * multiple;
 		}
 
+		// Runs its action when the enclosing scope leaves, on every path
+		// including an exception. Used where a failure must not skip a
+		// release: a claimed slot state, or a join counter that a waiter
+		// depends on. The action must not throw.
+		template<typename F>
+		struct scope_guard {
+			explicit scope_guard(F fn) : action{std::move(fn)} {}
+			~scope_guard() { action(); }
+			scope_guard(scope_guard const &) = delete;
+			scope_guard &operator=(scope_guard const &) = delete;
+
+		private:
+			F action;
+		};
+
+		template<typename F>
+		scope_guard(F) -> scope_guard<F>;
+
 		// The VMA budget: vm.max_map_count minus the configured headroom for
 		// the rest of the process. Darwin has no map-count limit.
 		size_t vma_budget(size_t headroom) noexcept {
@@ -114,6 +132,7 @@ namespace privateer {
 		void (*cleaner_slot_hook)(size_t) = nullptr;
 		result<uint64_t> (*resident_bytes_fn)() = resident_pss_bytes;
 		int (*pageout_fn)(void *, size_t) = pageout_range;
+		bool (*commit_post_fails_fn)(size_t) = nullptr;
 
 	}  // namespace detail_region
 #endif
@@ -151,6 +170,18 @@ namespace privateer {
 			return detail_region::clock_fn();
 #else
 			return monotonic_now_ns();
+#endif
+		}
+
+		// Whether posting the commit write-out worker with this index must
+		// fail; tests reroute it through the seam to exercise the fan-out's
+		// failure path. The engine always posts.
+		bool commit_post_fails([[maybe_unused]] size_t worker) {
+#ifdef PRIVATEER_TEST_HOOKS
+			return detail_region::commit_post_fails_fn != nullptr &&
+				   detail_region::commit_post_fails_fn(worker);
+#else
+			return false;
 #endif
 		}
 
@@ -1150,8 +1181,13 @@ namespace privateer {
 			// sweeper comes first: it must outlive the pools, because a
 			// sweep task queued at teardown still locks its mutex.
 			touch_resident_sweeper();
-			(void) work_pool();
-			(void) timer_pool();
+			// Starting the pools starts their threads. A host with no thread
+			// budget left fails here instead of later: without a work thread
+			// nothing drains the region's tasks, and close would wait on a
+			// task that can never run.
+			if (work_pool_size() == 0 || timer_pool_size() == 0) {
+				return fail(errc::io_error, "the executor could not start a thread");
+			}
 
 			// arm the write barrier
 			if (auto installed = install_fault_handler(); !installed) {
@@ -1344,18 +1380,31 @@ namespace privateer {
 			bool empty;  // captured from dirty_empty: an empty commit
 		};
 		std::vector<captured_slot> captured;
+		// Claims are held from here on, so no allocation may happen with a
+		// claim in hand: the capture loop below only pushes into this space.
+		captured.reserve(captured_slots);
 
-		// Restores captured but unwritten slots after a failure, so no waiter
-		// parks on a syncing slot forever. A write capture may already be
-		// read-only; it must be writable again before dirty reappears, and
-		// re-protecting a still-writable page is harmless. The governor wake
-		// covers the republished dirt: it changed no counter, so without the
-		// wake a parked cleaner would sleep a full interval on it.
-		auto const restore_range = [&](size_t from, size_t to) {
-			for (size_t i = from; i < to; ++i) {
-				auto const &cap = captured[i];
+		// Restores every captured slot the write-out did not release, on
+		// every path out of this function. A slot left in syncing parks every
+		// writer that touches it for as long as the region lives, so the
+		// restore must also run when an allocation or a worker post throws.
+		// Only this commit moves a slot out of syncing, so the state
+		// identifies the unreleased ones exactly; on the paths where every
+		// slot was released this is a scan that changes nothing. A write
+		// capture may already be read-only, so it must be writable again
+		// before dirty reappears, and re-protecting a still-writable page is
+		// harmless. The governor wake covers the republished dirt: it changed
+		// no counter, so without the wake a parked cleaner would sleep a full
+		// interval on it.
+		scope_guard const restore_captured{[&]() noexcept {
+			bool restored = false;
+			for (auto const &cap : captured) {
+				if (table.load(cap.slot) != slot_state::syncing) {
+					continue;
+				}
 				if (cap.empty) {
 					table.publish(cap.slot, slot_state::dirty_empty);
+					restored = true;
 					continue;
 				}
 				if (::mprotect(slot_addr(cap.slot), block_size, PROT_READ | PROT_WRITE) != 0) {
@@ -1365,11 +1414,12 @@ namespace privateer {
 					continue;
 				}
 				table.publish(cap.slot, slot_state::dirty);
+				restored = true;
 			}
-			if (from < to) {
+			if (restored) {
 				table.wake_governor();
 			}
-		};
+		}};
 
 		for (size_t slot = 0; slot < captured_slots; ++slot) {
 			for (;;) {
@@ -1393,7 +1443,6 @@ namespace privateer {
 					continue;
 				}
 				if (state == slot_state::poisoned) {
-					restore_range(0, captured.size());
 					return fail(errc::region_poisoned, "a slot is dead after a failed protection change");
 				}
 				// clean and empty are already persisted; a freeing slot
@@ -1423,8 +1472,6 @@ namespace privateer {
 					table.sub_dirty();
 				}
 				st.hot->error.store(1, std::memory_order_release);
-				restore_range(0, i);
-				restore_range(j, captured.size());
 				errno = freeze_errno;
 				return fail_errno(errc::io_error, "freeze captured slots");
 			}
@@ -1458,11 +1505,22 @@ namespace privateer {
 		// Heap-shared join counter: the final decrement releases the
 		// committing thread, whose frame may be gone by the time the wake
 		// after it runs, so nothing past the decrement may touch the frame.
-		auto const workers_left =
-				std::make_shared<std::atomic<uint32_t>>(static_cast<uint32_t>(worker_count));
+		// It counts worker 0, which runs below on this thread; every posted
+		// worker adds itself, so a post that fails leaves no count behind
+		// and the join always ends.
+		auto const workers_left = std::make_shared<std::atomic<uint32_t>>(1);
 		auto const count_worker_out = [workers_left] {
 			if (workers_left->fetch_sub(1, std::memory_order_acq_rel) == 1) {
 				word_wake_all(*workers_left);
+			}
+		};
+		auto const join_workers = [workers_left] {
+			for (;;) {
+				uint32_t const left = workers_left->load(std::memory_order_acquire);
+				if (left == 0) {
+					return;
+				}
+				(void) word_wait(*workers_left, left);
 			}
 		};
 
@@ -1528,21 +1586,42 @@ namespace privateer {
 			}
 		};
 
+		// The posted workers hold this frame by reference, so nothing may
+		// leave it while one of them still runs. On an exception this stops
+		// the write-out and joins them before the frame dies; the join is
+		// idempotent, so the normal path below joins where it needs the
+		// results. It is declared after everything the workers touch, so it
+		// runs before any of that is destroyed.
+		std::optional<error> post_err;
+		scope_guard const join_posted_workers{[&]() noexcept {
+			write_out_failed.store(1, std::memory_order_release);
+			join_workers();
+		}};
+
 		for (size_t w = 1; w < worker_count; ++w) {
-			asio::post(work_pool(), [&run_worker, &results, w, count_worker_out] {
-				run_worker(results[w]);
+			workers_left->fetch_add(1, std::memory_order_relaxed);
+			try {
+				if (commit_post_fails(w)) {
+					throw std::bad_alloc{};  // the injected failure of the seam
+				}
+				asio::post(work_pool(), [&run_worker, &results, w, count_worker_out] {
+					run_worker(results[w]);
+					count_worker_out();
+				});
+			} catch (...) {
+				// This worker never runs, so its count must go back or the
+				// join would wait for it forever. The captured slots it would
+				// have written stay with the workers that do run, and the
+				// commit reports the failure.
 				count_worker_out();
-			});
+				post_err = error{errc::io_error, ENOMEM, "post a commit write-out worker"};
+				write_out_failed.store(1, std::memory_order_release);
+				break;
+			}
 		}
 		run_worker(results[0]);
 		count_worker_out();
-		for (;;) {
-			uint32_t const left = workers_left->load(std::memory_order_acquire);
-			if (left == 0) {
-				break;
-			}
-			(void) word_wait(*workers_left, left);
-		}
+		join_workers();
 
 		for (auto const &res : results) {
 			for (auto const &delta : res.deltas) {
@@ -1555,32 +1634,16 @@ namespace privateer {
 			}
 		}
 		if (write_out_failed.load(std::memory_order_acquire) != 0) {
-			// Restore every captured slot the write-out did not release, so
-			// no waiter parks forever; released slots keep their release.
-			// Only this commit moves a slot out of syncing, so the state
-			// identifies the unreleased ones exactly.
-			for (auto const &cap : captured) {
-				if (table.load(cap.slot) != slot_state::syncing) {
-					continue;
-				}
-				if (cap.empty) {
-					table.publish(cap.slot, slot_state::dirty_empty);
-					continue;
-				}
-				if (::mprotect(slot_addr(cap.slot), block_size, PROT_READ | PROT_WRITE) != 0) {
-					table.publish(cap.slot, slot_state::poisoned);
-					table.sub_dirty();
-					st.hot->error.store(1, std::memory_order_release);
-					continue;
-				}
-				table.publish(cap.slot, slot_state::dirty);
-			}
-			// republished dirt changed no counter; wake a parked cleaner
-			table.wake_governor();
+			// The captured slots the write-out did not release are restored
+			// on the way out of this function; released slots keep their
+			// release. A worker's own error names the failure best.
 			for (auto const &res : results) {
 				if (res.err) {
 					return std::unexpected{*res.err};
 				}
+			}
+			if (post_err) {
+				return std::unexpected{*post_err};
 			}
 			return fail(errc::io_error, "commit write-out failed");
 		}
