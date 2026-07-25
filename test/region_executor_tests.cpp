@@ -20,7 +20,6 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
-#include <latch>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -116,27 +115,51 @@ namespace {
 		ASSERT_TRUE(opened.has_value()) << to_string(opened.error());
 		std::optional<region> reg{std::move(*opened)};
 
+		// The blocker tasks below can outlive the test frame, so they own
+		// their state, and every wait they make is bounded and released on
+		// every exit path of the frame. A work-pool task that parks
+		// unconditionally holds its thread for the rest of the process, and
+		// the pool's join at static teardown then never returns: the process
+		// hangs instead of reporting a failed test.
+		struct blocker_state {
+			std::atomic<size_t> started{0};
+			std::atomic<size_t> finished{0};
+			std::atomic<bool> released{false};
+		};
+		auto const blockers = std::make_shared<blocker_state>();
+		struct release_guard {
+			std::shared_ptr<blocker_state> state;
+			~release_guard() { state->released.store(true, std::memory_order_release); }
+		} const guard{blockers};
+
 		// Occupy every work-pool thread, so the region task stays queued.
-		// The blockers outlive the test frame (nothing joins them), so they
-		// share ownership of the latches instead of borrowing the stack.
-		auto const occupied = std::make_shared<std::latch>(static_cast<ptrdiff_t>(work_pool_size()));
-		auto const release = std::make_shared<std::latch>(1);
-		for (size_t i = 0; i < work_pool_size(); ++i) {
-			asio::post(work_pool(), [occupied, release] {
-				occupied->count_down();
-				release->wait();
+		size_t const workers = work_pool_size();
+		for (size_t i = 0; i < workers; ++i) {
+			asio::post(work_pool(), [blockers] {
+				blockers->started.fetch_add(1, std::memory_order_acq_rel);
+				auto const deadline = std::chrono::steady_clock::now() + 60s;
+				while (!blockers->released.load(std::memory_order_acquire) &&
+					   std::chrono::steady_clock::now() < deadline) {
+					std::this_thread::sleep_for(1ms);
+				}
+				blockers->finished.fetch_add(1, std::memory_order_acq_rel);
 			});
 		}
-		occupied->wait();
+		ASSERT_TRUE(eventually([&] { return blockers->started.load() == workers; }, 30s))
+				<< "the work pool started " << blockers->started.load() << " of " << workers
+				<< " posted tasks concurrently";
 
 		detail_region::post_task(*reg, [] {});
 
 		// Close joins the queued task: it cannot start before the blockers
 		// leave, and close cannot finish before it is counted out.
 		std::thread closer{[&] { reg.reset(); }};
-		release->count_down();
+		blockers->released.store(true, std::memory_order_release);
 		closer.join();
 		EXPECT_FALSE(reg.has_value());
+
+		// No task this test posted still holds a work-pool thread.
+		EXPECT_TRUE(eventually([&] { return blockers->finished.load() == workers; }, 30s));
 	}
 
 	TEST_F(RegionExecutorTest, CloseCancelsAPendingTimer) {
