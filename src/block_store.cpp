@@ -207,6 +207,19 @@ namespace privateer {
 		return refcounts_.contains(name);
 	}
 
+	void block_store::discard_unreferenced(block_digest const &name) {
+		if (refcounts_.contains(name)) {
+			return;
+		}
+		if (::unlink(block_path(name).c_str()) != 0 && errno != ENOENT) {
+			// stays a candidate; reclaim and the open-time sweep are the backstop
+			PRIVATEER_LOG(log_level::warning, "cannot unlink block {} (errno {})", to_hex(name), errno);
+			return;
+		}
+		durable_.erase(name);
+		candidates_.erase(name);
+	}
+
 	void block_store::reclaim() {
 		// names unlinked in this pass, grouped by shard: a name leaves the
 		// candidate set only once its shard directory is synced, so a failed

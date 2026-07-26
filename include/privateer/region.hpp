@@ -61,6 +61,15 @@ namespace privateer {
 		// backoff.
 		std::chrono::nanoseconds backoff_base = std::chrono::milliseconds{500};
 		std::chrono::nanoseconds backoff_cap = std::chrono::seconds{30};
+
+		// Failure handling. The cleaner is an optimization, so its failures
+		// are non-fatal: a batch that hits one logs it, unwinds the affected
+		// slots back to dirty, and backs off (backoff_base per failed batch,
+		// doubling up to backoff_cap). After failure_limit consecutive
+		// failed batches the cleaner disables itself for the region's
+		// lifetime and write-back degrades to commit time; the store stays
+		// healthy. 0 retries forever.
+		size_t failure_limit = 8;
 	};
 
 	// The memory governor. All watermarks are byte values; 0 disables the
@@ -189,6 +198,19 @@ namespace privateer {
 		// override_backoff ignores the re-dirty backoff. Returns the number
 		// of slots written back.
 		size_t run_cleaner_batch(region &reg, bool override_backoff);
+
+		// When set, decides whether the cleaner's block write for this slot
+		// fails, the way ENOSPC would. Tests use it to exercise the batch's
+		// unwind and the failure backoff.
+		extern bool (*cleaner_write_fails_fn)(size_t slot);
+
+		// When set, decides whether the cleaner's eager durability barrier
+		// fails, the way a failed fsync would. Tests use it to exercise the
+		// whole-batch unwind.
+		extern bool (*cleaner_durability_fails_fn)();
+
+		// whether the cleaner has disabled itself after repeated failures
+		[[nodiscard]] bool cleaner_disabled(region &reg) noexcept;
 
 		// The resident sweep's process residency probe. Tests replace it to
 		// feed synthetic Pss values; the default reads /proc/self/smaps_rollup.
@@ -320,6 +342,7 @@ namespace privateer {
 		friend void detail_region::start_timer(region &reg, std::chrono::nanoseconds delay,
 											   std::function<void(bool aborted)> handler);
 		friend size_t detail_region::run_cleaner_batch(region &reg, bool override_backoff);
+		friend bool detail_region::cleaner_disabled(region &reg) noexcept;
 #endif
 	};
 

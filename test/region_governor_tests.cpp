@@ -16,6 +16,7 @@
 #include "support/temp_dir.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstddef>
@@ -482,6 +483,36 @@ namespace {
 		g_resident.store(1000 * bs);
 		EXPECT_EQ(detail_region::run_resident_sweep(), 0u);
 		EXPECT_TRUE(g_pageout_calls.empty());
+	}
+
+	// the counting, failing residency probe of the disable test
+	std::atomic<int> g_resident_probe_calls{0};
+
+	TEST_F(RegionResidentTest, AFailedResidencyReadDisablesOnlyTheResidentBudget) {
+		privateer::testing::build_committed_store(dir.path, bs, {'a', 'b'});
+		g_resident_probe_calls.store(0);
+		detail_region::resident_bytes_fn = [] {
+			g_resident_probe_calls.fetch_add(1);
+			return result<uint64_t>{
+					std::unexpected{error{errc::io_error, EACCES, "read smaps_rollup"}}};
+		};
+		auto reg = region::open(dir.path, resident_options(2 * bs, 0));
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		scan_slot(*reg, 0, bs);
+
+		// the failed read disables the budget; later passes never probe again
+		EXPECT_EQ(detail_region::run_resident_sweep(), 0u);
+		EXPECT_EQ(g_resident_probe_calls.load(), 1);
+		EXPECT_EQ(detail_region::run_resident_sweep(), 0u);
+		EXPECT_EQ(g_resident_probe_calls.load(), 1);
+
+		// nothing else died: the region writes, commits, and closes clean
+		EXPECT_TRUE(reg->check_sanity());
+		bytes(*reg)[0] = 'A';
+		ASSERT_TRUE(reg->commit(true));
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		EXPECT_EQ(bytes(*reopened)[0], 'A');
 	}
 
 	TEST_F(RegionResidentTest, RealPageoutEvictsCleanSlotsAndContentSurvives) {
