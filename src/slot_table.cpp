@@ -1,10 +1,14 @@
 #include <privateer/slot_table.hpp>
 
 #include <privateer/handler_text.hpp>
+#include <privateer/vm.hpp>
 #include <privateer/word_wait.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <new>
+
+#include <sys/mman.h>
 
 namespace privateer {
 
@@ -26,19 +30,46 @@ namespace privateer {
 		if (slot_count == 0) {
 			return fail(errc::invalid_argument, "slot table needs at least one slot");
 		}
-		auto buffer = mlocked_buffer::allocate(sizeof(header) + slot_count * sizeof(std::atomic<uint32_t>), lock);
+		// allocated unlocked; the table locks its own prefix page-wise
+		auto buffer = mlocked_buffer::allocate(sizeof(header) + slot_count * sizeof(std::atomic<uint32_t>), false);
 		if (!buffer) {
 			return std::unexpected{buffer.error()};
 		}
 		slot_table table;
 		table.buffer_ = std::move(*buffer);
 		table.count_ = slot_count;
+		table.lock_ = lock;
 		new (table.buffer_.addr()) header{};
 		auto *states = table.states();
 		for (size_t i = 0; i < slot_count; ++i) {
 			new (states + i) std::atomic<uint32_t>{static_cast<uint32_t>(slot_state::empty)};
 		}
+		// the header page: the counters and the governor word are handler-read
+		if (auto locked = table.lock_to(0); !locked) {
+			return std::unexpected{locked.error()};
+		}
 		return table;
+	}
+
+	size_t slot_table::locked_bytes_for(size_t slots_in_use) noexcept {
+		size_t const page = page_size();
+		size_t const bytes = sizeof(header) + slots_in_use * sizeof(std::atomic<uint32_t>);
+		return (bytes + page - 1) / page * page;
+	}
+
+	result<> slot_table::lock_to(size_t slots_in_use) noexcept {
+		if (!lock_) {
+			return {};
+		}
+		size_t const end = locked_bytes_for(std::min(slots_in_use, count_));
+		if (end <= locked_end_) {
+			return {};
+		}
+		if (::mlock(static_cast<std::byte *>(buffer_.addr()) + locked_end_, end - locked_end_) != 0) {
+			return fail_errno(errc::memlock_limit_too_low, "mlock state pages");
+		}
+		locked_end_ = end;
+		return {};
 	}
 
 	slot_table::header *slot_table::head() const noexcept {

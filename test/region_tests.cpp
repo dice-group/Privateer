@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <privateer/block_store.hpp>
+#include <privateer/fault_handler.hpp>
 #include <privateer/recipe.hpp>
 #include <privateer/region.hpp>
 #include <privateer/vm.hpp>
@@ -16,8 +17,11 @@
 #include <optional>
 #include <vector>
 
+#include <sys/resource.h>
+
 using namespace privateer;
 using privateer::testing::is_fault_signal;
+using privateer::testing::subprocess_result;
 namespace fs = std::filesystem;
 
 namespace {
@@ -252,6 +256,117 @@ namespace {
 		region moved = std::move(*reg);
 		EXPECT_EQ(read_byte(moved, 0), 'a');
 		EXPECT_EQ(moved.size(), bs);
+	}
+
+	TEST_F(RegionTest, DeepVerifyRejectsACorruptedBlockFile) {
+		build_store({'a', 'b'});
+		std::vector<std::byte> const data(bs, std::byte{'b'});
+		auto store = block_store::open(dir.path);
+		ASSERT_TRUE(store.has_value());
+		fs::path const path = store->block_path(hash_block(hash_algorithm::xxh3_128, data));
+		{
+			std::fstream file{path, std::ios::binary | std::ios::in | std::ios::out};
+			file.seekp(7);
+			file.put('x');
+		}
+		ASSERT_EQ(fs::file_size(path), bs);  // size validation cannot see the corruption
+
+		region_options verify = small_options();
+		verify.deep_verify = true;
+		auto rejected = region::open(dir.path, verify);
+		ASSERT_FALSE(rejected.has_value());
+		EXPECT_EQ(rejected.error().code, errc::block_file_invalid);
+
+		auto accepted = region::open(dir.path, small_options());
+		ASSERT_TRUE(accepted.has_value()) << to_string(accepted.error());
+	}
+
+	TEST_F(RegionTest, DeepVerifyPassesOnAnIntactStore) {
+		build_store({'a', std::nullopt, 'b', 'a'});
+		region_options verify = small_options();
+		verify.deep_verify = true;
+		{
+			auto reg = region::open(dir.path, verify);
+			ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+			EXPECT_EQ(read_byte(*reg, 0), 'a');
+			EXPECT_EQ(read_byte(*reg, bs), 0);
+			EXPECT_EQ(read_byte(*reg, 2 * bs), 'b');
+			EXPECT_EQ(read_byte(*reg, 3 * bs), 'a');
+		}
+		auto ro = region::open_read_only(dir.path, verify);
+		ASSERT_TRUE(ro.has_value()) << to_string(ro.error());
+		EXPECT_EQ(read_byte(*ro, 2 * bs), 'b');
+	}
+
+	TEST_F(RegionTest, LockedStateBytesTrackTheSizeNotTheCapacity) {
+		uint64_t const slots_per_page = page_size() / sizeof(uint32_t);
+		auto reg = region::create(dir.path, 2 * slots_per_page * bs, small_options());
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		auto &table = detail_region::table_of(*reg);
+		EXPECT_TRUE(table.locking());
+		EXPECT_EQ(table.locked_bytes(), slot_table::locked_bytes_for(0));
+		EXPECT_LT(table.locked_bytes(), slot_table::locked_bytes_for(2 * slots_per_page));
+
+		ASSERT_TRUE(reg->extend(bs));
+		EXPECT_EQ(table.locked_bytes(), slot_table::locked_bytes_for(1));
+
+		ASSERT_TRUE(reg->extend((slots_per_page + 1) * bs));
+		EXPECT_EQ(table.locked_bytes(), slot_table::locked_bytes_for(slots_per_page + 1));
+		EXPECT_GT(table.locked_bytes(), slot_table::locked_bytes_for(1));
+	}
+
+	TEST_F(RegionTest, OpenLocksTheStateArrayForTheCommittedSize) {
+		uint64_t const slots_per_page = page_size() / sizeof(uint32_t);
+		build_store({'a', 'b'}, 2 * slots_per_page);
+		{
+			auto reg = region::open(dir.path);
+			ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+			EXPECT_EQ(detail_region::table_of(*reg).locked_bytes(), slot_table::locked_bytes_for(2));
+		}
+		auto ro = region::open_read_only(dir.path);
+		ASSERT_TRUE(ro.has_value()) << to_string(ro.error());
+		EXPECT_FALSE(detail_region::table_of(*ro).locking());  // read-only opens never lock
+		EXPECT_EQ(detail_region::table_of(*ro).locked_bytes(), 0u);
+	}
+
+	TEST_F(RegionTest, ExtendFailsCleanlyUnderALoweredMemlockLimit) {
+		uint64_t const slots_per_page = page_size() / sizeof(uint32_t);
+		auto const res = PRIVATEER_SANDBOX {
+			// fresh dispositions: the sandbox cleared the inherited handler
+			privateer::detail_fault_handler::uninstall_for_tests();
+			auto reg = region::create(dir.path, 2 * slots_per_page * bs, small_options());
+			if (!reg) {
+				return 10;
+			}
+			if (!reg->extend(bs)) {
+				return 11;
+			}
+			rlimit const zero{0, 0};
+			if (::setrlimit(RLIMIT_MEMLOCK, &zero) != 0) {
+				return 12;
+			}
+			// crossing into a new state page needs a lock the limit refuses
+			auto crossed = reg->extend((slots_per_page + 1) * bs);
+			if (crossed.has_value()) {
+				return 13;
+			}
+			if (crossed.error().code != errc::memlock_limit_too_low) {
+				return 14;
+			}
+			if (reg->size() != bs) {
+				return 15;  // the failed extend must not advance the size
+			}
+			// the region keeps working within the already locked pages
+			if (!reg->extend(2 * bs)) {
+				return 16;
+			}
+			static_cast<unsigned char volatile *>(reg->segment())[0] = 'x';
+			if (!reg->commit(true)) {
+				return 17;
+			}
+			return 0;
+		};
+		EXPECT_EQ(res, subprocess_result::exit_success);
 	}
 
 #ifdef __linux__

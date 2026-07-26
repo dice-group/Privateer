@@ -13,9 +13,12 @@
 //   mprotect or mmap that establishes its protection has returned, so an
 //   observed terminal state always describes the mapping.
 //
-// The state array lives in one mlocked buffer: the fault handler reads and
-// waits on these words while its own signal is masked, and a page fault on a
-// reclaimed state page there would kill the process.
+// The state array lives in one buffer whose pages are mlocked as far as the
+// region's extended size reaches: the fault handler reads and waits on these
+// words while its own signal is masked, and a page fault on a reclaimed
+// state page there would kill the process. The handler gates on the extended
+// size before it touches any state word, so pages beyond the locked prefix
+// are never read in signal context.
 
 #include <privateer/error.hpp>
 #include <privateer/mlocked.hpp>
@@ -57,9 +60,11 @@ namespace privateer {
 	// no syscalls besides waits and wakes; mapping and protection changes are
 	// the callers' job, ordered by the two rules above.
 	struct slot_table {
-		// Allocates the mlocked state array; every slot starts empty. With
-		// lock false the array is allocated but not locked (the override for
-		// swapless deployments).
+		// Allocates the state array at the full slot_count; every slot starts
+		// empty. With lock true the pages covering the header are locked
+		// right away and lock_to locks more as the region grows. With lock
+		// false nothing is ever locked (the override for swapless
+		// deployments).
 		static result<slot_table> create(size_t slot_count, bool lock = true);
 
 		constexpr slot_table() = default;
@@ -70,6 +75,21 @@ namespace privateer {
 		~slot_table() = default;
 
 		[[nodiscard]] size_t slot_count() const noexcept { return count_; }
+
+		// Grows the locked prefix to the pages covering the header and the
+		// first slots_in_use state words; it never shrinks. A failed mlock
+		// changes nothing and reports memlock_limit_too_low. With locking
+		// disabled at create this is a no-op.
+		result<> lock_to(size_t slots_in_use) noexcept;
+
+		// bytes lock_to(slots_in_use) keeps locked, page granular
+		[[nodiscard]] static size_t locked_bytes_for(size_t slots_in_use) noexcept;
+
+		// bytes currently locked; 0 with locking disabled
+		[[nodiscard]] size_t locked_bytes() const noexcept { return locked_end_; }
+
+		// whether create enabled locking
+		[[nodiscard]] bool locking() const noexcept { return lock_; }
 
 		[[nodiscard]] slot_state load(size_t slot) const noexcept;  // acquire
 
@@ -136,6 +156,8 @@ namespace privateer {
 
 		mlocked_buffer buffer_;
 		size_t count_ = 0;
+		bool lock_ = false;
+		size_t locked_end_ = 0;  // page multiple, from the buffer start
 	};
 
 }  // namespace privateer

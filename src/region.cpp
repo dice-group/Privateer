@@ -1336,15 +1336,24 @@ namespace privateer {
 		if (auto validated = validate_blocks(*rec, *store); !validated) {
 			return std::unexpected{validated.error()};
 		}
+		if (options.deep_verify) {
+			if (auto verified = deep_verify_blocks(*rec, *store); !verified) {
+				return std::unexpected{verified.error()};
+			}
+		}
 
 		uint64_t const size_slots = rec->size / rec->block_size;
 		if (size_slots > vma_budget(options.vma_headroom)) {
 			return fail(errc::vma_budget_exceeded, "mapping the extended size would cross the VMA budget");
 		}
 
+		// The state array is allocated at capacity but locked only for the
+		// pages that slots within size touch; extend locks more as the
+		// region grows.
 		bool const lock = !read_only && options.lock_state_array;
 		if (lock) {
-			if (auto raised = ensure_memlock_limit(slot_count * sizeof(uint32_t) + sizeof(region_hot) + 64);
+			if (auto raised = ensure_memlock_limit(slot_table::locked_bytes_for(size_slots) +
+												   sizeof(region_hot) + 64);
 				!raised) {
 				return std::unexpected{raised.error()};
 			}
@@ -1352,6 +1361,9 @@ namespace privateer {
 		auto table = slot_table::create(slot_count, lock);
 		if (!table) {
 			return std::unexpected{table.error()};
+		}
+		if (auto locked = table->lock_to(size_slots); !locked) {
+			return std::unexpected{locked.error()};
 		}
 		auto hot_buffer = mlocked_buffer::allocate(sizeof(region_hot), lock);
 		if (!hot_buffer) {
@@ -1532,8 +1544,22 @@ namespace privateer {
 		if (target > st.rec.capacity) {
 			return fail(errc::capacity_exceeded, "extend beyond the region capacity");
 		}
-		if (target / st.rec.block_size > vma_budget(st.vma_headroom)) {
+		size_t const target_slots = target / st.rec.block_size;
+		if (target_slots > vma_budget(st.vma_headroom)) {
 			return fail(errc::vma_budget_exceeded, "extend would cross the VMA budget");
+		}
+		// Lock the state pages the grown size touches before anything else
+		// changes: a failed lock leaves mappings, states, and size untouched.
+		auto &table = st.hot->table;
+		if (table.locking() && slot_table::locked_bytes_for(target_slots) > table.locked_bytes()) {
+			if (auto raised = ensure_memlock_limit(slot_table::locked_bytes_for(target_slots) +
+												   sizeof(region_hot) + 64);
+				!raised) {
+				return std::unexpected{raised.error()};
+			}
+			if (auto locked = table.lock_to(target_slots); !locked) {
+				return std::unexpected{locked.error()};
+			}
 		}
 		auto *const grown = static_cast<std::byte *>(segment()) + current;
 		if (auto mapped = map_anonymous(grown, target - current, page_access::read); !mapped) {

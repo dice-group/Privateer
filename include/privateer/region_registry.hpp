@@ -94,7 +94,7 @@ namespace privateer {
 		};
 
 		// allocates a table for count entries and keeps its buffer in tables_
-		result<table *> make_table(size_t count);
+		result<table *> make_table(size_t count, bool lock = true);
 
 		std::atomic<table *> current_{nullptr};
 		std::atomic<uint32_t> epoch_{0};

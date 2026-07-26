@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <privateer/slot_table.hpp>
+#include <privateer/vm.hpp>
 #include <privateer/word_wait.hpp>
 
 #include <atomic>
@@ -38,6 +39,37 @@ namespace {
 		auto table = slot_table::create(8, false);
 		ASSERT_TRUE(table.has_value()) << to_string(table.error());
 		EXPECT_EQ(table->load(0), slot_state::empty);
+		EXPECT_FALSE(table->locking());
+		EXPECT_EQ(table->locked_bytes(), 0u);
+		EXPECT_TRUE(table->lock_to(8));  // a no-op with locking disabled
+		EXPECT_EQ(table->locked_bytes(), 0u);
+	}
+
+	TEST(SlotTableTest, LocksThePagesTheUsedSlotsTouch) {
+		size_t const slots_per_page = privateer::page_size() / sizeof(uint32_t);
+		auto table = make_table(4 * slots_per_page);
+		EXPECT_TRUE(table.locking());
+		// create locks the header page only
+		EXPECT_EQ(table.locked_bytes(), slot_table::locked_bytes_for(0));
+		EXPECT_LT(table.locked_bytes(), slot_table::locked_bytes_for(4 * slots_per_page));
+
+		ASSERT_TRUE(table.lock_to(slots_per_page + 1));
+		EXPECT_EQ(table.locked_bytes(), slot_table::locked_bytes_for(slots_per_page + 1));
+
+		// the locked prefix never shrinks
+		ASSERT_TRUE(table.lock_to(1));
+		EXPECT_EQ(table.locked_bytes(), slot_table::locked_bytes_for(slots_per_page + 1));
+
+		// a request beyond the slot count clamps to the whole array
+		ASSERT_TRUE(table.lock_to(100 * slots_per_page));
+		EXPECT_EQ(table.locked_bytes(), slot_table::locked_bytes_for(4 * slots_per_page));
+	}
+
+	TEST(SlotTableTest, LockedBytesForIsPageGranularAndMonotone) {
+		size_t const page = privateer::page_size();
+		EXPECT_EQ(slot_table::locked_bytes_for(0), page);
+		EXPECT_EQ(slot_table::locked_bytes_for(0) % page, 0u);
+		EXPECT_LE(slot_table::locked_bytes_for(1), slot_table::locked_bytes_for(page));
 	}
 
 	TEST(SlotTableTest, StateNamesAreStable) {

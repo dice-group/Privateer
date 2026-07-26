@@ -16,8 +16,8 @@ namespace privateer {
 
 	}  // namespace
 
-	result<region_registry::table *> region_registry::make_table(size_t count) {
-		auto buf = mlocked_buffer::allocate(sizeof(table) + count * sizeof(entry));
+	result<region_registry::table *> region_registry::make_table(size_t count, bool lock) {
+		auto buf = mlocked_buffer::allocate(sizeof(table) + count * sizeof(entry), lock);
 		if (!buf) {
 			return std::unexpected{buf.error()};
 		}
@@ -75,14 +75,22 @@ namespace privateer {
 		}
 
 		// The successor table needs one small allocation. remove must not
-		// fail (close depends on it), so an allocation failure is retried;
-		// a process unable to allocate a few hundred bytes is lost anyway.
+		// fail (close depends on it), so a memory allocation failure is
+		// retried; a process unable to allocate a few hundred bytes is lost
+		// anyway. A failed mlock is not transient: RLIMIT_MEMLOCK is
+		// exhausted and stays so. The table is then left unlocked, trading
+		// the handler's reclaimed-page hazard for a close that terminates.
 		table *next = nullptr;
+		bool lock_table = true;
 		for (;;) {
-			auto t = make_table(old_count - 1);
+			auto t = make_table(old_count - 1, lock_table);
 			if (t) {
 				next = *t;
 				break;
+			}
+			if (t.error().code == errc::memlock_limit_too_low) {
+				lock_table = false;
+				continue;
 			}
 			drain_backoff();
 		}

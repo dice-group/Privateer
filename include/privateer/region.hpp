@@ -155,9 +155,17 @@ namespace privateer {
 		// such limit and no budget)
 		size_t vma_headroom = 4096;
 
-		// mlock the slot state array; the override for swapless deployments,
-		// where anonymous pages are never reclaimed
+		// mlock the slot state array pages that the extended size touches;
+		// extend locks more as the region grows. false is the override for
+		// swapless deployments, where anonymous pages are never reclaimed.
 		bool lock_state_array = true;
+
+		// Re-hash every referenced block file against its name at open, one
+		// read pass over the unique referenced blocks. Size validation
+		// always runs and catches truncation; deep verify also catches
+		// content corruption, upgrading the consistency mark from
+		// structurally plausible to content-verified.
+		bool deep_verify = false;
 
 		// A failed protection change in the fault handler marks the slot
 		// poisoned and parks the writer; the cleaner and commits retry the
@@ -321,10 +329,12 @@ namespace privateer {
 		[[nodiscard]] region_statistics statistics() const noexcept;
 
 		// Extends the region to at least target_size bytes, rounded up to
-		// whole slots: maps the grown range as anonymous zeros and publishes
-		// the new size. Fails cleanly beyond capacity or beyond the VMA
-		// budget; a target at or below the current size is a no-op. The new
-		// size is persisted by the next commit.
+		// whole slots: locks the state-array pages the new size touches,
+		// maps the grown range as anonymous zeros, and publishes the new
+		// size. Fails cleanly beyond capacity, beyond the VMA budget, or
+		// when RLIMIT_MEMLOCK cannot hold the grown state array; a target at
+		// or below the current size is a no-op. The new size is persisted by
+		// the next commit.
 		result<> extend(uint64_t target_size);
 
 		// Frees the whole slots fully covered by [offset, offset + nbytes):
