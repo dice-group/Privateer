@@ -75,6 +75,13 @@ namespace privateer {
 		return static_cast<slot_state>(word_wait(states()[slot], static_cast<uint32_t>(observed)));
 	}
 
+	PRIVATEER_HANDLER_TEXT slot_state slot_table::wait_changed_for(size_t slot, slot_state observed,
+																   int64_t timeout_ns) noexcept {
+		assert(slot < count_);
+		return static_cast<slot_state>(
+				word_wait_for(states()[slot], static_cast<uint32_t>(observed), timeout_ns));
+	}
+
 	PRIVATEER_HANDLER_TEXT uint64_t slot_table::dirty_slots() const noexcept {
 		return head()->dirty.load(std::memory_order_acquire);
 	}

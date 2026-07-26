@@ -134,6 +134,14 @@ namespace privateer {
 		// where anonymous pages are never reclaimed
 		bool lock_state_array = true;
 
+		// A failed protection change in the fault handler marks the slot
+		// poisoned and parks the writer; the cleaner and commits retry the
+		// change and heal the slot. poison_timeout bounds that wait. On
+		// timeout the write is lost, so the error flag is set and the fault
+		// forwards as a crash. The default spans several cleaner intervals,
+		// so recovery gets more than one attempt.
+		std::chrono::nanoseconds poison_timeout = std::chrono::seconds{10};
+
 		// Worker count of the commit write-out fan-out on the process-wide
 		// executor. 0 selects the hardware concurrency; 1 keeps the
 		// write-out on the committing thread.
@@ -162,8 +170,9 @@ namespace privateer {
 		// a fault at addr. Returns whether the fault was handled.
 		bool deliver_fault(region &reg, uintptr_t addr, int signo) noexcept;
 
-		// The protection-change syscall of the fault path. Tests replace it
-		// to fail the change on purpose; everything else leaves it alone.
+		// The protection-change syscall of the fault path and of poisoned-slot
+		// recovery (cleaner and commit capture). Tests replace it to fail the
+		// change on purpose; everything else leaves it alone.
 		extern int (*mprotect_fn)(void *addr, size_t len, int prot);
 
 		// When set, called after each completed commit phase (1 capture,
@@ -211,6 +220,10 @@ namespace privateer {
 
 		// whether the cleaner has disabled itself after repeated failures
 		[[nodiscard]] bool cleaner_disabled(region &reg) noexcept;
+
+		// count of slots currently poisoned, the recovery cue the governed
+		// cleaner reads
+		[[nodiscard]] uint64_t poisoned_slots(region &reg) noexcept;
 
 		// The resident sweep's process residency probe. Tests replace it to
 		// feed synthetic Pss values; the default reads /proc/self/smaps_rollup.
@@ -343,6 +356,7 @@ namespace privateer {
 											   std::function<void(bool aborted)> handler);
 		friend size_t detail_region::run_cleaner_batch(region &reg, bool override_backoff);
 		friend bool detail_region::cleaner_disabled(region &reg) noexcept;
+		friend uint64_t detail_region::poisoned_slots(region &reg) noexcept;
 #endif
 	};
 

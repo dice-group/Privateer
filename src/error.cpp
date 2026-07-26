@@ -19,7 +19,6 @@ namespace privateer {
 			case errc::memlock_limit_too_low: return "memlock_limit_too_low";
 			case errc::vma_budget_exceeded: return "vma_budget_exceeded";
 			case errc::hash_collision: return "hash_collision";
-			case errc::region_poisoned: return "region_poisoned";
 			case errc::shutting_down: return "shutting_down";
 			case errc::capacity_exceeded: return "capacity_exceeded";
 		}

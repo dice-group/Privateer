@@ -15,21 +15,59 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <thread>
 #include <vector>
 
 #include <sys/mman.h>
 
 using namespace privateer;
+using namespace std::chrono_literals;
 using privateer::testing::is_fault_signal;
 using privateer::testing::subprocess_result;
 namespace fs = std::filesystem;
 
 namespace {
 
+	bool eventually(std::function<bool()> const &condition, std::chrono::seconds timeout = 30s) {
+		auto const deadline = std::chrono::steady_clock::now() + timeout;
+		while (std::chrono::steady_clock::now() < deadline) {
+			if (condition()) {
+				return true;
+			}
+			std::this_thread::sleep_for(1ms);
+		}
+		return condition();
+	}
+
+	// The protection-change seam: fails the next g_protect_fails write
+	// upgrades (negative: all of them), everything else passes through.
+	// The handler and poisoned-slot recovery share the seam, so the budget
+	// decides how many attempts fail before one heals the slot.
+	std::atomic<int> g_protect_fails{0};
+
+	int failing_protect(void *addr, size_t len, int prot) {
+		if ((prot & PROT_WRITE) != 0) {
+			for (int budget = g_protect_fails.load(std::memory_order_acquire); budget != 0;) {
+				if (budget < 0 ||
+					g_protect_fails.compare_exchange_weak(budget, budget - 1,
+														  std::memory_order_acq_rel)) {
+					errno = ENOMEM;
+					return -1;
+				}
+			}
+		}
+		return ::mprotect(addr, len, prot);
+	}
+
 	struct RegionWriteTest : ::testing::Test {
 		privateer::testing::temp_dir dir;
 		uint64_t const bs = page_size();
+
+		void TearDown() override {
+			detail_region::mprotect_fn = ::mprotect;
+			g_protect_fails.store(0);
+		}
 
 		[[nodiscard]] region_options options() const {
 			region_options opts;
@@ -38,12 +76,14 @@ namespace {
 		}
 
 		// a fresh read-write region with the given number of extended slots
-		region make_region(uint64_t extended_slots) {
-			auto reg = region::create(dir.path, 8 * bs, options());
+		region make_region(uint64_t extended_slots, region_options const &opts) {
+			auto reg = region::create(dir.path, 8 * bs, opts);
 			EXPECT_TRUE(reg.has_value()) << to_string(reg.error());
 			EXPECT_TRUE(reg->extend(extended_slots * bs));
 			return std::move(*reg);
 		}
+
+		region make_region(uint64_t extended_slots) { return make_region(extended_slots, options()); }
 
 		static unsigned char volatile *bytes(region &reg) {
 			return static_cast<unsigned char volatile *>(reg.segment());
@@ -149,25 +189,61 @@ namespace {
 		EXPECT_EQ(table.dirty_slots(), 1u);
 	}
 
-	TEST_F(RegionWriteTest, AFailedProtectionChangePoisonsTheSlot) {
+	TEST_F(RegionWriteTest, ATransientProtectionFailureHealsThroughRecovery) {
 		auto reg = make_region(1);
-		detail_region::mprotect_fn = [](void *, size_t, int) {
-			errno = ENOMEM;
-			return -1;
-		};
+		auto &table = detail_region::table_of(reg);
+		g_protect_fails.store(1);  // the handler's change fails once; the retry heals
+		detail_region::mprotect_fn = failing_protect;
+
+		std::atomic<bool> done{false};
+		std::thread writer{[&] {
+			(void) arm_thread_fault_stack();
+			bytes(reg)[0] = 'w';  // poisons the slot and parks in the handler
+			done.store(true, std::memory_order_release);
+		}};
+		ASSERT_TRUE(eventually([&] { return table.load(0) == slot_state::poisoned; }));
+		EXPECT_EQ(detail_region::poisoned_slots(reg), 1u);
+		EXPECT_FALSE(done.load(std::memory_order_acquire));  // parked on the poisoned slot
+
+		// a cleaner cycle is the recovery actor; the parked store lands
+		(void) detail_region::run_cleaner_batch(reg, false);
+		writer.join();
+
+		EXPECT_TRUE(done.load());
+		EXPECT_EQ(bytes(reg)[0], 'w');
+		EXPECT_EQ(table.load(0), slot_state::dirty);
+		EXPECT_EQ(table.dirty_slots(), 1u);
+		EXPECT_EQ(detail_region::poisoned_slots(reg), 0u);
+		EXPECT_TRUE(reg.check_sanity());
+	}
+
+	TEST_F(RegionWriteTest, ASustainedProtectionFailureTimesOutAndSetsTheFlag) {
+		auto opts = options();
+		opts.poison_timeout = 50ms;  // no recovery actor runs; only the timeout ends the wait
+		auto reg = make_region(1, opts);
+		g_protect_fails.store(-1);
+		detail_region::mprotect_fn = failing_protect;
 		bool const handled =
 				detail_region::deliver_fault(reg, reinterpret_cast<uintptr_t>(reg.segment()), SIGSEGV);
-		detail_region::mprotect_fn = ::mprotect;
 
-		EXPECT_FALSE(handled);
+		EXPECT_FALSE(handled);  // the wait timed out; the write is lost
 		auto &table = detail_region::table_of(reg);
 		EXPECT_EQ(table.load(0), slot_state::poisoned);
 		EXPECT_EQ(table.dirty_slots(), 0u);  // the failed claim is balanced
+		EXPECT_EQ(detail_region::poisoned_slots(reg), 1u);
 		EXPECT_FALSE(reg.check_sanity());
+	}
 
-		// a later fault on the poisoned slot forwards without waiting
-		EXPECT_FALSE(detail_region::deliver_fault(reg, reinterpret_cast<uintptr_t>(reg.segment()), SIGSEGV));
-		EXPECT_EQ(table.load(0), slot_state::poisoned);
+	TEST_F(RegionWriteTest, ATimedOutPoisonedWaitForwardsAsACrash) {
+		auto opts = options();
+		opts.poison_timeout = 50ms;
+		auto reg = make_region(1, opts);
+		g_protect_fails.store(-1);
+		detail_region::mprotect_fn = failing_protect;
+		auto const res = PRIVATEER_SANDBOX {
+			bytes(reg)[0] = 'x';  // no recovery actor in the child; the wait times out
+		};
+		EXPECT_TRUE(is_fault_signal(res));
 	}
 
 	TEST_F(RegionWriteTest, ConcurrentFirstTouchesOfOneSlotAllLand) {
