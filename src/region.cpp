@@ -14,6 +14,7 @@
 #include <privateer/word_wait.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <functional>
 #include <memory>
@@ -133,6 +134,8 @@ namespace privateer {
 		result<uint64_t> (*resident_bytes_fn)() = resident_pss_bytes;
 		int (*pageout_fn)(void *, size_t) = pageout_range;
 		bool (*commit_post_fails_fn)(size_t) = nullptr;
+		bool (*cleaner_write_fails_fn)(size_t) = nullptr;
+		bool (*cleaner_durability_fails_fn)() = nullptr;
 
 	}  // namespace detail_region
 #endif
@@ -180,6 +183,28 @@ namespace privateer {
 #ifdef PRIVATEER_TEST_HOOKS
 			return detail_region::commit_post_fails_fn != nullptr &&
 				   detail_region::commit_post_fails_fn(worker);
+#else
+			return false;
+#endif
+		}
+
+		// Whether the cleaner's block write for this slot must fail, the way
+		// ENOSPC would; tests reroute it through the seam.
+		bool cleaner_write_fails([[maybe_unused]] size_t slot) {
+#ifdef PRIVATEER_TEST_HOOKS
+			return detail_region::cleaner_write_fails_fn != nullptr &&
+				   detail_region::cleaner_write_fails_fn(slot);
+#else
+			return false;
+#endif
+		}
+
+		// Whether the cleaner's eager durability barrier must fail, the way
+		// a failed fsync would; tests reroute it through the seam.
+		bool cleaner_durability_fails() {
+#ifdef PRIVATEER_TEST_HOOKS
+			return detail_region::cleaner_durability_fails_fn != nullptr &&
+				   detail_region::cleaner_durability_fails_fn();
 #else
 			return false;
 #endif
@@ -530,22 +555,40 @@ namespace privateer {
 		};
 		std::vector<cleaner_slot_meta> cleaner_meta;
 
+		// Batch-level failure bookkeeping. The counter and the backoff time
+		// are guarded by the commit mutex; the disabled flag is also read by
+		// the scheduling paths outside it.
+		size_t cleaner_failures = 0;        // consecutive failed batches
+		int64_t cleaner_backoff_until = 0;  // no batch before this cleaner-clock time
+		std::atomic<uint32_t> cleaner_off{0};
+
 		// One write-back batch: scans for dirty slots, orders them coldest
-		// first, and runs the commit's capture and write-out for each, one
-		// slot at a time. The on-disk recipe is untouched; the recipe table
-		// entries the batch updates are picked up by the next commit, so a
-		// crash anywhere in here leaves only sweepable block files behind.
-		// override_backoff takes every dirty slot regardless of its backoff:
-		// the hard-watermark drain, where cleaner throughput must not wait
-		// out backoff timers. Returns the number of slots written back.
+		// first, and runs the commit's capture and write-out for them under
+		// one commit-mutex hold. The batch writes every victim's block file
+		// first and remaps only after that (in eager-durable mode, after the
+		// batch's durability barrier), so any failure can still unwind: the
+		// recipe-table entry and the references revert and the slot returns
+		// to dirty while its private pages exist. The on-disk recipe is
+		// untouched; the recipe table entries the batch updates are picked
+		// up by the next commit, so a crash anywhere in here leaves only
+		// sweepable block files behind. A failed batch backs the cleaner
+		// off, and repeated failures disable it (failure_limit); only a slot
+		// the batch cannot restore is poisoned. override_backoff takes every
+		// dirty slot regardless of its re-dirty backoff: the hard-watermark
+		// drain, where cleaner throughput must not wait out backoff timers.
+		// Returns the number of slots written back.
 		size_t clean_batch(bool override_backoff) {
 			std::lock_guard const commit_lock{commit_mutex};
-			if (hot->error.load(std::memory_order_acquire) != 0) {
+			if (hot->error.load(std::memory_order_acquire) != 0 ||
+				cleaner_off.load(std::memory_order_acquire) != 0) {
 				return 0;
 			}
 			auto &table = hot->table;
 			uint64_t const block_size = rec.block_size;
 			int64_t const now = cleaner_now_ns();
+			if (now < cleaner_backoff_until) {
+				return 0;  // backing off after a failed batch
+			}
 			size_t const slots = table.extended_size() / block_size;
 			if (cleaner_meta.size() < slots) {
 				cleaner_meta.resize(slots);
@@ -588,8 +631,52 @@ namespace privateer {
 				victims.resize(cleaner.batch_slots);
 			}
 
-			size_t cleaned = 0;
-			std::vector<block_digest> written;
+			// A slot the batch captured but has not released yet. prior is
+			// the recipe-table entry before the batch; replaced says the
+			// entry now names the new block.
+			struct pending_slot {
+				size_t slot;
+				block_digest prior;
+				bool replaced;
+			};
+			std::vector<pending_slot> pendings;
+			std::vector<block_digest> written;      // entries the barrier must cover
+			std::vector<block_digest> fresh_names;  // block files this batch created
+			// Claims are held from the capture loop on, so the engine's own
+			// bookkeeping must not allocate with a claim in hand (the same
+			// rule as the commit's capture); the loops below only push into
+			// this space.
+			pendings.reserve(victims.size());
+			written.reserve(victims.size());
+			fresh_names.reserve(victims.size());
+			bool failed = false;
+
+			// Restores one pending slot: the recipe-table entry and the
+			// references revert, the freeze reverses, and the slot returns
+			// to dirty. Only a failed reversal poisons; the caller wakes the
+			// governor word once for the batch.
+			auto const unwind = [&](pending_slot const &p) {
+				auto &entry = rec.entries[p.slot];
+				if (p.replaced) {
+					store->drop_reference(entry);
+					if (p.prior.size != 0) {
+						store->add_reference(p.prior);
+					}
+					entry = p.prior;
+				}
+				auto *const addr = segment_base() + p.slot * block_size;
+				if (::mprotect(addr, block_size, PROT_READ | PROT_WRITE) != 0) {
+					table.publish(p.slot, slot_state::poisoned);
+					table.sub_dirty();
+					hot->error.store(1, std::memory_order_release);
+					PRIVATEER_LOG(log_level::error, "cleaner cannot restore slot {} (errno {})", p.slot,
+								  errno);
+					return;
+				}
+				table.publish(p.slot, slot_state::dirty);
+			};
+
+			// Capture and write: claim, freeze, hash, write the block file.
 			for (size_t const slot : victims) {
 				if (hot->closing.load(std::memory_order_acquire) != 0) {
 					break;
@@ -601,68 +688,125 @@ namespace privateer {
 				// freeze: when mprotect returns, no core holds a stale
 				// writable entry, so the content below is what gets hashed
 				if (::mprotect(addr, block_size, PROT_READ) != 0) {
-					table.publish(slot, slot_state::poisoned);
-					table.sub_dirty();
-					hot->error.store(1, std::memory_order_release);
-					PRIVATEER_LOG(log_level::error, "cleaner cannot freeze slot {} (errno {})", slot, errno);
+					// a failed downgrade may have covered part of the range;
+					// the unwind reverses it before the slot goes back to dirty
+					PRIVATEER_LOG(log_level::warning, "cleaner cannot freeze slot {} (errno {})", slot,
+								  errno);
+					unwind({slot, {}, false});
+					failed = true;
 					break;
 				}
 				std::span<std::byte const> const content{addr, block_size};
 				auto const name = hash_block(rec.algorithm, content);
 				auto &entry = rec.entries[slot];
-				if (name != entry) {
-					if (auto published = store->publish(name, content); !published) {
-						// Nothing is lost: the slot goes back to dirty and the
-						// next commit retries the write-out and reports the
-						// failure to a caller.
-						PRIVATEER_LOG(log_level::warning, "cleaner cannot write slot {} back: {}", slot,
-									  to_string(published.error()));
-						if (::mprotect(addr, block_size, PROT_READ | PROT_WRITE) != 0) {
-							table.publish(slot, slot_state::poisoned);
-							table.sub_dirty();
-							hot->error.store(1, std::memory_order_release);
-						} else {
-							table.publish(slot, slot_state::dirty);
-						}
-						break;
-					}
-					if (entry.size != 0) {
-						store->drop_reference(entry);
-					}
-					store->add_reference(name);
-					entry = name;
+				if (name == entry) {
+					pendings.push_back({slot, entry, false});
+					written.push_back(entry);
+					continue;
 				}
-				if (auto mapped = map_block_file(addr, block_size, store->block_path(entry)); !mapped) {
-					table.publish(slot, slot_state::poisoned);
-					table.sub_dirty();
-					hot->error.store(1, std::memory_order_release);
-					PRIVATEER_LOG(log_level::error, "cleaner cannot remap slot {}: {}", slot,
-								  to_string(mapped.error()));
+				auto const published =
+						cleaner_write_fails(slot)
+								? result<bool>{std::unexpected{error{errc::io_error, ENOSPC,
+																	 "write a block file"}}}
+								: store->publish(name, content);
+				if (!published) {
+					// Nothing is lost: the slot goes back to dirty and the
+					// next commit retries the write-out and reports the
+					// failure to a caller.
+					PRIVATEER_LOG(log_level::warning, "cleaner cannot write slot {} back: {}", slot,
+								  to_string(published.error()));
+					unwind({slot, {}, false});
+					failed = true;
 					break;
 				}
-				table.publish(slot, slot_state::clean);
-				table.sub_dirty();
-				auto &meta = cleaner_meta[slot];
-				meta.cleaned_at_ns = now;
-				meta.first_dirty_ns = -1;
-				written.push_back(entry);
-				++cleaned;
-				cleaner_slot_done(slot);
+				if (*published) {
+					fresh_names.push_back(name);
+				}
+				pendings.push_back({slot, entry, true});
+				if (entry.size != 0) {
+					store->drop_reference(entry);
+				}
+				store->add_reference(name);
+				entry = name;
+				written.push_back(name);
 			}
 
 			// Eager durability: the full durable-name contract for what the
 			// batch wrote, both halves batched (the file contents, then the
-			// shard directory entries). A name recorded after only the file
-			// sync would let a later durable commit skip the directory sync.
+			// shard directory entries), before any of the batch's remaps. A
+			// name recorded after only the file sync would let a later
+			// durable commit skip the directory sync. A failed barrier
+			// unwinds the whole batch while the private pages still exist,
+			// and drops the files this batch created: a later publish of the
+			// same content must not dedup against a file whose sync failed,
+			// because a re-synced file cannot be trusted; the rewrite
+			// through a fresh file is the trustworthy retry.
 			if (cleaner.mode == cleaner_mode::eager_durable && !written.empty()) {
-				if (auto synced = store->make_durable(written); !synced) {
-					// A failed sync leaves the durability of the written
-					// blocks unknown, and a retried sync cannot be trusted
-					// once the kernel may have dropped the dirty pages.
-					hot->error.store(1, std::memory_order_release);
-					PRIVATEER_LOG(log_level::error, "cleaner durability barrier failed: {}",
+				auto const synced = cleaner_durability_fails()
+											? result<>{std::unexpected{error{errc::io_error, EIO,
+																			 "sync a block file"}}}
+											: store->make_durable(written);
+				if (!synced) {
+					PRIVATEER_LOG(log_level::warning, "cleaner durability barrier failed: {}",
 								  to_string(synced.error()));
+					for (auto const &p : pendings) {
+						unwind(p);
+					}
+					for (auto const &name : fresh_names) {
+						store->discard_unreferenced(name);
+					}
+					pendings.clear();
+					failed = true;
 				}
+			}
+
+			// Remap and release. A failure here unwinds this slot and the
+			// rest of the batch; the slots already released keep their
+			// release.
+			size_t cleaned = 0;
+			for (size_t i = 0; i < pendings.size(); ++i) {
+				auto const &p = pendings[i];
+				auto *const addr = segment_base() + p.slot * block_size;
+				if (auto mapped = map_block_file(addr, block_size, store->block_path(rec.entries[p.slot]));
+					!mapped) {
+					PRIVATEER_LOG(log_level::warning, "cleaner cannot remap slot {}: {}", p.slot,
+								  to_string(mapped.error()));
+					for (size_t k = i; k < pendings.size(); ++k) {
+						unwind(pendings[k]);
+					}
+					failed = true;
+					break;
+				}
+				table.publish(p.slot, slot_state::clean);
+				table.sub_dirty();
+				auto &meta = cleaner_meta[p.slot];
+				meta.cleaned_at_ns = now;
+				meta.first_dirty_ns = -1;
+				++cleaned;
+				cleaner_slot_done(p.slot);
+			}
+
+			if (failed) {
+				// Republished dirt with no counter change: wake a parked
+				// cleaner wait and any writer at the hard mark, the same
+				// reason the commit's restore paths wake.
+				table.wake_governor();
+				++cleaner_failures;
+				if (cleaner.failure_limit != 0 && cleaner_failures >= cleaner.failure_limit) {
+					cleaner_off.store(1, std::memory_order_release);
+					PRIVATEER_LOG(log_level::error,
+								  "cleaner disabled after {} consecutive failed batches; "
+								  "write-back degrades to commits",
+								  cleaner_failures);
+				} else if (cleaner.backoff_base.count() > 0) {
+					auto const shift = static_cast<int64_t>(std::min<size_t>(cleaner_failures - 1, 20));
+					cleaner_backoff_until =
+							now + std::min(cleaner.backoff_base.count() << shift,
+										   cleaner.backoff_cap.count());
+				}
+			} else if (cleaned > 0) {
+				cleaner_failures = 0;
+				cleaner_backoff_until = 0;
 			}
 			return cleaned;
 		}
@@ -679,7 +823,9 @@ namespace privateer {
 				}
 				post_task([this] {
 					(void) clean_batch(false);
-					schedule_cleaner();
+					if (cleaner_off.load(std::memory_order_acquire) == 0) {
+						schedule_cleaner();
+					}
 				});
 			});
 		}
@@ -703,6 +849,12 @@ namespace privateer {
 			// visible here
 			uint32_t const observed = hot->table.governor_word().load(std::memory_order_acquire);
 			if (hot->closing.load(std::memory_order_acquire) != 0) {
+				return;
+			}
+			if (cleaner_off.load(std::memory_order_acquire) != 0) {
+				// Self-disabled after repeated failures: the chain ends,
+				// write-back degrades to commits, and hard-mark waits drain
+				// through their timeouts.
 				return;
 			}
 			uint64_t const block_size = rec.block_size;
@@ -801,6 +953,11 @@ namespace privateer {
 			std::mutex mutex;
 			std::vector<entry> entries;
 			bool armed = false;
+			// Set when the residency probe fails: procfs can be restricted
+			// in containers, and a budget that cannot measure cannot trim.
+			// Only the resident budget dies; the store stays healthy. A new
+			// registration gives the probe another chance.
+			bool disabled = false;
 
 			static resident_sweeper &instance() {
 				static resident_sweeper sweeper;
@@ -811,6 +968,7 @@ namespace privateer {
 				std::lock_guard const lock{mutex};
 				entries.push_back({owner, hot, governor.resident_soft, governor.resident_low,
 								   governor.sweep_interval.count()});
+				disabled = false;
 				if (!armed) {
 					armed = true;
 					arm(min_interval_ns());
@@ -859,11 +1017,15 @@ namespace privateer {
 			// one sweep pass; returns the bytes it asked the kernel to push out
 			uint64_t pass(bool rearm) {
 				std::lock_guard const lock{mutex};
-				if (entries.empty()) {
+				if (entries.empty() || disabled) {
 					armed = false;
 					return 0;
 				}
 				uint64_t const asked = sweep_locked();
+				if (disabled) {
+					armed = false;
+					return asked;
+				}
 				if (rearm) {
 					arm(min_interval_ns());
 				}
@@ -879,7 +1041,9 @@ namespace privateer {
 				}
 				auto const resident = resident_bytes_now();
 				if (!resident) {
-					PRIVATEER_LOG(log_level::warning, "resident sweep cannot read residency: {}",
+					disabled = true;
+					PRIVATEER_LOG(log_level::error,
+								  "resident sweep cannot read residency, resident budget disabled: {}",
 								  to_string(resident.error()));
 					return 0;
 				}
@@ -1466,13 +1630,9 @@ namespace privateer {
 			}
 			size_t const run_slots = captured[j - 1].slot - captured[i].slot + 1;
 			if (::mprotect(slot_addr(captured[i].slot), run_slots * block_size, PROT_READ) != 0) {
-				int const freeze_errno = errno;
-				for (size_t k = i; k < j; ++k) {
-					table.publish(captured[k].slot, slot_state::poisoned);
-					table.sub_dirty();
-				}
-				st.hot->error.store(1, std::memory_order_release);
-				errno = freeze_errno;
+				// The captured slots stay syncing; the guard above reverses
+				// any partial downgrade of this run and republishes dirty,
+				// so the commit unwinds completely and a retry can succeed.
 				return fail_errno(errc::io_error, "freeze captured slots");
 			}
 			i = j;
@@ -1546,13 +1706,13 @@ namespace privateer {
 				}
 				std::span<std::byte const> const content{slot_addr(cap.slot), block_size};
 				auto const name = hash_block(st.rec.algorithm, content);
+				block_digest const prior = entry;
 				if (name != entry) {
 					if (auto published = st.store->publish(name, content); !published) {
 						res.err = published.error();
 						write_out_failed.store(1, std::memory_order_release);
 						return;
 					}
-					res.deltas.push_back({entry, name});
 					entry = name;
 				}
 				// One MAP_FIXED call replaces the private pages with the
@@ -1562,12 +1722,18 @@ namespace privateer {
 				if (auto mapped =
 							map_block_file(slot_addr(cap.slot), block_size, st.store->block_path(entry));
 					!mapped) {
-					table.publish(cap.slot, slot_state::poisoned);
-					table.sub_dirty();
-					st.hot->error.store(1, std::memory_order_release);
+					// The mapping is untouched by the failed call, so the
+					// slot unwinds: the entry reverts, the restore guard
+					// republishes dirty, and a retried commit rehashes the
+					// same private pages. A published file stays sweepable
+					// garbage.
+					entry = prior;
 					res.err = mapped.error();
 					write_out_failed.store(1, std::memory_order_release);
 					return;
+				}
+				if (name != prior) {
+					res.deltas.push_back({prior, name});
 				}
 				table.publish(cap.slot, slot_state::clean);
 				table.sub_dirty();
@@ -1732,6 +1898,10 @@ namespace privateer {
 
 		size_t run_cleaner_batch(region &reg, bool override_backoff) {
 			return reg.state_->clean_batch(override_backoff);
+		}
+
+		bool cleaner_disabled(region &reg) noexcept {
+			return reg.state_->cleaner_off.load(std::memory_order_acquire) != 0;
 		}
 
 		uint64_t run_resident_sweep() {

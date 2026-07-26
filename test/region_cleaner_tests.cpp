@@ -70,6 +70,8 @@ namespace {
 		void TearDown() override {
 			detail_region::clock_fn = real_clock_;
 			detail_region::cleaner_slot_hook = nullptr;
+			detail_region::cleaner_write_fails_fn = nullptr;
+			detail_region::cleaner_durability_fails_fn = nullptr;
 		}
 
 		// The interval keeps the timer from ever firing inside a test; the
@@ -312,6 +314,110 @@ namespace {
 		EXPECT_EQ(bytes(*reopened)[0], 'x');
 		EXPECT_EQ(bytes(*reopened)[bs], 'y');
 		EXPECT_EQ(count_block_files(dir.path), 2u);
+	}
+
+	TEST_F(RegionCleanerTest, AFailedWriteBackUnwindsTheSlotAndLeavesTheStoreHealthy) {
+		privateer::testing::build_committed_store(dir.path, bs, {'x'});
+		auto reg = region::open(dir.path, options(cleaner_mode::non_durable));
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		auto &table = detail_region::table_of(*reg);
+		bytes(*reg)[0] = 'a';
+
+		detail_region::cleaner_write_fails_fn = [](size_t) { return true; };
+		EXPECT_EQ(detail_region::run_cleaner_batch(*reg, false), 0u);
+		detail_region::cleaner_write_fails_fn = nullptr;
+
+		// the slot is dirty again, writable, and the region is healthy
+		EXPECT_EQ(table.load(0), slot_state::dirty);
+		EXPECT_EQ(table.dirty_slots(), 1u);
+		EXPECT_TRUE(reg->check_sanity());
+		bytes(*reg)[0] = 'b';  // a native store into the restored mapping
+
+		// sync(true) succeeds, so close earns the consistency mark
+		ASSERT_TRUE(reg->commit(true));
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		EXPECT_EQ(bytes(*reopened)[0], 'b');
+	}
+
+	TEST_F(RegionCleanerTest, AFailedBatchBacksTheCleanerOff) {
+		privateer::testing::build_committed_store(dir.path, bs, {'x'});
+		auto reg = region::open(dir.path, options(cleaner_mode::non_durable));
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		bytes(*reg)[0] = 'a';
+
+		detail_region::cleaner_write_fails_fn = [](size_t) { return true; };
+		ASSERT_EQ(detail_region::run_cleaner_batch(*reg, false), 0u);  // fails at 0
+		detail_region::cleaner_write_fails_fn = nullptr;
+
+		// no attempt before backoff_base has passed, even though the
+		// failure is gone
+		ASSERT_EQ(detail_region::run_cleaner_batch(*reg, false), 0u);
+		g_now.store(99);
+		ASSERT_EQ(detail_region::run_cleaner_batch(*reg, false), 0u);
+		g_now.store(100);
+		EXPECT_EQ(detail_region::run_cleaner_batch(*reg, false), 1u);
+		EXPECT_TRUE(reg->check_sanity());
+	}
+
+	TEST_F(RegionCleanerTest, RepeatedFailuresDisableTheCleanerAndTheStoreStaysHealthy) {
+		privateer::testing::build_committed_store(dir.path, bs, {'x'});
+		auto opts = options(cleaner_mode::non_durable);
+		opts.cleaner.failure_limit = 3;
+		auto reg = region::open(dir.path, opts);
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		bytes(*reg)[0] = 'a';
+
+		// each failed batch doubles the backoff; the third disables
+		detail_region::cleaner_write_fails_fn = [](size_t) { return true; };
+		ASSERT_EQ(detail_region::run_cleaner_batch(*reg, false), 0u);  // backoff until 100
+		EXPECT_FALSE(detail_region::cleaner_disabled(*reg));
+		g_now.store(100);
+		ASSERT_EQ(detail_region::run_cleaner_batch(*reg, false), 0u);  // backoff until 300
+		g_now.store(300);
+		ASSERT_EQ(detail_region::run_cleaner_batch(*reg, false), 0u);
+		detail_region::cleaner_write_fails_fn = nullptr;
+		EXPECT_TRUE(detail_region::cleaner_disabled(*reg));
+
+		// disabled means no more attempts, not an unhealthy store
+		g_now.store(100000);
+		EXPECT_EQ(detail_region::run_cleaner_batch(*reg, false), 0u);
+		EXPECT_TRUE(reg->check_sanity());
+		ASSERT_TRUE(reg->commit(true));  // commit-time write-back still lands the data
+
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		EXPECT_EQ(bytes(*reopened)[0], 'a');
+	}
+
+	TEST_F(RegionCleanerTest, AFailedDurabilityBarrierUnwindsTheWholeBatch) {
+		privateer::testing::build_committed_store(dir.path, bs, {std::nullopt, std::nullopt});
+		auto reg = region::open(dir.path, options(cleaner_mode::eager_durable));
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		auto &table = detail_region::table_of(*reg);
+		bytes(*reg)[0] = 'a';
+		bytes(*reg)[bs] = 'b';
+
+		detail_region::cleaner_durability_fails_fn = [] { return true; };
+		EXPECT_EQ(detail_region::run_cleaner_batch(*reg, false), 0u);
+		detail_region::cleaner_durability_fails_fn = nullptr;
+
+		// both slots unwound to dirty, and the files the batch created are
+		// gone: nothing a later publish could dedup against
+		EXPECT_EQ(table.load(0), slot_state::dirty);
+		EXPECT_EQ(table.load(1), slot_state::dirty);
+		EXPECT_EQ(table.dirty_slots(), 2u);
+		EXPECT_TRUE(reg->check_sanity());
+		EXPECT_EQ(count_block_files(dir.path), 0u);
+
+		// past the failure backoff the retry writes both back durably
+		g_now.store(100);
+		EXPECT_EQ(detail_region::run_cleaner_batch(*reg, false), 2u);
+		ASSERT_TRUE(reg->commit(true));
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		EXPECT_EQ(bytes(*reopened)[0], 'a');
+		EXPECT_EQ(bytes(*reopened)[bs], 'b');
 	}
 
 	TEST_F(RegionCleanerTest, TheTimerDrivenCleanerDrainsDirtySlots) {

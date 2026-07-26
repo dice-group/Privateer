@@ -81,6 +81,15 @@ namespace privateer {
 		// only garbage remains.
 		void reclaim();
 
+		// Unlinks an unreferenced name's file right away instead of leaving
+		// it to reclaim. For unwind paths that must not leave the file
+		// behind as a dedup target: after a failed durability barrier a
+		// re-synced file cannot be trusted, so a retry must rewrite through
+		// a fresh file. The caller guarantees the on-disk recipe does not
+		// reference the name (it names a file created after the last recipe
+		// commit). A name that still has references is left alone.
+		void discard_unreferenced(block_digest const &name);
+
 		// Open-time sweep: unlinks every file in the store whose name is not
 		// in referenced, including temp leftovers. Returns the number of
 		// files removed. Read-write opens only; the caller has verified the
