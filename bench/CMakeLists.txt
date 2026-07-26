@@ -7,3 +7,7 @@ target_link_libraries(privateer_hash_bench PRIVATE privateer::privateer benchmar
 add_executable(privateer_region_bench region_bench.cpp)
 target_include_directories(privateer_region_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../test)
 target_link_libraries(privateer_region_bench PRIVATE privateer::privateer benchmark::benchmark Threads::Threads)
+
+add_executable(privateer_addressing_bench addressing_bench.cpp)
+target_include_directories(privateer_addressing_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../test)
+target_link_libraries(privateer_addressing_bench PRIVATE privateer::privateer benchmark::benchmark)
