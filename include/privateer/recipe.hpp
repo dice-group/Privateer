@@ -56,6 +56,10 @@ namespace privateer {
 	// block_size bytes
 	result<> validate_blocks(recipe const &rec, block_store const &store);
 
+	// deep open validation: every referenced block file re-hashes to its
+	// recipe name; one full read pass over the unique referenced blocks
+	result<> deep_verify_blocks(recipe const &rec, block_store const &store);
+
 }  // namespace privateer
 
 #endif  // PRIVATEER_RECIPE_HPP

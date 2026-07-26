@@ -232,4 +232,43 @@ namespace privateer {
 		return {};
 	}
 
+	result<> deep_verify_blocks(recipe const &rec, block_store const &store) {
+		boost::unordered_flat_set<block_digest, block_digest_hash> checked;
+		std::vector<std::byte> content(rec.block_size);
+		for (auto const &entry : rec.entries) {
+			if (entry.size == 0 || !checked.insert(entry).second) {
+				continue;
+			}
+			int const fd = ::open(store.block_path(entry).c_str(), O_RDONLY | O_CLOEXEC);
+			if (fd < 0) {
+				return fail_errno(errc::datastore_inconsistent, "open referenced block");
+			}
+			size_t offset = 0;
+			while (offset < content.size()) {
+				ssize_t const got = ::pread(fd, content.data() + offset, content.size() - offset,
+											static_cast<off_t>(offset));
+				if (got < 0) {
+					if (errno == EINTR) {
+						continue;
+					}
+					auto const err = fail_errno(errc::io_error, "read referenced block");
+					::close(fd);
+					return err;
+				}
+				if (got == 0) {
+					break;
+				}
+				offset += static_cast<size_t>(got);
+			}
+			::close(fd);
+			if (offset != content.size()) {
+				return fail(errc::block_file_invalid, "referenced block is not exactly block_size");
+			}
+			if (hash_block(rec.algorithm, content) != entry) {
+				return fail(errc::block_file_invalid, "referenced block does not hash to its name");
+			}
+		}
+		return {};
+	}
+
 }  // namespace privateer
