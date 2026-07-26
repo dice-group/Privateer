@@ -34,7 +34,10 @@ namespace fs = std::filesystem;
 
 namespace {
 
-	bool eventually(std::function<bool()> const &condition, std::chrono::seconds timeout = 10s) {
+	// Patient by default: these waits assert that something happens at all,
+	// not how fast. A sanitizer build on a small oversubscribed runner needs
+	// the room, and the wait returns as soon as the condition holds.
+	bool eventually(std::function<bool()> const &condition, std::chrono::seconds timeout = 60s) {
 		auto const deadline = std::chrono::steady_clock::now() + timeout;
 		while (std::chrono::steady_clock::now() < deadline) {
 			if (condition()) {
