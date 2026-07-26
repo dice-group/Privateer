@@ -53,6 +53,13 @@ target_include_directories(privateer_barrier_tests PRIVATE ${CMAKE_CURRENT_SOURC
 target_link_libraries(privateer_barrier_tests PRIVATE privateer::privateer GTest::gtest_main Threads::Threads)
 gtest_discover_tests(privateer_barrier_tests PROPERTIES TIMEOUT ${PRIVATEER_TEST_TIMEOUT})
 
+# own binary: the combined long-running soak; excluded from CI by its label,
+# run locally with ctest -L long_running (PRIVATEER_SOAK_SECONDS stretches it)
+add_executable(privateer_soak_tests region_soak_tests.cpp)
+target_include_directories(privateer_soak_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(privateer_soak_tests PRIVATE privateer::privateer GTest::gtest_main Threads::Threads)
+gtest_discover_tests(privateer_soak_tests PROPERTIES LABELS long_running TIMEOUT 900)
+
 # own binary: its strong metall_log must replace the weak built-in sink at link time
 add_executable(privateer_logger_override_test logger_override_tests.cpp)
 target_include_directories(privateer_logger_override_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
