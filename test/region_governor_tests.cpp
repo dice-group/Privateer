@@ -104,6 +104,9 @@ namespace {
 			opts.governor.dirty_low = low_blocks * bs;
 			opts.governor.dirty_hard = hard_blocks * bs;
 			opts.governor.hard_timeout = hard_timeout;
+			// the watermarks here are a few blocks by design; the floor has
+			// its own validation test
+			opts.governor.hard_floor_blocks = 1;
 			return opts;
 		}
 
@@ -148,6 +151,28 @@ namespace {
 			auto reg = region::create(dir.path / "d", 16 * bs, opts);
 			ASSERT_FALSE(reg.has_value());
 			EXPECT_EQ(reg.error().code, errc::invalid_argument);
+		}
+	}
+
+	TEST_F(RegionGovernorTest, TheHardMarkSanityFloorIsValidated) {
+		{
+			auto opts = options(2, 0, 4);
+			opts.governor.hard_floor_blocks = 8;  // the hard mark sits at 4 blocks: below the floor
+			auto reg = region::create(dir.path / "a", 16 * bs, opts);
+			ASSERT_FALSE(reg.has_value());
+			EXPECT_EQ(reg.error().code, errc::invalid_argument);
+		}
+		{
+			auto opts = options(2, 0, 8);
+			opts.governor.hard_floor_blocks = 8;  // exactly at the floor passes
+			auto reg = region::create(dir.path / "b", 16 * bs, opts);
+			EXPECT_TRUE(reg.has_value()) << to_string(reg.error());
+		}
+		{
+			auto opts = options(1, 0, 1);
+			opts.governor.hard_floor_blocks = 0;  // 0 disables the check
+			auto reg = region::create(dir.path / "c", 16 * bs, opts);
+			EXPECT_TRUE(reg.has_value()) << to_string(reg.error());
 		}
 	}
 
@@ -275,6 +300,7 @@ namespace {
 		auto const elapsed = std::chrono::steady_clock::now() - start;
 		EXPECT_GE(elapsed, timeout);
 		EXPECT_LT(elapsed, 10 * timeout);
+		EXPECT_EQ(reg->statistics().writer_stalls, 1u);
 		// the write overshot to two dirty blocks; the woken cleaner may
 		// have written the fresh one back by the time this samples
 		EXPECT_GE(table.dirty_slots(), 1u);
@@ -304,6 +330,45 @@ namespace {
 		// the commit quiesces the write-back before the content read
 		ASSERT_TRUE(reg->commit(true));
 		EXPECT_EQ(bytes(*reg)[2 * bs], 'c');
+	}
+
+	TEST_F(RegionGovernorTest, AWorkingSetAboveTheHardMarkThrashesWithoutLosingWrites) {
+		// Thrash: the write working set does not fit under the hard
+		// watermark, so the cleaner's override cleans the coldest dirty
+		// slot and the writer re-dirties it, round after round. Forward
+		// progress holds (every write lands), and the redirty ratio
+		// approaching one is what makes the regime diagnosable.
+		auto opts = options(2, 0, 4, 60s);
+		// Re-dirty detection needs a window. The frozen test clock keeps
+		// every re-dirty inside it, and the zero backoff_base keeps every
+		// slot eligible, so the cleaner never idles.
+		opts.cleaner.backoff_cap = std::chrono::hours{1};
+		auto reg = region::create(dir.path, 16 * bs, opts);
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		ASSERT_TRUE(reg->extend(8 * bs));
+
+		size_t const rounds = 32;
+		for (size_t round = 1; round <= rounds; ++round) {
+			for (size_t slot = 0; slot < 8; ++slot) {
+				bytes(*reg)[slot * bs] = static_cast<unsigned char>('a' + (round + slot) % 26);
+			}
+		}
+		auto const stats = reg->statistics();
+		EXPECT_GT(stats.writer_stalls, 0u);
+		EXPECT_GT(stats.slots_cleaned, rounds);
+		EXPECT_GT(stats.redirty_ratio(), 0.5);
+
+		// every write landed and the store is consistent; the commit
+		// quiesces the write-back before the content reads
+		ASSERT_TRUE(reg->commit(true));
+		for (size_t slot = 0; slot < 8; ++slot) {
+			EXPECT_EQ(bytes(*reg)[slot * bs], static_cast<unsigned char>('a' + (rounds + slot) % 26));
+		}
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		for (size_t slot = 0; slot < 8; ++slot) {
+			EXPECT_EQ(bytes(*reopened)[slot * bs], static_cast<unsigned char>('a' + (rounds + slot) % 26));
+		}
 	}
 
 	TEST_F(RegionGovernorTest, ABlockedWriterHoldingApplicationLocksMakesProgress) {

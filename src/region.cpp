@@ -106,6 +106,12 @@ namespace privateer {
 			int64_t gov_hard_timeout_ns = 0;
 			// longest a writer parked on a poisoned slot waits for recovery
 			int64_t poison_timeout_ns = 0;
+			// Counters behind region::statistics(). The stall counter is
+			// written by the fault handler, so they live in the mlocked hot
+			// state with everything else the handler touches.
+			std::atomic<uint64_t> stat_cleaned{0};
+			std::atomic<uint64_t> stat_redirtied{0};
+			std::atomic<uint64_t> stat_stalls{0};
 		};
 
 		// the resident sweep's default probe: the process Pss
@@ -327,6 +333,7 @@ namespace privateer {
 							int64_t const now = monotonic_now_ns();
 							if (gate_deadline < 0) {
 								gate_deadline = now + hot.gov_hard_timeout_ns;
+								hot.stat_stalls.fetch_add(1, std::memory_order_relaxed);
 							} else if (now >= gate_deadline) {
 								break;  // bounded stall: overshoot by one block
 							}
@@ -683,6 +690,7 @@ namespace privateer {
 				if (meta.first_dirty_ns < 0) {
 					meta.first_dirty_ns = now;
 					if (meta.cleaned_at_ns >= 0 && now - meta.cleaned_at_ns < cleaner.backoff_cap.count()) {
+						hot->stat_redirtied.fetch_add(1, std::memory_order_relaxed);
 						meta.backoff_ns = meta.backoff_ns == 0
 												  ? cleaner.backoff_base.count()
 												  : std::min(meta.backoff_ns * 2, cleaner.backoff_cap.count());
@@ -856,6 +864,9 @@ namespace privateer {
 				meta.first_dirty_ns = -1;
 				++cleaned;
 				cleaner_slot_done(p.slot);
+			}
+			if (cleaned > 0) {
+				hot->stat_cleaned.fetch_add(cleaned, std::memory_order_relaxed);
 			}
 
 			if (failed) {
@@ -1296,6 +1307,10 @@ namespace privateer {
 			if (gov.dirty_hard != 0 && gov.hard_timeout.count() <= 0) {
 				return fail(errc::invalid_argument, "the hard watermark needs a positive hard_timeout");
 			}
+			if (gov.dirty_hard != 0 && gov.dirty_hard / rec->block_size < gov.hard_floor_blocks) {
+				return fail(errc::invalid_argument,
+							"dirty_hard sits below the sanity floor of hard_floor_blocks blocks");
+			}
 		} else if (gov.dirty_hard != 0 || gov.dirty_low != 0) {
 			return fail(errc::invalid_argument, "the dirty budget needs a soft watermark");
 		}
@@ -1494,6 +1509,13 @@ namespace privateer {
 
 	bool region::check_sanity() const noexcept {
 		return state_->hot->error.load(std::memory_order_acquire) == 0;
+	}
+
+	region_statistics region::statistics() const noexcept {
+		auto const &hot = *state_->hot;
+		return {.slots_cleaned = hot.stat_cleaned.load(std::memory_order_relaxed),
+				.slots_redirtied = hot.stat_redirtied.load(std::memory_order_relaxed),
+				.writer_stalls = hot.stat_stalls.load(std::memory_order_relaxed)};
 	}
 
 	result<> region::extend(uint64_t target_size) {

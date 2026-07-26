@@ -106,12 +106,37 @@ namespace privateer {
 		uint64_t dirty_hard = 0;
 		// longest a writer waits at the hard mark before it overshoots
 		std::chrono::nanoseconds hard_timeout = std::chrono::milliseconds{100};
+		// Sanity floor for the hard watermark, in blocks: a nonzero
+		// dirty_hard below hard_floor_blocks * block_size fails open. A
+		// hard mark of a few blocks cannot hold any real write working
+		// set and thrashes by construction. 0 disables the check.
+		uint64_t hard_floor_blocks = 8;
 
 		// resident budget, bytes, Linux only; resident_soft 0 disables it
 		uint64_t resident_soft = 0;
 		uint64_t resident_low = 0;
 		// cadence of the resident sweep
 		std::chrono::nanoseconds sweep_interval = std::chrono::seconds{1};
+	};
+
+	// Write-back and backpressure counters, monotonic while the region is
+	// open. They make the thrash regime diagnosable: a redirty ratio near
+	// one under a steady hard watermark means the dirty budget cannot hold
+	// the write working set, and the fix is a larger budget.
+	struct region_statistics {
+		// slots the cleaner wrote back
+		uint64_t slots_cleaned = 0;
+		// cleaned slots that turned dirty again within their backoff window
+		uint64_t slots_redirtied = 0;
+		// write faults that waited at the hard watermark
+		uint64_t writer_stalls = 0;
+
+		// slots_redirtied over slots_cleaned; 0 while nothing was cleaned
+		[[nodiscard]] double redirty_ratio() const noexcept {
+			return slots_cleaned == 0
+						   ? 0.0
+						   : static_cast<double>(slots_redirtied) / static_cast<double>(slots_cleaned);
+		}
 	};
 
 	struct region_options {
@@ -290,6 +315,10 @@ namespace privateer {
 		// true while no failure was recorded on the region; once false,
 		// commits and close fail, and metall withholds the consistency mark
 		[[nodiscard]] bool check_sanity() const noexcept;
+
+		// write-back and backpressure counters since open; all zero on a
+		// read-only region
+		[[nodiscard]] region_statistics statistics() const noexcept;
 
 		// Extends the region to at least target_size bytes, rounded up to
 		// whole slots: maps the grown range as anonymous zeros and publishes
