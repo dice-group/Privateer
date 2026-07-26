@@ -35,7 +35,7 @@ namespace privateer {
 		clean,        // block-file mapping matching the recipe entry, read-only
 		dirty,        // private copy-on-write pages, writable
 		dirty_empty,  // freed since the last commit: anonymous zeros, the recipe entry is stale
-		poisoned,     // a protection change failed; every actor reports an error instead of waiting
+		poisoned,     // a protection change failed; recoverable, waits on it are always timed
 		// Transient claim states, each owned by exactly one actor until it
 		// publishes a terminal state.
 		materializing,  // a faulting writer installs write access
@@ -85,6 +85,13 @@ namespace privateer {
 
 		// Waits while the slot holds observed; returns the changed state.
 		[[nodiscard]] slot_state wait_changed(size_t slot, slot_state observed) noexcept;
+
+		// Timed variant: waits at most timeout_ns. Returns the current state;
+		// observed back means the deadline passed with the word unchanged.
+		// Waits on a poisoned slot use this, so a slot whose recovery never
+		// succeeds cannot park a waiter forever.
+		[[nodiscard]] slot_state wait_changed_for(size_t slot, slot_state observed,
+												  int64_t timeout_ns) noexcept;
 
 		// Dirty accounting, slot-granular: a slot counts from the moment a
 		// faulting writer wins its materializing claim until it leaves dirty

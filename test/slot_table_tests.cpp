@@ -99,6 +99,26 @@ namespace {
 		EXPECT_EQ(table.wait_changed(1, slot_state::empty), slot_state::freeing);
 	}
 
+	TEST(SlotTableTest, TimedWaitReturnsObservedOnTimeout) {
+		auto table = make_table(4);
+		// nothing publishes: the deadline passes with the word unchanged
+		EXPECT_EQ(table.wait_changed_for(0, slot_state::empty, 5'000'000), slot_state::empty);
+	}
+
+	TEST(SlotTableTest, TimedWaitReturnsOnPublish) {
+		auto table = make_table(4);
+		ASSERT_TRUE(table.try_claim(1, slot_state::empty, slot_state::syncing));
+		slot_state seen = slot_state::syncing;
+		std::thread waiter{[&] {
+			// a minute, but the publish below releases the wait promptly
+			seen = table.wait_changed_for(1, slot_state::syncing, 60'000'000'000);
+		}};
+		std::this_thread::sleep_for(std::chrono::milliseconds{20});
+		table.publish(1, slot_state::poisoned);
+		waiter.join();
+		EXPECT_EQ(seen, slot_state::poisoned);
+	}
+
 	TEST(SlotTableTest, ClaimStormHasExactlyOneWinner) {
 		auto table = make_table(1);
 		constexpr int threads = 8;

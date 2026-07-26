@@ -31,7 +31,6 @@ namespace {
 			errc::memlock_limit_too_low,
 			errc::vma_budget_exceeded,
 			errc::hash_collision,
-			errc::region_poisoned,
 			errc::shutting_down,
 			errc::capacity_exceeded,
 	};
@@ -55,8 +54,8 @@ namespace {
 	}
 
 	TEST(ErrorMessage, CodeAndContext) {
-		EXPECT_EQ(privateer::to_string(error{errc::region_poisoned, 0, "commit capture"}),
-				  "region_poisoned: commit capture");
+		EXPECT_EQ(privateer::to_string(error{errc::shutting_down, 0, "free_region"}),
+				  "shutting_down: free_region");
 	}
 
 	TEST(ErrorMessage, CodeContextAndErrno) {

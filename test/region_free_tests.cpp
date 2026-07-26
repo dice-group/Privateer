@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <privateer/fault_handler.hpp>
 #include <privateer/region.hpp>
 #include <privateer/vm.hpp>
 
@@ -7,8 +8,10 @@
 #include "support/temp_dir.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <thread>
 
@@ -25,13 +28,48 @@
 #endif
 
 using namespace privateer;
+using namespace std::chrono_literals;
 using privateer::testing::count_block_files;
 
 namespace {
 
+	bool eventually(std::function<bool()> const &condition, std::chrono::seconds timeout = 30s) {
+		auto const deadline = std::chrono::steady_clock::now() + timeout;
+		while (std::chrono::steady_clock::now() < deadline) {
+			if (condition()) {
+				return true;
+			}
+			std::this_thread::sleep_for(1ms);
+		}
+		return condition();
+	}
+
+	// the protection-change seam: fails the next g_protect_fails write
+	// upgrades, everything else passes through
+	std::atomic<int> g_protect_fails{0};
+
+	int failing_protect(void *addr, size_t len, int prot) {
+		if ((prot & PROT_WRITE) != 0) {
+			for (int budget = g_protect_fails.load(std::memory_order_acquire); budget != 0;) {
+				if (budget < 0 ||
+					g_protect_fails.compare_exchange_weak(budget, budget - 1,
+														  std::memory_order_acq_rel)) {
+					errno = ENOMEM;
+					return -1;
+				}
+			}
+		}
+		return ::mprotect(addr, len, prot);
+	}
+
 	struct RegionFreeTest : ::testing::Test {
 		privateer::testing::temp_dir dir;
 		uint64_t const bs = page_size();
+
+		void TearDown() override {
+			detail_region::mprotect_fn = ::mprotect;
+			g_protect_fails.store(0);
+		}
 
 		// a region over a committed store holding 'a' and 'b'
 		region open_ab() {
@@ -177,19 +215,34 @@ namespace {
 		EXPECT_EQ(bytes(reg)[0], 0);
 	}
 
-	TEST_F(RegionFreeTest, FreeOnAPoisonedSlotFails) {
+	TEST_F(RegionFreeTest, AFreeHealsAPoisonedSlot) {
 		auto reg = open_ab();
-		detail_region::mprotect_fn = [](void *, size_t, int) {
-			errno = ENOMEM;
-			return -1;
-		};
-		(void) detail_region::deliver_fault(reg, reinterpret_cast<uintptr_t>(reg.segment()), SIGSEGV);
-		detail_region::mprotect_fn = ::mprotect;
-		ASSERT_EQ(detail_region::table_of(reg).load(0), slot_state::poisoned);
+		auto &table = detail_region::table_of(reg);
+		g_protect_fails.store(1);  // the handler's change fails once
+		detail_region::mprotect_fn = failing_protect;
 
-		auto freed = reg.free_region(0, 2 * bs);
-		ASSERT_FALSE(freed.has_value());
-		EXPECT_EQ(freed.error().code, errc::region_poisoned);
+		std::atomic<bool> done{false};
+		std::thread writer{[&] {
+			(void) arm_thread_fault_stack();
+			bytes(reg)[0] = 'w';  // poisons slot 0 and parks in the handler
+			done.store(true, std::memory_order_release);
+		}};
+		ASSERT_TRUE(eventually([&] { return table.load(0) == slot_state::poisoned; }));
+
+		// The free claims the poisoned slot directly: the remap replaces the
+		// mapping wholesale and does not need the protection change that
+		// failed. The woken writer rematerializes the fresh zeros.
+		ASSERT_TRUE(reg.free_region(0, bs));
+		writer.join();
+
+		EXPECT_TRUE(done.load());
+		EXPECT_EQ(bytes(reg)[0], 'w');
+		EXPECT_EQ(bytes(reg)[1], 0);  // the pre-free content was discarded
+		EXPECT_EQ(bytes(reg)[bs], 'b');
+		EXPECT_EQ(table.load(0), slot_state::dirty);
+		EXPECT_EQ(table.dirty_slots(), 1u);
+		EXPECT_EQ(detail_region::poisoned_slots(reg), 0u);
+		EXPECT_TRUE(reg.check_sanity());
 	}
 
 	TEST_F(RegionFreeTest, ACaptureSkipsAFreeingSlotAndKeepsThePreFreeName) {

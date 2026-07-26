@@ -90,6 +90,11 @@ namespace privateer {
 			slot_table table;
 			std::atomic<uint32_t> error{0};
 			std::atomic<uint32_t> closing{0};
+			// Count of slots in poisoned state, the recovery cue: the handler
+			// increments when it poisons, every heal decrements. The governed
+			// cleaner runs a batch whenever it is nonzero, so recovery does
+			// not wait for the dirty budget.
+			std::atomic<uint64_t> poisoned{0};
 			uintptr_t segment_start = 0;
 			uint64_t block_size = 0;
 			// Dirty budget thresholds the handler reads on every fault.
@@ -99,6 +104,8 @@ namespace privateer {
 			uint64_t gov_soft_cross = 0;
 			uint64_t gov_hard_bytes = 0;
 			int64_t gov_hard_timeout_ns = 0;
+			// longest a writer parked on a poisoned slot waits for recovery
+			int64_t poison_timeout_ns = 0;
 		};
 
 		// the resident sweep's default probe: the process Pss
@@ -286,9 +293,11 @@ namespace privateer {
 				return false;  // beyond the extended size: a genuine wild access
 			}
 			size_t const slot = offset / hot.block_size;
-			// One deadline bounds the total hard-mark wait of this fault,
-			// across re-loops and spurious wakeups.
+			// One deadline each bounds the total hard-mark wait and the total
+			// poisoned-recovery wait of this fault, across re-loops and
+			// spurious wakeups.
 			int64_t gate_deadline = -1;
+			int64_t poison_deadline = -1;
 			for (;;) {
 				slot_state const state = hot.table.load(slot);
 				switch (state) {
@@ -330,13 +339,21 @@ namespace privateer {
 						void *const slot_addr =
 								reinterpret_cast<void *>(hot.segment_start + slot * hot.block_size);
 						if (protect_slot_for_write(slot_addr, hot.block_size) != 0) {
-							// The slot is dead. Balance the count, publish the
-							// terminal poisoned state so no waiter parks
-							// forever, record the failure, and forward.
+							// VMA exhaustion, a process-wide condition that can
+							// clear; the failed syscall changed nothing, so the
+							// mapping and content are intact. The handler
+							// cannot retry (signal context, nothing it waits on
+							// drains VMAs), so it hands the slot over: balance
+							// the count, publish poisoned, and wake the
+							// governor word as the recovery request (the
+							// cleaner waits on that word; the wake comes after
+							// the publish so a woken cleaner finds the slot
+							// poisoned). Then park below like any waiter.
+							hot.poisoned.fetch_add(1, std::memory_order_release);
 							hot.table.sub_dirty();
 							hot.table.publish(slot, slot_state::poisoned);
-							hot.error.store(1, std::memory_order_release);
-							return false;
+							hot.table.wake_governor();
+							continue;
 						}
 						hot.table.publish(slot, slot_state::dirty);
 						if (hot.gov_soft_cross != 0 && dirty_now >= hot.gov_soft_cross) {
@@ -373,9 +390,25 @@ namespace privateer {
 						// stale TLB entry or a benign race with a fresh
 						// transition; the retry succeeds.
 						return true;
-					case slot_state::poisoned:
-						hot.error.store(1, std::memory_order_release);
-						return false;
+					case slot_state::poisoned: {
+						// Recovery runs where retrying is possible: the
+						// cleaner and commit capture retry the protection
+						// change under the commit mutex and republish dirty;
+						// free_region heals by remap. Park with a timeout, so
+						// a slot whose recovery never succeeds cannot hold
+						// this writer forever; on timeout the write is lost
+						// and the segment may be torn mid-operation, so the
+						// terminal flag is set and the fault forwards.
+						int64_t const now = monotonic_now_ns();
+						if (poison_deadline < 0) {
+							poison_deadline = now + hot.poison_timeout_ns;
+						} else if (now >= poison_deadline) {
+							hot.error.store(1, std::memory_order_release);
+							return false;
+						}
+						(void) hot.table.wait_changed_for(slot, state, poison_deadline - now);
+						continue;  // re-examine; recovery may have republished dirty
+					}
 				}
 				// a corrupt state value: no claim was won, nothing to balance
 				hot.error.store(1, std::memory_order_release);
@@ -562,6 +595,33 @@ namespace privateer {
 		int64_t cleaner_backoff_until = 0;  // no batch before this cleaner-clock time
 		std::atomic<uint32_t> cleaner_off{0};
 
+		// Retries the protection change a poisoned slot failed. The caller
+		// holds the commit mutex, so retrying is possible here (normal thread
+		// context, and the condition behind the failure can have cleared). On
+		// success the block counts dirty again, dirty is republished, and the
+		// parked writer's retried store lands. On failure the slot stays
+		// poisoned and the next cycle retries. Returns whether the slot was
+		// healed; false also when a concurrent free_region claimed the slot
+		// first (its remap heals instead).
+		bool recover_poisoned(size_t slot) {
+			auto &table = hot->table;
+			if (!table.try_claim(slot, slot_state::poisoned, slot_state::syncing)) {
+				return false;
+			}
+			auto *const addr = segment_base() + slot * rec.block_size;
+			if (protect_slot_for_write(addr, rec.block_size) != 0) {
+				PRIVATEER_LOG(log_level::warning, "recovery of poisoned slot {} failed (errno {})", slot,
+							  errno);
+				table.publish(slot, slot_state::poisoned);
+				return false;
+			}
+			table.add_dirty();
+			hot->poisoned.fetch_sub(1, std::memory_order_release);
+			table.publish(slot, slot_state::dirty);
+			PRIVATEER_LOG(log_level::info, "poisoned slot {} recovered", slot);
+			return true;
+		}
+
 		// One write-back batch: scans for dirty slots, orders them coldest
 		// first, and runs the commit's capture and write-out for them under
 		// one commit-mutex hold. The batch writes every victim's block file
@@ -605,7 +665,18 @@ namespace privateer {
 			std::vector<size_t> victims;
 			for (size_t slot = 0; slot < slots; ++slot) {
 				auto &meta = cleaner_meta[slot];
-				if (table.load(slot) != slot_state::dirty) {
+				slot_state const state = table.load(slot);
+				if (state == slot_state::poisoned) {
+					// The cleaner is the recovery actor: the handler's wake
+					// after poisoning lands in the cleaner's governor-word
+					// wait, and each cycle retries here. A healed slot is
+					// dirty now and stays out of this batch; the writer's
+					// parked store lands first.
+					(void) recover_poisoned(slot);
+					meta.first_dirty_ns = -1;
+					continue;
+				}
+				if (state != slot_state::dirty) {
 					meta.first_dirty_ns = -1;
 					continue;
 				}
@@ -666,6 +737,7 @@ namespace privateer {
 				}
 				auto *const addr = segment_base() + p.slot * block_size;
 				if (::mprotect(addr, block_size, PROT_READ | PROT_WRITE) != 0) {
+					hot->poisoned.fetch_add(1, std::memory_order_release);
 					table.publish(p.slot, slot_state::poisoned);
 					table.sub_dirty();
 					hot->error.store(1, std::memory_order_release);
@@ -859,7 +931,11 @@ namespace privateer {
 			}
 			uint64_t const block_size = rec.block_size;
 			uint64_t const dirty_bytes = hot->table.dirty_slots() * block_size;
-			if (dirty_bytes > (draining ? governor.dirty_low : governor.dirty_soft)) {
+			// A poisoned slot runs a batch regardless of the budget: the batch
+			// is where recovery retries, and the handler's wake after
+			// poisoning is what woke this step.
+			bool const have_poisoned = hot->poisoned.load(std::memory_order_acquire) != 0;
+			if (have_poisoned || dirty_bytes > (draining ? governor.dirty_low : governor.dirty_soft)) {
 				bool const writers_blocked =
 						governor.dirty_hard != 0 && dirty_bytes + block_size > governor.dirty_hard;
 				if (clean_batch(writers_blocked) == 0) {
@@ -1193,6 +1269,9 @@ namespace privateer {
 		if (rec->block_size % page_size() != 0) {
 			return fail(errc::option_mismatch, "block_size is not a multiple of this host's page size");
 		}
+		if (options.poison_timeout.count() <= 0) {
+			return fail(errc::invalid_argument, "poison_timeout must be positive");
+		}
 		if (options.cleaner.mode != cleaner_mode::off) {
 			if (options.cleaner.interval.count() <= 0 || options.cleaner.batch_slots == 0) {
 				return fail(errc::invalid_argument, "the cleaner needs a positive interval and batch size");
@@ -1290,6 +1369,7 @@ namespace privateer {
 		st.governor = options.governor;
 		st.read_only = read_only;
 		st.store = std::move(*store);
+		st.hot->poison_timeout_ns = options.poison_timeout.count();
 		if (!read_only && st.governor.dirty_soft != 0) {
 			// the dirty-slot count whose reach crosses the soft watermark
 			st.hot->gov_soft_cross = st.governor.dirty_soft / st.rec.block_size + 1;
@@ -1479,13 +1559,14 @@ namespace privateer {
 			slot_state prior;
 			for (;;) {
 				slot_state const state = table.load(slot);
-				if (state == slot_state::poisoned) {
-					return fail(errc::region_poisoned, "a slot is dead after a failed protection change");
-				}
 				if (is_transient(state)) {
 					(void) table.wait_changed(slot, state);
 					continue;
 				}
+				// A poisoned slot is claimed like any terminal state: the
+				// anonymous remap replaces the mapping wholesale and does not
+				// need the protection change that failed, so the free heals
+				// the slot as a side effect.
 				if (table.try_claim(slot, state, slot_state::freeing)) {
 					prior = state;
 					break;
@@ -1496,6 +1577,11 @@ namespace privateer {
 			// writers cannot exist for a freed range (the allocator freed it).
 			if (auto mapped = map_anonymous(segment_base + slot * block_size, block_size, page_access::read);
 				!mapped) {
+				// A failed MAP_FIXED mmap can leave the range unmapped, so
+				// restorability is in doubt: terminal flag.
+				if (prior != slot_state::poisoned) {
+					st.hot->poisoned.fetch_add(1, std::memory_order_release);
+				}
 				table.publish(slot, slot_state::poisoned);
 				if (prior == slot_state::dirty) {
 					table.sub_dirty();
@@ -1506,6 +1592,9 @@ namespace privateer {
 			table.publish(slot, slot_state::dirty_empty);
 			if (prior == slot_state::dirty) {
 				table.sub_dirty();
+			} else if (prior == slot_state::poisoned) {
+				// the handler balanced the dirty counter at poisoning time
+				st.hot->poisoned.fetch_sub(1, std::memory_order_release);
 			}
 		}
 		return {};
@@ -1572,6 +1661,7 @@ namespace privateer {
 					continue;
 				}
 				if (::mprotect(slot_addr(cap.slot), block_size, PROT_READ | PROT_WRITE) != 0) {
+					st.hot->poisoned.fetch_add(1, std::memory_order_release);
 					table.publish(cap.slot, slot_state::poisoned);
 					table.sub_dirty();
 					st.hot->error.store(1, std::memory_order_release);
@@ -1607,7 +1697,19 @@ namespace privateer {
 					continue;
 				}
 				if (state == slot_state::poisoned) {
-					return fail(errc::region_poisoned, "a slot is dead after a failed protection change");
+					// Recovery under the mutex this commit already holds: on
+					// success the slot is dirty and the re-examination
+					// captures it normally. An unhealed slot keeps its recipe
+					// entry and the commit proceeds without it: no store has
+					// landed on the slot, so its content is unchanged since
+					// the entry named it. (A slot poisoned out of dirty_empty
+					// keeps its pre-free name for content that is zeros in
+					// memory, the same divergence as the freeing skip below,
+					// and sound for the same reason.)
+					if (!st.recover_poisoned(slot) && table.load(slot) == slot_state::poisoned) {
+						break;
+					}
+					continue;  // healed, or a concurrent free claimed it; re-examine
 				}
 				// clean and empty are already persisted; a freeing slot
 				// resolves to dirty_empty and belongs to the next epoch
@@ -1902,6 +2004,10 @@ namespace privateer {
 
 		bool cleaner_disabled(region &reg) noexcept {
 			return reg.state_->cleaner_off.load(std::memory_order_acquire) != 0;
+		}
+
+		uint64_t poisoned_slots(region &reg) noexcept {
+			return reg.state_->hot->poisoned.load(std::memory_order_acquire);
 		}
 
 		uint64_t run_resident_sweep() {

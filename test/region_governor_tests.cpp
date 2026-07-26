@@ -52,6 +52,24 @@ namespace {
 	// the injected cleaner clock; the backoff never engages in these tests
 	std::atomic<int64_t> g_now{0};
 
+	// the protection-change seam: fails the next g_protect_fails write
+	// upgrades, everything else passes through
+	std::atomic<int> g_protect_fails{0};
+
+	int failing_protect(void *addr, size_t len, int prot) {
+		if ((prot & PROT_WRITE) != 0) {
+			for (int budget = g_protect_fails.load(std::memory_order_acquire); budget != 0;) {
+				if (budget < 0 ||
+					g_protect_fails.compare_exchange_weak(budget, budget - 1,
+														  std::memory_order_acq_rel)) {
+					errno = ENOMEM;
+					return -1;
+				}
+			}
+		}
+		return ::mprotect(addr, len, prot);
+	}
+
 	struct RegionGovernorTest : ::testing::Test {
 		privateer::testing::temp_dir dir;
 		uint64_t const bs = page_size();
@@ -65,6 +83,8 @@ namespace {
 
 		void TearDown() override {
 			detail_region::clock_fn = real_clock_;
+			detail_region::mprotect_fn = ::mprotect;
+			g_protect_fails.store(0);
 		}
 
 		// Cleaner driven purely by governor wakes: the interval fallback
@@ -307,26 +327,32 @@ namespace {
 		writer.join();
 	}
 
-	TEST_F(RegionGovernorTest, APoisonedSlotFailsCommitsAndCloseDoesNotHang) {
-		auto reg = region::create(dir.path, 16 * bs, options(2, 0, 4));
+	TEST_F(RegionGovernorTest, TheGovernedCleanerHealsAPoisonedSlot) {
+		auto opts = options(2, 0, 4);
+		opts.poison_timeout = 60s;  // patient: the heal releases the writer long before
+		auto reg = region::create(dir.path, 16 * bs, opts);
 		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
 		ASSERT_TRUE(reg->extend(4 * bs));
+		g_protect_fails.store(1);  // the handler's change fails once; the retry heals
+		detail_region::mprotect_fn = failing_protect;
+
+		// One dirty block stays far below the soft mark, so only the
+		// handler's wake after poisoning can activate the cleaner; its next
+		// batch retries the protection change and the parked store lands.
+		std::atomic<bool> done{false};
+		std::thread writer{[&] {
+			(void) arm_thread_fault_stack();
+			bytes(*reg)[bs] = 'x';
+			done.store(true, std::memory_order_release);
+		}};
+		EXPECT_TRUE(eventually([&] { return done.load(std::memory_order_acquire); }, 30s));
+		writer.join();
+
 		auto &table = detail_region::table_of(*reg);
-
-		// a dead slot, exactly as the handler's failed-mprotect path leaves
-		// it: counter balanced, terminal poisoned published
-		bytes(*reg)[bs] = 'x';
-		table.publish(1, slot_state::poisoned);
-		table.sub_dirty();
-
-		auto committed = reg->commit(true);
-		ASSERT_FALSE(committed.has_value());
-		EXPECT_EQ(committed.error().code, errc::region_poisoned);
-		auto freed = reg->free_region(bs, bs);
-		ASSERT_FALSE(freed.has_value());
-		EXPECT_EQ(freed.error().code, errc::region_poisoned);
-		// close completes although the cleaner is live and a slot is dead;
-		// the test ends by destroying the region
+		EXPECT_EQ(bytes(*reg)[bs], 'x');
+		EXPECT_EQ(table.load(1), slot_state::dirty);
+		EXPECT_EQ(detail_region::poisoned_slots(*reg), 0u);
+		EXPECT_TRUE(reg->check_sanity());
 	}
 
 	TEST_F(RegionGovernorTest, CloseForwardsAParkedHardMarkWaiterAsACrash) {
