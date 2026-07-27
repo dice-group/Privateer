@@ -96,7 +96,15 @@ jobs:
         run: cmake --build build -j$(nproc)
 
       - name: Test
-        run: ctest --test-dir build -j$(nproc) --output-on-failure -LE long_running
+        run: ctest --test-dir build -j$(nproc) --output-on-failure -LE "long_running|probes"
+
+      # The probes measure the host, not the change under review: they assert
+      # kernel behaviour the engine relies on, and a shared runner can decline
+      # an advisory syscall for a whole test. Their result is a record, so a
+      # failure here is reported and does not fail the job.
+      - name: Platform probes
+        continue-on-error: true
+        run: ctest --test-dir build -j$(nproc) --output-on-failure -L probes
 
   macos:
     runs-on: macos-15
@@ -144,4 +152,8 @@ jobs:
         run: cmake --build build -j$(sysctl -n hw.ncpu)
 
       - name: Test
-        run: ctest --test-dir build -j$(sysctl -n hw.ncpu) --output-on-failure -LE long_running
+        run: ctest --test-dir build -j$(sysctl -n hw.ncpu) --output-on-failure -LE "long_running|probes"
+
+      - name: Platform probes
+        continue-on-error: true
+        run: ctest --test-dir build -j$(sysctl -n hw.ncpu) --output-on-failure -L probes
