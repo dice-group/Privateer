@@ -2,7 +2,10 @@
 // throughput and worker scaling, writer stall during a commit, and reader
 // disturbance during commit capture. Every benchmark sweeps the A/B 3
 // block-size candidates (2, 8, 32 MiB); the commit benchmark additionally
-// sweeps the worker count (A/B 4).
+// sweeps the worker count (A/B 4) up to 48, one per hardware thread of the
+// benchmark machine. The process work pool holds one thread per hardware
+// thread, so worker counts above that queue there and measure saturation
+// rather than more parallelism.
 //
 // The datastore lives under the default temp directory. For decision-grade
 // numbers run with TMPDIR on a container-local disk: virtio-fs mounts are
@@ -290,17 +293,35 @@ namespace {
 		}
 	}
 
+	// Every commit arm reports real time: a commit spends its time in worker
+	// threads and in the device, and the reported rate divides the bytes by
+	// the reported time. Against the committing thread's own CPU time a
+	// fan-out looks faster the more work it hands off.
 	BENCHMARK(fault_latency)->ArgNames({"MiB"})->Arg(2)->Arg(8)->Arg(32)->UseManualTime();
 	BENCHMARK(commit_non_durable)
 			->ArgNames({"MiB", "workers"})
-			->ArgsProduct({{2, 8, 32}, {1, 2, 4, 8, 16}})
+			->ArgsProduct({{2, 8, 32}, {1, 2, 4, 8, 16, 24, 32, 48}})
+			->UseRealTime()
 			->Unit(benchmark::kMillisecond);
 	BENCHMARK(commit_durable)
 			->ArgNames({"MiB", "workers"})
 			->ArgsProduct({{2, 8, 32}, {0}})
+			->UseRealTime()
 			->Unit(benchmark::kMillisecond);
-	BENCHMARK(commit_writer_stall)->ArgNames({"MiB"})->Arg(2)->Arg(8)->Arg(32)->Unit(benchmark::kMillisecond);
-	BENCHMARK(reader_disturbance)->ArgNames({"MiB"})->Arg(2)->Arg(8)->Arg(32)->Unit(benchmark::kMillisecond);
+	BENCHMARK(commit_writer_stall)
+			->ArgNames({"MiB"})
+			->Arg(2)
+			->Arg(8)
+			->Arg(32)
+			->UseRealTime()
+			->Unit(benchmark::kMillisecond);
+	BENCHMARK(reader_disturbance)
+			->ArgNames({"MiB"})
+			->Arg(2)
+			->Arg(8)
+			->Arg(32)
+			->UseRealTime()
+			->Unit(benchmark::kMillisecond);
 
 }  // namespace
 
