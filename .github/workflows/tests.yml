@@ -30,7 +30,7 @@ jobs:
             cxx: clang++-21
             sanitizer: "thread"
             san-name: tsan
-            experimental: true
+            experimental: false
           - os: ubuntu-26.04-arm
             cc: gcc-15
             cxx: g++-15
