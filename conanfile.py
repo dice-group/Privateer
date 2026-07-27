@@ -1,7 +1,6 @@
 import os
 
 from conan import ConanFile
-from conan.tools.build import check_min_cppstd
 from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
 from conan.tools.files import copy, rmdir
 
@@ -38,9 +37,6 @@ class PrivateerConan(ConanFile):
     def build_requirements(self):
         self.test_requires("gtest/1.17.0")
         self.test_requires("benchmark/1.9.5")
-
-    def validate(self):
-        check_min_cppstd(self, 23)
 
     def layout(self):
         cmake_layout(self)
