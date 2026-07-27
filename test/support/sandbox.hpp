@@ -8,6 +8,8 @@
 // Preconditions:
 // - the process is single threaded when the sandbox forks (or no other thread holds a global lock)
 // - the block must not call std::exit; return instead
+// - under TSan the binary links support/sanitizer_options.cpp, which turns off
+//   the guard that kills a child creating a thread after a multi-threaded fork
 
 #include <cerrno>
 #include <csignal>

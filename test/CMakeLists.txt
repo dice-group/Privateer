@@ -38,6 +38,7 @@ add_executable(privateer_unit_tests
         region_tests.cpp
         region_write_tests.cpp
         slot_table_tests.cpp
+        support/sanitizer_options.cpp
         vm_tests.cpp
         word_wait_tests.cpp)
 target_include_directories(privateer_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -48,7 +49,8 @@ gtest_discover_tests(privateer_unit_tests PROPERTIES TIMEOUT ${PRIVATEER_TEST_TI
 add_executable(privateer_barrier_tests
         registry_tests.cpp
         fault_handler_tests.cpp
-        memlock_tests.cpp)
+        memlock_tests.cpp
+        support/sanitizer_options.cpp)
 target_include_directories(privateer_barrier_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(privateer_barrier_tests PRIVATE privateer::privateer GTest::gtest_main Threads::Threads)
 gtest_discover_tests(privateer_barrier_tests PROPERTIES TIMEOUT ${PRIVATEER_TEST_TIMEOUT})
