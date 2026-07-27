@@ -119,10 +119,13 @@ namespace privateer {
 		std::chrono::nanoseconds sweep_interval = std::chrono::seconds{1};
 	};
 
-	// Write-back and backpressure counters, monotonic while the region is
-	// open. They make the thrash regime diagnosable: a redirty ratio near
-	// one under a steady hard watermark means the dirty budget cannot hold
-	// the write working set, and the fix is a larger budget.
+	// Write-out, write-back and backpressure counters, monotonic while the
+	// region is open. They make the thrash regime diagnosable: a redirty
+	// ratio near one under a steady hard watermark means the dirty budget
+	// cannot hold the write working set, and the fix is a larger budget.
+	// They also make write amplification measurable from outside: the bytes
+	// a checkpoint writes are slots_written times block_size, against the
+	// bytes the application dirtied, which only the application knows.
 	struct region_statistics {
 		// slots the cleaner wrote back
 		uint64_t slots_cleaned = 0;
@@ -130,6 +133,21 @@ namespace privateer {
 		uint64_t slots_redirtied = 0;
 		// write faults that waited at the hard watermark
 		uint64_t writer_stalls = 0;
+
+		// Write-out outcomes, counted by commits and by the cleaner alike.
+		// They count the work done, not slots released: a slot whose remap
+		// fails afterwards keeps its write counted, because the block file
+		// was written. slots_hashed is the sum of the other three plus the
+		// slots whose write-out failed before it reached an outcome.
+		//
+		// slots frozen and hashed for write-out; empty slots are not hashed
+		uint64_t slots_hashed = 0;
+		// hash matched the recipe entry, so no file was written
+		uint64_t slots_skipped = 0;
+		// new name, an identical block file already existed
+		uint64_t slots_deduped = 0;
+		// new name, a new block file was written
+		uint64_t slots_written = 0;
 
 		// slots_redirtied over slots_cleaned; 0 while nothing was cleaned
 		[[nodiscard]] double redirty_ratio() const noexcept {
@@ -324,8 +342,8 @@ namespace privateer {
 		// commits and close fail, and metall withholds the consistency mark
 		[[nodiscard]] bool check_sanity() const noexcept;
 
-		// write-back and backpressure counters since open; all zero on a
-		// read-only region
+		// write-out, write-back and backpressure counters since open; all
+		// zero on a read-only region
 		[[nodiscard]] region_statistics statistics() const noexcept;
 
 		// Extends the region to at least target_size bytes, rounded up to

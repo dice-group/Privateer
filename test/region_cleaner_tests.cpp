@@ -155,6 +155,28 @@ namespace {
 		EXPECT_EQ(bytes(*reopened)[bs], 'b');
 	}
 
+	TEST_F(RegionCleanerTest, TheWriteOutCountersCountWhatTheCleanerWrites) {
+		privateer::testing::build_committed_store(dir.path, bs, {'x', 'y'});
+		auto reg = region::open(dir.path, options(cleaner_mode::non_durable));
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		bytes(*reg)[0] = 'a';   // new content: a fresh block file
+		bytes(*reg)[bs] = 'y';  // dirtied but unchanged: the write is skipped
+		ASSERT_EQ(detail_region::run_cleaner_batch(*reg, false), 2u);
+		{
+			auto const stats = reg->statistics();
+			EXPECT_EQ(stats.slots_hashed, 2u);
+			EXPECT_EQ(stats.slots_written, 1u);
+			EXPECT_EQ(stats.slots_skipped, 1u);
+			EXPECT_EQ(stats.slots_deduped, 0u);
+			EXPECT_EQ(stats.slots_cleaned, 2u);
+		}
+
+		// Both slots are clean now, so the commit captures nothing and hashes
+		// nothing: the cleaner already paid for this content.
+		ASSERT_TRUE(reg->commit(true));
+		EXPECT_EQ(reg->statistics().slots_hashed, 2u);
+	}
+
 	TEST_F(RegionCleanerTest, NonDurableCleaningLeavesTheSyncsToTheNextDurableCommit) {
 		privateer::testing::build_committed_store(dir.path, bs, {std::nullopt, std::nullopt});
 		auto reg = region::open(dir.path, options(cleaner_mode::non_durable));

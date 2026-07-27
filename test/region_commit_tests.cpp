@@ -163,6 +163,47 @@ namespace {
 		EXPECT_EQ(bytes(*reopened)[bs], 'd');
 	}
 
+	TEST_F(RegionCommitTest, TheWriteOutCountersSeparateFreshWritesDedupsAndSkips) {
+		auto reg = make_region(3);
+		bytes(reg)[0] = 'd';       // slot 0 and slot 1 end up with the same
+		bytes(reg)[bs] = 'd';      // content, so the second one dedups
+		bytes(reg)[2 * bs] = 'e';  // its own content, its own block file
+		ASSERT_TRUE(reg.commit(true));
+		{
+			auto const stats = reg.statistics();
+			EXPECT_EQ(stats.slots_hashed, 3u);
+			EXPECT_EQ(stats.slots_written, 2u);
+			EXPECT_EQ(stats.slots_deduped, 1u);
+			EXPECT_EQ(stats.slots_skipped, 0u);
+		}
+
+		// Rewriting the same values dirties both slots again, so both are
+		// hashed again; the content still carries the entry name, so no file
+		// is written.
+		bytes(reg)[0] = 'd';
+		bytes(reg)[bs] = 'd';
+		ASSERT_TRUE(reg.commit(true));
+		auto const stats = reg.statistics();
+		EXPECT_EQ(stats.slots_hashed, 5u);
+		EXPECT_EQ(stats.slots_skipped, 2u);
+		EXPECT_EQ(stats.slots_written, 2u);
+		EXPECT_EQ(stats.slots_deduped, 1u);
+	}
+
+	TEST_F(RegionCommitTest, AnEmptiedSlotIsNotHashed) {
+		auto reg = make_region(2);
+		bytes(reg)[0] = 'a';
+		bytes(reg)[bs] = 'b';
+		ASSERT_TRUE(reg.commit(true));
+		ASSERT_EQ(reg.statistics().slots_hashed, 2u);
+
+		ASSERT_TRUE(reg.free_region(0, bs));
+		ASSERT_TRUE(reg.commit(true));
+		auto const stats = reg.statistics();
+		EXPECT_EQ(stats.slots_hashed, 2u);  // an empty slot has no content to name
+		EXPECT_EQ(stats.slots_written, 2u);
+	}
+
 	TEST_F(RegionCommitTest, ADurableCommitReclaimsTheRetiredBlock) {
 		privateer::testing::build_committed_store(dir.path, bs, {'a'});
 		auto reg = region::open(dir.path);
