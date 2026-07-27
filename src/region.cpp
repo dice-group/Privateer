@@ -475,6 +475,15 @@ namespace privateer {
 		std::mutex region_mutex;  // serializes extend and close bookkeeping
 		std::mutex commit_mutex;  // one commit at a time; owns the recipe table and the store bookkeeping
 
+		// Write-out counters behind region::statistics(). The fault handler
+		// never touches them, so unlike the counters in region_hot they need
+		// no locked memory. The commit write-out workers share them, which is
+		// one relaxed increment per block written.
+		std::atomic<uint64_t> stat_hashed{0};
+		std::atomic<uint64_t> stat_skipped{0};
+		std::atomic<uint64_t> stat_deduped{0};
+		std::atomic<uint64_t> stat_written{0};
+
 		// Detached tasks the region owns on the executor: counted here,
 		// joined at close. The commit write-out workers are not detached;
 		// the commit itself joins them before it returns. The counter is
@@ -778,8 +787,10 @@ namespace privateer {
 				}
 				std::span<std::byte const> const content{addr, block_size};
 				auto const name = hash_block(rec.algorithm, content);
+				stat_hashed.fetch_add(1, std::memory_order_relaxed);
 				auto &entry = rec.entries[slot];
 				if (name == entry) {
+					stat_skipped.fetch_add(1, std::memory_order_relaxed);
 					pendings.push_back({slot, entry, false});
 					written.push_back(entry);
 					continue;
@@ -799,6 +810,7 @@ namespace privateer {
 					failed = true;
 					break;
 				}
+				(*published ? stat_written : stat_deduped).fetch_add(1, std::memory_order_relaxed);
 				if (*published) {
 					fresh_names.push_back(name);
 				}
@@ -1524,10 +1536,15 @@ namespace privateer {
 	}
 
 	region_statistics region::statistics() const noexcept {
-		auto const &hot = *state_->hot;
+		auto const &st = *state_;
+		auto const &hot = *st.hot;
 		return {.slots_cleaned = hot.stat_cleaned.load(std::memory_order_relaxed),
 				.slots_redirtied = hot.stat_redirtied.load(std::memory_order_relaxed),
-				.writer_stalls = hot.stat_stalls.load(std::memory_order_relaxed)};
+				.writer_stalls = hot.stat_stalls.load(std::memory_order_relaxed),
+				.slots_hashed = st.stat_hashed.load(std::memory_order_relaxed),
+				.slots_skipped = st.stat_skipped.load(std::memory_order_relaxed),
+				.slots_deduped = st.stat_deduped.load(std::memory_order_relaxed),
+				.slots_written = st.stat_written.load(std::memory_order_relaxed)};
 	}
 
 	result<> region::extend(uint64_t target_size) {
@@ -1856,13 +1873,18 @@ namespace privateer {
 				}
 				std::span<std::byte const> const content{slot_addr(cap.slot), block_size};
 				auto const name = hash_block(st.rec.algorithm, content);
+				st.stat_hashed.fetch_add(1, std::memory_order_relaxed);
 				block_digest const prior = entry;
-				if (name != entry) {
-					if (auto published = st.store->publish(name, content); !published) {
+				if (name == entry) {
+					st.stat_skipped.fetch_add(1, std::memory_order_relaxed);
+				} else {
+					auto const published = st.store->publish(name, content);
+					if (!published) {
 						res.err = published.error();
 						write_out_failed.store(1, std::memory_order_release);
 						return;
 					}
+					(*published ? st.stat_written : st.stat_deduped).fetch_add(1, std::memory_order_relaxed);
 					entry = name;
 				}
 				// One MAP_FIXED call replaces the private pages with the
