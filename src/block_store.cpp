@@ -196,22 +196,32 @@ namespace privateer {
 		// keeps its own failure, so a failure anywhere leaves the durable-name
 		// set untouched.
 		std::vector<std::optional<error>> failures(pending.size() + shards.size());
+		// The path each sync builds is the only allocation left in here, and it
+		// may run on a pool thread, where an escaping exception would take the
+		// process down. It becomes this index's failure instead, so the barrier
+		// reports it and records nothing.
 		auto const sync_one = [&](size_t index) {
-			if (index < pending.size()) {
-				int const fd = ::open(block_path(pending[index]).c_str(), O_RDONLY | O_CLOEXEC);
-				if (fd < 0) {
-					failures[index] = fail_errno(errc::io_error, "open block for the durability barrier").error();
+			try {
+				if (index < pending.size()) {
+					int const fd = ::open(block_path(pending[index]).c_str(), O_RDONLY | O_CLOEXEC);
+					if (fd < 0) {
+						failures[index] =
+								fail_errno(errc::io_error, "open block for the durability barrier").error();
+						return;
+					}
+					auto synced = sync_file(fd);
+					::close(fd);
+					if (!synced) {
+						failures[index] = synced.error();
+					}
 					return;
 				}
-				auto synced = sync_file(fd);
-				::close(fd);
-				if (!synced) {
+				if (auto synced = sync_directory(blocks_dir_ / shard_name(shards[index - pending.size()]));
+					!synced) {
 					failures[index] = synced.error();
 				}
-				return;
-			}
-			if (auto synced = sync_directory(blocks_dir_ / shard_name(shards[index - pending.size()])); !synced) {
-				failures[index] = synced.error();
+			} catch (...) {
+				failures[index] = error{errc::io_error, ENOMEM, "durability barrier"};
 			}
 		};
 		spread_syncs(fan_out, failures.size(), sync_one);
@@ -291,24 +301,35 @@ namespace privateer {
 			batches[it->second].names.push_back(name);
 		}
 
+		// Reserved here, so the pass itself only allocates the paths it builds;
+		// an exception from one of those may run on a pool thread, and it ends
+		// the shard's task with its names still candidates, which is what any
+		// other failure of the pass does.
+		for (auto &batch : batches) {
+			batch.unlinked.reserve(batch.names.size());
+		}
 		auto const reclaim_shard = [&](size_t index) {
 			auto &batch = batches[index];
-			for (auto const &name : batch.names) {
-				if (::unlink(block_path(name).c_str()) != 0 && errno != ENOENT) {
-					PRIVATEER_LOG(log_level::warning, "cannot unlink block {} (errno {})", to_hex(name), errno);
-					continue;
+			try {
+				for (auto const &name : batch.names) {
+					if (::unlink(block_path(name).c_str()) != 0 && errno != ENOENT) {
+						PRIVATEER_LOG(log_level::warning, "cannot unlink block {} (errno {})", to_hex(name), errno);
+						continue;
+					}
+					batch.unlinked.push_back(name);
 				}
-				batch.unlinked.push_back(name);
+				if (batch.unlinked.empty()) {
+					return;
+				}
+				if (auto synced = sync_directory(blocks_dir_ / shard_name(batch.byte)); !synced) {
+					PRIVATEER_LOG(log_level::warning, "cannot sync shard {} after reclaim: {}",
+								  shard_name(batch.byte), to_string(synced.error()));
+					return;
+				}
+				batch.synced = true;
+			} catch (...) {
+				// the shard keeps its candidates for the next pass
 			}
-			if (batch.unlinked.empty()) {
-				return;
-			}
-			if (auto synced = sync_directory(blocks_dir_ / shard_name(batch.byte)); !synced) {
-				PRIVATEER_LOG(log_level::warning, "cannot sync shard {} after reclaim: {}",
-							  shard_name(batch.byte), to_string(synced.error()));
-				return;
-			}
-			batch.synced = true;
 		};
 		spread_syncs(fan_out, batches.size(), reclaim_shard);
 

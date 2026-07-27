@@ -232,7 +232,15 @@ namespace privateer {
 				left->fetch_add(1, std::memory_order_relaxed);
 				try {
 					asio::post(work_pool(), [&claim, count_out] {
-						claim();
+						// The contract is that body does not throw, and both
+						// callers keep it by turning their own failures into
+						// recorded ones. The catch is there so a broken
+						// contract cannot take the pool thread, and with it
+						// the process, down.
+						try {
+							claim();
+						} catch (...) {
+						}
 						count_out();
 					});
 				} catch (...) {
