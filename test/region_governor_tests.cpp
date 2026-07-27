@@ -282,8 +282,8 @@ namespace {
 	}
 
 	TEST_F(RegionGovernorTest, TheHardMarkWaitIsBoundedByTheTimeout) {
-		// Soft sits at the hard mark, so the cleaner is never activated and
-		// nothing drains: the writer must be released by the timeout alone.
+		// Soft sits at the hard mark, so nothing drains below it: the writer
+		// must be released by the timeout alone.
 		auto const timeout = 300ms;
 		auto reg = region::create(dir.path, 16 * bs, options(1, 0, 1, timeout));
 		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
@@ -299,8 +299,14 @@ namespace {
 		bytes(*reg)[bs] = 'b';  // would take the total above the hard mark
 		auto const elapsed = std::chrono::steady_clock::now() - start;
 		EXPECT_GE(elapsed, timeout);
-		EXPECT_LT(elapsed, 10 * timeout);
-		EXPECT_EQ(reg->statistics().writer_stalls, 1u);
+		// One store can stall more than once. The overshoot leaves the region
+		// above the soft mark, so the cleaner writes the fresh slot back; a
+		// store retried against the cleaned slot faults again and meets the
+		// hard mark again. Every stalled fault counts, so the count is a
+		// lower bound, and the elapsed time is a multiple of the timeout.
+		uint64_t const stalls = reg->statistics().writer_stalls;
+		EXPECT_GE(stalls, 1u);
+		EXPECT_LT(elapsed, 10 * timeout * stalls);
 		// the write overshot to two dirty blocks; the woken cleaner may
 		// have written the fresh one back by the time this samples
 		EXPECT_GE(table.dirty_slots(), 1u);
