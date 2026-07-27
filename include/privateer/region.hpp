@@ -32,7 +32,13 @@
 
 namespace privateer {
 
-	inline constexpr uint64_t default_block_size = 8ull * 1024 * 1024;
+	// The unit of write-back, and therefore what a checkpoint writes for a
+	// given amount of changed data. 2 MiB is metall's chunk size, so a
+	// whole-chunk deallocation covers exactly one slot, and it halves the
+	// write amplification of every larger candidate. What argues for larger
+	// blocks is store size: mappings, block files and recipe entries all scale
+	// with the block count of a datastore.
+	inline constexpr uint64_t default_block_size = 2ull * 1024 * 1024;
 
 	// Background write-back of dirty slots ahead of commits. off disables
 	// it. non_durable writes and remaps blocks; their durability stays with
