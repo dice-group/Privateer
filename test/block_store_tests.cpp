@@ -13,6 +13,8 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -194,6 +196,119 @@ namespace {
 		ASSERT_FALSE(barrier.has_value());
 		EXPECT_EQ(barrier.error().code, errc::io_error);
 		EXPECT_FALSE(f.store.is_durable(names[0]));
+	}
+
+	// A fan-out that runs every index on its own thread, so the store's own
+	// bookkeeping is the only thing left on the calling thread, and counts the
+	// indices it was given.
+	struct counting_fan_out {
+		std::atomic<size_t> indices{0};
+		std::atomic<size_t> calls{0};
+
+		block_store::sync_fan_out get() {
+			return [this](size_t count, std::function<void(size_t)> const &body) {
+				calls.fetch_add(1);
+				indices.fetch_add(count);
+				std::vector<std::thread> threads;
+				threads.reserve(count);
+				for (size_t index = 0; index < count; ++index) {
+					threads.emplace_back([&body, index] { body(index); });
+				}
+				for (auto &thread : threads) {
+					thread.join();
+				}
+			};
+		}
+	};
+
+	// eight distinct blocks, published but not durable
+	std::vector<block_digest> publish_eight(store_fixture &f) {
+		std::vector<block_digest> names;
+		for (int i = 0; i < 8; ++i) {
+			auto const data = content("spread block " + std::to_string(i));
+			auto const name = name_of(data);
+			EXPECT_TRUE(f.store.publish(name, data).has_value());
+			names.push_back(name);
+		}
+		return names;
+	}
+
+	size_t shard_count_of(std::vector<block_digest> const &names) {
+		std::set<uint8_t> shards;
+		for (auto const &name : names) {
+			shards.insert(static_cast<uint8_t>(name.bytes[0]));
+		}
+		return shards.size();
+	}
+
+	TEST(BlockStore, MakeDurableSpreadsOverTheFanOut) {
+		store_fixture f;
+		auto const names = publish_eight(f);
+		counting_fan_out fan_out;
+		detail_file_util::sync_calls.store(0);
+
+		auto barrier = f.store.make_durable(names, fan_out.get());
+		ASSERT_TRUE(barrier.has_value()) << to_string(barrier.error());
+		for (auto const &name : names) {
+			EXPECT_TRUE(f.store.is_durable(name));
+		}
+		// one index per block file and one per shard that got an entry, and
+		// exactly that many syncs
+		size_t const expected = names.size() + shard_count_of(names);
+		EXPECT_EQ(fan_out.calls.load(), 1u);
+		EXPECT_EQ(fan_out.indices.load(), expected);
+		EXPECT_EQ(detail_file_util::sync_calls.load(), expected);
+	}
+
+	TEST(BlockStore, MakeDurableSyncsADuplicateNameOnce) {
+		store_fixture f;
+		auto const data = content("named once");
+		auto const name = name_of(data);
+		ASSERT_TRUE(f.store.publish(name, data));
+		// a dedup hit puts one name in several recipe entries
+		std::vector<block_digest> const names(6, name);
+		counting_fan_out fan_out;
+
+		ASSERT_TRUE(f.store.make_durable(names, fan_out.get()));
+		EXPECT_TRUE(f.store.is_durable(name));
+		// one file, one shard, and no spread for a batch that small
+		EXPECT_EQ(fan_out.calls.load(), 0u);
+	}
+
+	TEST(BlockStore, MakeDurableThroughTheFanOutRecordsNothingOnAFailure) {
+		store_fixture f;
+		auto names = publish_eight(f);
+		names.push_back(name_of(content("never published")));
+		counting_fan_out fan_out;
+
+		auto barrier = f.store.make_durable(names, fan_out.get());
+		ASSERT_FALSE(barrier.has_value());
+		EXPECT_EQ(barrier.error().code, errc::io_error);
+		for (auto const &name : names) {
+			EXPECT_FALSE(f.store.is_durable(name));
+		}
+	}
+
+	TEST(BlockStore, ReclaimSpreadsByShard) {
+		store_fixture f;
+		auto const names = publish_eight(f);
+		for (auto const &name : names) {
+			f.store.add_reference(name);
+			f.store.drop_reference(name);
+		}
+		counting_fan_out fan_out;
+
+		f.store.reclaim(fan_out.get());
+		for (auto const &name : names) {
+			EXPECT_FALSE(fs::exists(f.store.block_path(name)));
+			EXPECT_FALSE(f.store.is_durable(name));
+		}
+		EXPECT_EQ(file_count(f.blocks_dir()), 0u);
+		// one index per shard, and the candidates are gone, so a second pass
+		// has nothing to spread
+		EXPECT_EQ(fan_out.indices.load(), shard_count_of(names));
+		f.store.reclaim(fan_out.get());
+		EXPECT_EQ(fan_out.calls.load(), 1u);
 	}
 
 	TEST(BlockStore, SeedDurableSkipsTheSyncs) {

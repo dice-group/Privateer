@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <span>
 
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -55,11 +56,24 @@ namespace privateer {
 		// path of the block file for a name, existing or not
 		[[nodiscard]] std::filesystem::path block_path(block_digest const &name) const;
 
+		// How the store spreads independent sync calls. body(index) is called
+		// once for every index below count, in any order and possibly on other
+		// threads, and the call returns only after all of them finished; body
+		// never throws. The store's own bookkeeping stays outside the fan-out,
+		// so it keeps a single owner. Passing none runs every index on the
+		// calling thread, which is also what a small batch does: syncs of a
+		// device are what parallelizes, and a batch of a few costs more to
+		// spread than to run.
+		using sync_fan_out = std::function<void(size_t count, std::function<void(size_t)> const &body)>;
+
 		// The durability barrier for a set of published names: syncs the file
 		// content and the shard directory entry of every name not yet in the
 		// durable-name set, then records the names. Nothing is recorded when
-		// any sync fails.
-		result<> make_durable(std::span<block_digest const> names);
+		// any sync fails. The file syncs and the directory syncs of one call
+		// are independent and may run in one wave: a crash between them leaves
+		// a block file that no committed recipe names, which the open-time
+		// sweep removes.
+		result<> make_durable(std::span<block_digest const> names, sync_fan_out const &fan_out = {});
 
 		[[nodiscard]] bool is_durable(block_digest const &name) const;
 
@@ -78,8 +92,9 @@ namespace privateer {
 		// Unlinks the candidate files and drops them from the durable-name
 		// set. Errors are logged and never fatal: a failed name stays a
 		// candidate for the next pass, the commit is already durable and
-		// only garbage remains.
-		void reclaim();
+		// only garbage remains. The fan-out spreads the pass by shard, since
+		// each shard owns its unlinks and its one directory sync.
+		void reclaim(sync_fan_out const &fan_out = {});
 
 		// Unlinks an unreferenced name's file right away instead of leaving
 		// it to reclaim. For unwind paths that must not leave the file

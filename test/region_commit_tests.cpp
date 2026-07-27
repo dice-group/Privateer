@@ -246,6 +246,51 @@ namespace {
 		EXPECT_EQ(bytes(*reg)[0], 'c');
 	}
 
+	TEST_F(RegionCommitTest, ADurableCommitSpreadsTheBarrierAndTheReclaim) {
+		// Enough slots that the barrier and the reclaim pass cross the store's
+		// spread floor, so both run over the commit workers instead of in
+		// line. What must hold is unchanged: every block durable and named by
+		// the recipe, and the retired ones unlinked.
+		constexpr size_t slots = 6;
+		auto opts = options();
+		opts.commit_workers = 4;
+		{
+			auto reg = region::create(dir.path, 8 * bs, opts);
+			ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+			ASSERT_TRUE(reg->extend(slots * bs));
+			for (size_t slot = 0; slot < slots; ++slot) {
+				bytes(*reg)[slot * bs] = static_cast<unsigned char>('a' + slot);
+			}
+			ASSERT_TRUE(reg->commit(true));
+			EXPECT_EQ(count_block_files(dir.path), slots);
+
+			// a second round retires all six names at once
+			for (size_t slot = 0; slot < slots; ++slot) {
+				bytes(*reg)[slot * bs] = static_cast<unsigned char>('A' + slot);
+			}
+			ASSERT_TRUE(reg->commit(true));
+			EXPECT_EQ(count_block_files(dir.path), slots);
+		}
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		for (size_t slot = 0; slot < slots; ++slot) {
+			EXPECT_EQ(bytes(*reopened)[slot * bs], static_cast<unsigned char>('A' + slot));
+		}
+	}
+
+	TEST_F(RegionCommitTest, TheDefaultWorkerCountStopsAtTheMeasuredPlateau) {
+		auto reg = make_region(1);
+		size_t const cores = std::max(1u, std::thread::hardware_concurrency());
+		EXPECT_EQ(detail_region::commit_workers(reg), std::min<size_t>(cores, 16));
+
+		auto opts = options();
+		opts.commit_workers = 24;  // an explicit count is never capped
+		privateer::testing::temp_dir other;
+		auto explicit_workers = region::create(other.path, 8 * bs, opts);
+		ASSERT_TRUE(explicit_workers.has_value()) << to_string(explicit_workers.error());
+		EXPECT_EQ(detail_region::commit_workers(*explicit_workers), 24u);
+	}
+
 	TEST_F(RegionCommitTest, GrowthAcrossCommitsAccumulates) {
 		{
 			auto reg = make_region(1);
