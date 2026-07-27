@@ -238,9 +238,15 @@ namespace {
 		for (size_t slot = 0; slot < 3; ++slot) {
 			bytes(*reg)[slot * bs] = 'a';
 		}
-		// three dirty blocks crossed the two-block soft mark; the cleaner
-		// drains to the low target without any timer
-		EXPECT_TRUE(eventually([&] { return table.dirty_slots() == 0; })) << drain_state(*reg);
+		// Three dirty blocks crossed the two-block soft mark, so the cleaner
+		// writes all three back without any timer. The wait is for that, not
+		// for a dirty count of zero: the store that faulted last is retried
+		// after its handler published, and a cleaner that reaches the slot
+		// inside that window makes the retried store fault again. The slot is
+		// then dirty once more with the region below the soft mark, where no
+		// further drain is owed, and the next crossing is what drains it.
+		EXPECT_TRUE(eventually([&] { return reg->statistics().slots_cleaned >= 3; })) << drain_state(*reg);
+		EXPECT_LT(table.dirty_slots(), 3u);
 		EXPECT_EQ(table.load(0), slot_state::clean);
 	}
 
