@@ -37,6 +37,10 @@ class PrivateerConan(ConanFile):
     def build_requirements(self):
         self.test_requires("gtest/1.17.0")
         self.test_requires("benchmark/1.9.5")
+        # the io_uring arms of the durability barrier benchmark; the engine
+        # itself does not use io_uring
+        if self.settings.os == "Linux":
+            self.test_requires("liburing/2.13")
 
     def layout(self):
         cmake_layout(self)
