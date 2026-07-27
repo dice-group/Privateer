@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -112,6 +113,27 @@ namespace {
 
 		static unsigned char volatile *bytes(region &reg) {
 			return static_cast<unsigned char volatile *>(reg.segment());
+		}
+
+		// Everything that decides whether a drain happens, for the failure
+		// message of the waits below. A bare timeout reports only "false",
+		// which says nothing about why the cleaner did not get there.
+		[[nodiscard]] std::string drain_state(region &reg) const {
+			auto &table = detail_region::table_of(reg);
+			auto const stats = reg.statistics();
+			std::string out = "dirty_slots=" + std::to_string(table.dirty_slots()) +
+							  " poisoned=" + std::to_string(detail_region::poisoned_slots(reg)) +
+							  " cleaner_disabled=" +
+							  std::to_string(static_cast<int>(detail_region::cleaner_disabled(reg))) +
+							  " sane=" + std::to_string(static_cast<int>(reg.check_sanity())) +
+							  " cleaned=" + std::to_string(stats.slots_cleaned) +
+							  " redirtied=" + std::to_string(stats.slots_redirtied) +
+							  " stalls=" + std::to_string(stats.writer_stalls) + " states=[";
+			for (uint64_t slot = 0; slot < reg.size() / bs; ++slot) {
+				out += (slot == 0 ? "" : " ");
+				out += to_string(table.load(slot));
+			}
+			return out + "]";
 		}
 	};
 
@@ -218,7 +240,7 @@ namespace {
 		}
 		// three dirty blocks crossed the two-block soft mark; the cleaner
 		// drains to the low target without any timer
-		EXPECT_TRUE(eventually([&] { return table.dirty_slots() == 0; }));
+		EXPECT_TRUE(eventually([&] { return table.dirty_slots() == 0; })) << drain_state(*reg);
 		EXPECT_EQ(table.load(0), slot_state::clean);
 	}
 
@@ -243,13 +265,13 @@ namespace {
 		std::this_thread::sleep_for(200ms);
 
 		bytes(*reg)[6 * bs] = 'a';  // the publish must wake the parked cleaner
-		EXPECT_TRUE(eventually([&] { return table.load(6) == slot_state::clean; }));
+		EXPECT_TRUE(eventually([&] { return table.load(6) == slot_state::clean; })) << drain_state(*reg);
 
 		// unfreeze the fake writer with the handler's publish-then-wake
 		// protocol; the cleaner drains it like any dirt
 		table.publish(5, slot_state::dirty);
 		table.wake_governor();
-		EXPECT_TRUE(eventually([&] { return table.dirty_slots() == 0; }));
+		EXPECT_TRUE(eventually([&] { return table.dirty_slots() == 0; })) << drain_state(*reg);
 	}
 
 	TEST_F(RegionGovernorTest, TheDirtyBudgetHoldsUnderBulkLoad) {
@@ -270,7 +292,7 @@ namespace {
 		EXPECT_LE(max_dirty, hard_blocks);
 		// residual dirt below the soft mark is legal; above it the cleaner
 		// still owes a drain
-		EXPECT_TRUE(eventually([&] { return table.dirty_slots() * bs <= 2 * bs; }));
+		EXPECT_TRUE(eventually([&] { return table.dirty_slots() * bs <= 2 * bs; })) << drain_state(*reg);
 		// The commit quiesces the write-back (batches hold the commit
 		// mutex, and nothing stays dirty), so the reads below never race a
 		// remap; TSan models a remap as a plain write.
