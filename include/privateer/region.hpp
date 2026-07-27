@@ -194,8 +194,10 @@ namespace privateer {
 		std::chrono::nanoseconds poison_timeout = std::chrono::seconds{10};
 
 		// Worker count of the commit write-out fan-out on the process-wide
-		// executor. 0 selects the hardware concurrency; 1 keeps the
-		// write-out on the committing thread.
+		// executor, and of the durability barrier and reclaim pass of a
+		// durable commit. 0 selects the hardware concurrency capped at 16,
+		// which is where the write-out stops scaling; 1 keeps all of it on the
+		// committing thread.
 		size_t commit_workers = 0;
 
 		// Background write-back. Victims are picked cold first, by the time
@@ -293,6 +295,9 @@ namespace privateer {
 		// this index fails, the way an allocation failure would. Tests use it
 		// to exercise the fan-out's failure path.
 		extern bool (*commit_post_fails_fn)(size_t worker);
+
+		// the worker count a commit uses, after the default is resolved
+		[[nodiscard]] size_t commit_workers(region &reg) noexcept;
 
 	}  // namespace detail_region
 #endif  // PRIVATEER_TEST_HOOKS
@@ -414,6 +419,7 @@ namespace privateer {
 		friend size_t detail_region::run_cleaner_batch(region &reg, bool override_backoff);
 		friend bool detail_region::cleaner_disabled(region &reg) noexcept;
 		friend uint64_t detail_region::poisoned_slots(region &reg) noexcept;
+		friend size_t detail_region::commit_workers(region &reg) noexcept;
 #endif
 	};
 

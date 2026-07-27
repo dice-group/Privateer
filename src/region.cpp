@@ -189,6 +189,71 @@ namespace privateer {
 #endif
 		}
 
+		// Runs body over every index below count, spread over up to workers
+		// tasks on the work pool plus the calling thread, and returns once all
+		// of them finished. body must not throw. Tasks claim indices from one
+		// counter, so a task that cannot be posted only leaves its share to
+		// the others, and the calling thread claims as well, so the work is
+		// done even when the pool is busy. The block store's durability
+		// barrier and reclaim pass use this: their syncs wait for a device,
+		// and spread out they run two to four times faster.
+		void spread_over_workers(size_t count, size_t workers, std::function<void(size_t)> const &body) {
+			size_t const task_count = std::max<size_t>(1, std::min(workers, count));
+			// Heap-shared with the posted tasks: the last decrement releases
+			// the calling thread, and nothing past it may touch this frame.
+			auto const next = std::make_shared<std::atomic<size_t>>(0);
+			auto const left = std::make_shared<std::atomic<uint32_t>>(1);
+			auto const count_out = [left] {
+				if (left->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+					word_wake_all(*left);
+				}
+			};
+			auto const claim = [next, count, &body] {
+				for (;;) {
+					size_t const index = next->fetch_add(1, std::memory_order_relaxed);
+					if (index >= count) {
+						return;
+					}
+					body(index);
+				}
+			};
+			// Declared after everything the tasks touch, so the join runs
+			// before any of it is destroyed.
+			scope_guard const join{[left]() noexcept {
+				for (;;) {
+					uint32_t const outstanding = left->load(std::memory_order_acquire);
+					if (outstanding == 0) {
+						return;
+					}
+					(void) word_wait(*left, outstanding);
+				}
+			}};
+			for (size_t task = 1; task < task_count; ++task) {
+				left->fetch_add(1, std::memory_order_relaxed);
+				try {
+					asio::post(work_pool(), [&claim, count_out] {
+						// The contract is that body does not throw, and both
+						// callers keep it by turning their own failures into
+						// recorded ones. The catch is there so a broken
+						// contract cannot take the pool thread, and with it
+						// the process, down.
+						try {
+							claim();
+						} catch (...) {
+						}
+						count_out();
+					});
+				} catch (...) {
+					// this task never runs, so its count goes back or the join
+					// would wait for it forever
+					count_out();
+					break;
+				}
+			}
+			claim();
+			count_out();
+		}
+
 		// Whether posting the commit write-out worker with this index must
 		// fail; tests reroute it through the seam to exercise the fan-out's
 		// failure path. The engine always posts.
@@ -1401,9 +1466,13 @@ namespace privateer {
 		st.reservation = std::move(*reservation);
 		st.header_bytes = header_bytes;
 		st.vma_headroom = options.vma_headroom;
+		// The measured plateau of the write-out fan-out: past sixteen workers a
+		// commit gets slower, because every remap takes the address-space lock
+		// in write mode.
+		constexpr size_t worker_default_cap = 16;
 		st.commit_workers = options.commit_workers != 0
 									? options.commit_workers
-									: std::max<size_t>(1, std::thread::hardware_concurrency());
+									: std::clamp<size_t>(std::thread::hardware_concurrency(), 1, worker_default_cap);
 		st.cleaner = options.cleaner;
 		st.governor = options.governor;
 		st.read_only = read_only;
@@ -1987,6 +2056,15 @@ namespace privateer {
 		}
 		commit_phase_done(2);
 
+		// The barrier and the reclaim pass spend their time in the device, so
+		// they run over the commit workers as well. This is the committing
+		// thread, never a pool thread, so nothing nests here; the cleaner's
+		// own barrier runs on a pool thread and stays in line.
+		block_store::sync_fan_out const spread = [configured_workers](
+														 size_t count, std::function<void(size_t)> const &body) {
+			spread_over_workers(count, configured_workers, body);
+		};
+
 		// Phase 3: the durability barrier. Covers this commit's blocks and
 		// every name inherited from earlier non-durable commits; the store
 		// skips names already in the durable set.
@@ -1997,7 +2075,7 @@ namespace privateer {
 					referenced.push_back(entry);
 				}
 			}
-			if (auto synced = st.store->make_durable(referenced); !synced) {
+			if (auto synced = st.store->make_durable(referenced, spread); !synced) {
 				return std::unexpected{synced.error()};
 			}
 			commit_phase_done(3);
@@ -2013,7 +2091,7 @@ namespace privateer {
 		// Phase 5: reclaim. Errors are non-fatal and logged inside; a failed
 		// name stays a candidate, and the open-time sweep is the backstop.
 		if (durable) {
-			st.store->reclaim();
+			st.store->reclaim(spread);
 			commit_phase_done(5);
 		}
 		return {};
@@ -2078,6 +2156,10 @@ namespace privateer {
 
 		uint64_t poisoned_slots(region &reg) noexcept {
 			return reg.state_->hot->poisoned.load(std::memory_order_acquire);
+		}
+
+		size_t commit_workers(region &reg) noexcept {
+			return reg.state_->commit_workers;
 		}
 
 		uint64_t run_resident_sweep() {

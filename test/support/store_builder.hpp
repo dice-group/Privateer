@@ -40,7 +40,8 @@ namespace privateer::testing {
 			names.push_back(name);
 			rec.entries.push_back(name);
 		}
-		ASSERT_TRUE(store->make_durable(names));
+		auto barrier = store->make_durable(names);
+		ASSERT_TRUE(barrier.has_value()) << to_string(barrier.error());
 		ASSERT_TRUE(rec.commit(segment_dir, true));
 	}
 

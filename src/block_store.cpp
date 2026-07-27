@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +28,25 @@ namespace privateer {
 
 		uint8_t shard_byte(block_digest const &name) {
 			return static_cast<uint8_t>(name.bytes[0]);
+		}
+
+		// Batches below this stay on the calling thread. One sync of a device
+		// costs hundreds of microseconds and a spread costs a few to join, so
+		// the crossing is low; measured, a batch of eight is already twice as
+		// fast spread out.
+		constexpr size_t spread_floor = 4;
+
+		// runs body over every index below count, spread when there is enough
+		// of it and a fan-out to spread with
+		void spread_syncs(block_store::sync_fan_out const &fan_out, size_t count,
+						  std::function<void(size_t)> const &body) {
+			if (fan_out && count >= spread_floor) {
+				fan_out(count, body);
+				return;
+			}
+			for (size_t index = 0; index < count; ++index) {
+				body(index);
+			}
 		}
 
 		// byte-compares an existing block file against data
@@ -150,26 +171,64 @@ namespace privateer {
 		return false;
 	}
 
-	result<> block_store::make_durable(std::span<block_digest const> names) {
-		boost::unordered_flat_set<uint8_t> shards;
+	result<> block_store::make_durable(std::span<block_digest const> names, sync_fan_out const &fan_out) {
+		// the names this call owes a sync, each one once: a dedup hit puts the
+		// same name in several recipe entries
+		std::vector<block_digest> pending;
+		boost::unordered_flat_set<block_digest, block_digest_hash> seen;
+		boost::unordered_flat_set<uint8_t> shard_set;
 		for (auto const &name : names) {
-			if (durable_.contains(name)) {
+			if (durable_.contains(name) || !seen.insert(name).second) {
 				continue;
 			}
-			int const fd = ::open(block_path(name).c_str(), O_RDONLY | O_CLOEXEC);
-			if (fd < 0) {
-				return fail_errno(errc::io_error, "open block for the durability barrier");
-			}
-			auto synced = sync_file(fd);
-			::close(fd);
-			if (!synced) {
-				return synced;
-			}
-			shards.insert(shard_byte(name));
+			pending.push_back(name);
+			shard_set.insert(shard_byte(name));
 		}
-		for (auto const byte : shards) {
-			if (auto synced = sync_directory(blocks_dir_ / shard_name(byte)); !synced) {
-				return synced;
+		if (pending.empty()) {
+			for (auto const &name : names) {
+				durable_.insert(name);
+			}
+			return {};
+		}
+		std::vector<uint8_t> const shards{shard_set.begin(), shard_set.end()};
+
+		// One wave over the block files and the shard directories. Every sync
+		// keeps its own failure, so a failure anywhere leaves the durable-name
+		// set untouched.
+		std::vector<std::optional<error>> failures(pending.size() + shards.size());
+		// The path each sync builds is the only allocation left in here, and it
+		// may run on a pool thread, where an escaping exception would take the
+		// process down. It becomes this index's failure instead, so the barrier
+		// reports it and records nothing.
+		auto const sync_one = [&](size_t index) {
+			try {
+				if (index < pending.size()) {
+					int const fd = ::open(block_path(pending[index]).c_str(), O_RDONLY | O_CLOEXEC);
+					if (fd < 0) {
+						failures[index] =
+								fail_errno(errc::io_error, "open block for the durability barrier").error();
+						return;
+					}
+					auto synced = sync_file(fd);
+					::close(fd);
+					if (!synced) {
+						failures[index] = synced.error();
+					}
+					return;
+				}
+				if (auto synced = sync_directory(blocks_dir_ / shard_name(shards[index - pending.size()]));
+					!synced) {
+					failures[index] = synced.error();
+				}
+			} catch (...) {
+				failures[index] = error{errc::io_error, ENOMEM, "durability barrier"};
+			}
+		};
+		spread_syncs(fan_out, failures.size(), sync_one);
+
+		for (auto const &failure : failures) {
+			if (failure) {
+				return std::unexpected{*failure};
 			}
 		}
 		for (auto const &name : names) {
@@ -220,27 +279,66 @@ namespace privateer {
 		candidates_.erase(name);
 	}
 
-	void block_store::reclaim() {
-		// names unlinked in this pass, grouped by shard: a name leaves the
-		// candidate set only once its shard directory is synced, so a failed
-		// sync is retried by the next pass
-		boost::unordered_flat_map<uint8_t, std::vector<block_digest>> unlinked;
+	void block_store::reclaim(sync_fan_out const &fan_out) {
+		// The candidates grouped by shard, so one task owns a shard's unlinks
+		// and its one directory sync. A name leaves the candidate set only
+		// once that sync succeeded, so a failed sync is retried by the next
+		// pass; the sets themselves are touched after the fan-out joined.
+		struct shard_batch {
+			uint8_t byte = 0;
+			std::vector<block_digest> names;
+			std::vector<block_digest> unlinked;
+			bool synced = false;
+		};
+		std::vector<shard_batch> batches;
+		boost::unordered_flat_map<uint8_t, size_t> batch_of;
 		for (auto const &name : candidates_) {
-			if (::unlink(block_path(name).c_str()) != 0 && errno != ENOENT) {
-				PRIVATEER_LOG(log_level::warning, "cannot unlink block {} (errno {})", to_hex(name), errno);
-				continue;
+			uint8_t const byte = shard_byte(name);
+			auto const [it, fresh] = batch_of.try_emplace(byte, batches.size());
+			if (fresh) {
+				batches.push_back({byte, {}, {}, false});
 			}
-			durable_.erase(name);
-			unlinked[shard_byte(name)].push_back(name);
+			batches[it->second].names.push_back(name);
 		}
-		for (auto const &[byte, names] : unlinked) {
-			if (auto synced = sync_directory(blocks_dir_ / shard_name(byte)); !synced) {
-				PRIVATEER_LOG(log_level::warning, "cannot sync shard {} after reclaim: {}",
-							  shard_name(byte), to_string(synced.error()));
-				continue;
+
+		// Reserved here, so the pass itself only allocates the paths it builds;
+		// an exception from one of those may run on a pool thread, and it ends
+		// the shard's task with its names still candidates, which is what any
+		// other failure of the pass does.
+		for (auto &batch : batches) {
+			batch.unlinked.reserve(batch.names.size());
+		}
+		auto const reclaim_shard = [&](size_t index) {
+			auto &batch = batches[index];
+			try {
+				for (auto const &name : batch.names) {
+					if (::unlink(block_path(name).c_str()) != 0 && errno != ENOENT) {
+						PRIVATEER_LOG(log_level::warning, "cannot unlink block {} (errno {})", to_hex(name), errno);
+						continue;
+					}
+					batch.unlinked.push_back(name);
+				}
+				if (batch.unlinked.empty()) {
+					return;
+				}
+				if (auto synced = sync_directory(blocks_dir_ / shard_name(batch.byte)); !synced) {
+					PRIVATEER_LOG(log_level::warning, "cannot sync shard {} after reclaim: {}",
+								  shard_name(batch.byte), to_string(synced.error()));
+					return;
+				}
+				batch.synced = true;
+			} catch (...) {
+				// the shard keeps its candidates for the next pass
 			}
-			for (auto const &name : names) {
-				candidates_.erase(name);
+		};
+		spread_syncs(fan_out, batches.size(), reclaim_shard);
+
+		for (auto const &batch : batches) {
+			for (auto const &name : batch.unlinked) {
+				durable_.erase(name);
+				if (batch.synced) {
+					candidates_.erase(name);
+				}
 			}
 		}
 	}
