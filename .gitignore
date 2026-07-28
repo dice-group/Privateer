@@ -6,3 +6,4 @@ CMakeUserPresets.json
 docs/html
 docs/latex
 conan_provider.cmake
+results/
