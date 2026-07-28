@@ -1,0 +1,133 @@
+name: benchmarks
+
+# Manual only. The job proves that the microbenchmarks keep building and
+# running on both Linux architectures. Its numbers are not decision grade: a
+# hosted runner has four cores, a disk of unknown speed and neighbours on the
+# same host. The numbers that resolve an A/B come from a dedicated machine.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  microbenchmarks:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            arch: x86_64
+          - os: ubuntu-26.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CC: gcc-15
+      CXX: g++-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ matrix.os }}-bench-release
+
+      - name: Install conan
+        uses: dice-group/cpp-conan-release-reusable-workflow/.github/actions/configure_conan@main
+        with:
+          conan-version: 2.21.0
+
+      - name: Detect conan profile
+        run: conan profile detect --force
+
+      - name: Cache conan packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2/p
+          key: ${{ matrix.os }}-bench-conan2-${{ hashFiles('conanfile.py') }}
+
+      - name: Get conan provider
+        uses: dice-group/cpp-conan-release-reusable-workflow/.github/actions/add_conan_provider@main
+
+      # Release, and the test hooks off: the hooks add failure-injection seams
+      # to the engine, and a benchmark must measure the library a consumer gets.
+      - name: Configure
+        run: |
+          cmake -G Ninja -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPRIVATEER_BUILD_TESTING=OFF \
+            -DPRIVATEER_BUILD_BENCHMARKS=ON \
+            -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=conan_provider.cmake \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      # Every arm runs once. The arms are sized for a benchmark host, so a
+      # single iteration is what proves the arm still runs here.
+      #
+      # The barrier arms are the exception, because they carry their own
+      # iteration counts and the batch sizes above 64 blocks write 8 GiB per
+      # arm. Running the whole sweep costs about 83 GiB of synced writes, which
+      # a hosted runner does not have the time or the disk for. Batch sizes 1,
+      # 8 and 64 keep the shape of the sweep and the whole block-size axis at
+      # a peak of 2 GiB on disk.
+      #
+      # The io_uring arms report an error and skip where the kernel or the
+      # sandbox refuses a ring. That is a property of the runner, so it does
+      # not fail the job; the summary below names every arm that skipped.
+      - name: Run
+        env:
+          # The datastore goes on the runner disk. temp_dir reads TMPDIR, and
+          # the runner temp directory is a real file system, so a durability
+          # barrier reaches a device instead of being a no-op on tmpfs.
+          TMPDIR: ${{ runner.temp }}/privateer-bench
+        run: |
+          mkdir -p "$TMPDIR" results
+          df -h "$TMPDIR" | tail -1
+          run() {
+            local name=$1
+            shift
+            ./build/bench/privateer_"$name"_bench \
+              --benchmark_out="results/$name-${{ matrix.arch }}.json" \
+              --benchmark_out_format=json \
+              "$@"
+          }
+          run hash
+          run addressing --benchmark_min_time=1x
+          run region --benchmark_min_time=1x
+          run barrier --benchmark_filter='blocks:(1|8|64)/'
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## ${{ matrix.arch }} (${{ matrix.os }})"
+            echo
+            echo "| benchmark | arms | skipped |"
+            echo "|---|---:|---:|"
+            for file in results/*.json; do
+              [ -e "$file" ] || continue
+              arms=$(jq '.benchmarks | length' "$file")
+              skipped=$(jq '[.benchmarks[] | select(.error_occurred)] | length' "$file")
+              echo "| \`$(basename "$file")\` | $arms | $skipped |"
+            done
+            echo
+            jq -r '.benchmarks[] | select(.error_occurred) | "- `\(.name)`: \(.error_message)"' \
+              results/*.json > "$RUNNER_TEMP/skipped.txt" || true
+            if [ -s "$RUNNER_TEMP/skipped.txt" ]; then
+              echo "### Skipped arms"
+              echo
+              cat "$RUNNER_TEMP/skipped.txt"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-${{ matrix.arch }}
+          path: results/
+          if-no-files-found: error
