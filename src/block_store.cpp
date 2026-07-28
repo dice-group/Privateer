@@ -49,10 +49,22 @@ namespace privateer {
 			}
 		}
 
-		// byte-compares an existing block file against data
-		result<bool> file_equals(fs::path const &path, std::span<std::byte const> data) {
+		// what a block name already holds against the content being published
+		enum struct existing_block : int {
+			absent,   // the name has no file
+			equal,    // the file holds this content, so it is already published
+			differs,  // the file holds other content under the same name
+		};
+
+		// Byte-compares the file under path against data. A name with no file
+		// is absent rather than an error, because writing one is what a
+		// publisher does about it.
+		result<existing_block> compare_block(fs::path const &path, std::span<std::byte const> data) {
 			int const fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
 			if (fd < 0) {
+				if (errno == ENOENT) {
+					return existing_block::absent;
+				}
 				return fail_errno(errc::io_error, "open block for the dedup compare");
 			}
 			struct stat st {};
@@ -63,7 +75,7 @@ namespace privateer {
 			}
 			if (std::cmp_not_equal(st.st_size, data.size())) {
 				::close(fd);
-				return false;
+				return existing_block::differs;
 			}
 			std::vector<std::byte> buffer(std::min<size_t>(data.size(), size_t{1} << 20));
 			size_t offset = 0;
@@ -80,13 +92,21 @@ namespace privateer {
 				}
 				if (got == 0 || std::memcmp(buffer.data(), data.data() + offset, static_cast<size_t>(got)) != 0) {
 					::close(fd);
-					return false;
+					return existing_block::differs;
 				}
 				offset += static_cast<size_t>(got);
 			}
 			::close(fd);
-			return true;
+			return existing_block::equal;
 		}
+
+		// How many times publish resolves the name before it gives up. Each
+		// extra round needs another publisher to take the name in the window
+		// between this one's compare and its link, and something to unlink
+		// that file again before the next compare. A directory entry that
+		// cannot be opened at all, a dangling symlink in a tampered store,
+		// exhausts the rounds and reports io_error.
+		constexpr unsigned publish_attempts = 4;
 
 	}  // namespace
 
@@ -147,28 +167,45 @@ namespace privateer {
 		if (name.size == 0 || data.empty()) {
 			return fail(errc::invalid_argument, "publish needs a name and content");
 		}
-		auto staged = staged_file::create_in(shard_path(name));
-		if (!staged) {
-			return std::unexpected{staged.error()};
+		fs::path const path = block_path(name);
+		for (unsigned attempt = 0; attempt < publish_attempts; ++attempt) {
+			// A file already under the name carries the content the name
+			// stands for, so the compare is the whole publication and the
+			// block is not written at all. Content that repeats is the
+			// common case on a workload that copies a structure and changes
+			// parts of it.
+			auto const existing = compare_block(path, data);
+			if (!existing) {
+				return std::unexpected{existing.error()};
+			}
+			switch (*existing) {
+				case existing_block::equal:
+					return false;
+				case existing_block::differs:
+					return fail(errc::hash_collision, "existing block differs under the same name");
+				case existing_block::absent:
+					break;  // the write below is what resolves it
+			}
+			auto staged = staged_file::create_in(shard_path(name));
+			if (!staged) {
+				return std::unexpected{staged.error()};
+			}
+			if (auto written = staged->write(data); !written) {
+				return std::unexpected{written.error()};
+			}
+			auto const published = staged->publish(to_hex(name), publish_mode::fail_if_exists);
+			if (!published) {
+				return std::unexpected{published.error()};
+			}
+			if (*published) {
+				return true;
+			}
+			// The atomic link is what resolves a race on one name, and this
+			// caller lost it. The next round compares against the winner's
+			// file, which is the dedup answer; only an unlink of that file
+			// inside the same window sends the round back to the write.
 		}
-		if (auto written = staged->write(data); !written) {
-			return std::unexpected{written.error()};
-		}
-		auto published = staged->publish(to_hex(name), publish_mode::fail_if_exists);
-		if (!published) {
-			return std::unexpected{published.error()};
-		}
-		if (*published) {
-			return true;
-		}
-		auto equal = file_equals(block_path(name), data);
-		if (!equal) {
-			return std::unexpected{equal.error()};
-		}
-		if (!*equal) {
-			return fail(errc::hash_collision, "existing block differs under the same name");
-		}
-		return false;
+		return fail(errc::io_error, "the block name neither opens nor accepts a link");
 	}
 
 	result<> block_store::make_durable(std::span<block_digest const> names, sync_fan_out const &fan_out) {

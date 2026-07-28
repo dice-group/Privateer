@@ -26,6 +26,10 @@ namespace privateer {
 		// it to observe what a durability path paid.
 		extern std::atomic<uint64_t> sync_calls;
 
+		// Counts every staged backing file created. Tests reset and read it
+		// to observe whether a path wrote a file at all.
+		extern std::atomic<uint64_t> staged_files;
+
 	}  // namespace detail_file_util
 #endif  // PRIVATEER_TEST_HOOKS
 
