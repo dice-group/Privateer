@@ -26,8 +26,10 @@ namespace privateer {
 		xxh3_128 = 1,
 	};
 
-	// Width of one recipe entry on disk, which is a format constant and wider
-	// than the 16 byte digest in use. It does not shrink with the algorithm.
+	// In-memory capacity of a digest, and the widest a recipe entry may be.
+	// A digest narrower than this is zero padded in memory so two digests of
+	// one algorithm compare over the whole array; on disk the recipe entry is
+	// exactly the digest width, which the recipe header records.
 	inline constexpr size_t max_digest_size = 32;
 
 	// digest byte count of the algorithm, 0 for an id this build does not know

@@ -10,7 +10,10 @@
 
 #include "support/temp_dir.hpp"
 
+#include <algorithm>
 #include <filesystem>
+#include <ranges>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -108,6 +111,81 @@ namespace {
 		EXPECT_EQ(rec.serialize().error().code, errc::recipe_unsupported);
 	}
 
+	// Format version 1 is frozen. This pins every field at its offset and the
+	// entry stride, so a change to the layout fails here instead of silently
+	// making existing stores unreadable. An intended change takes format
+	// version 2. The digest values themselves are pinned in the block hash
+	// tests against independent vectors, so this asserts placement only.
+	TEST(Recipe, FormatVersion1IsFrozen) {
+		auto const bytes = sample_recipe().serialize();
+		ASSERT_TRUE(bytes.has_value()) << to_string(bytes.error());
+
+		constexpr size_t header = 56;
+		constexpr size_t entry = 16;  // the xxh3-128 digest width
+		ASSERT_EQ(bytes->size(), header + 3 * entry + sizeof(uint64_t));
+
+		auto const at = [&](size_t offset) { return static_cast<unsigned>((*bytes)[offset]); };
+		auto const le64_at = [&](size_t offset) {
+			uint64_t value = 0;
+			for (int i = 7; i >= 0; --i) {
+				value = (value << 8) | at(offset + static_cast<size_t>(i));
+			}
+			return value;
+		};
+
+		EXPECT_EQ(std::string(reinterpret_cast<char const *>(bytes->data()), 8), "PVRECIPE");
+		EXPECT_EQ(at(8), 1u);   // format version, little endian uint32
+		EXPECT_EQ(at(9), 0u);
+		EXPECT_EQ(at(10), 0u);
+		EXPECT_EQ(at(11), 0u);
+		EXPECT_EQ(at(12), 1u);   // hash algorithm id, xxh3_128
+		EXPECT_EQ(at(13), entry);  // entry width
+		EXPECT_EQ(at(14), 0u);   // reserved
+		EXPECT_EQ(at(15), 0u);
+		EXPECT_EQ(le64_at(16), test_block_size);
+		EXPECT_EQ(le64_at(24), 64 * test_block_size);
+		EXPECT_EQ(le64_at(32), 3 * test_block_size);
+		EXPECT_EQ(le64_at(40), 3u);  // slot count
+
+		// entries sit at the header, one digest wide each, sentinel all zero
+		auto const entry_at = [&](size_t index) {
+			return std::span<std::byte const>{bytes->data() + header + index * entry, entry};
+		};
+		auto const one = digest_of("block one");
+		auto const three = digest_of("block three");
+		EXPECT_TRUE(std::equal(entry_at(0).begin(), entry_at(0).end(), one.bytes.begin()));
+		EXPECT_TRUE(std::ranges::all_of(entry_at(1), [](std::byte b) { return b == std::byte{0}; }));
+		EXPECT_TRUE(std::equal(entry_at(2).begin(), entry_at(2).end(), three.bytes.begin()));
+
+		// and it reads back to the same recipe
+		auto const back = recipe::deserialize(*bytes);
+		ASSERT_TRUE(back.has_value()) << to_string(back.error());
+		EXPECT_EQ(back->block_size, test_block_size);
+		EXPECT_EQ(back->algorithm, hash_algorithm::xxh3_128);
+		EXPECT_EQ(back->entries.size(), 3u);
+		EXPECT_EQ(back->entries[0], one);
+		EXPECT_EQ(back->entries[1].size, 0u);
+		EXPECT_EQ(back->entries[2], three);
+	}
+
+	// The width lives in the header, so a recipe written before it existed
+	// carries a zero there and must fail rather than parse at 32 bytes.
+	TEST(Recipe, AZeroEntryWidthIsRejected) {
+		auto bytes = sample_recipe().serialize();
+		ASSERT_TRUE(bytes.has_value());
+		(*bytes)[13] = std::byte{0};
+		fix_checksums(*bytes);
+		EXPECT_EQ(recipe::deserialize(*bytes).error().code, errc::recipe_corrupt);
+	}
+
+	TEST(Recipe, AnEntryWidthThatDisagreesWithTheAlgorithmIsRejected) {
+		auto bytes = sample_recipe().serialize();
+		ASSERT_TRUE(bytes.has_value());
+		(*bytes)[13] = std::byte{32};  // what the pre-freeze layout used
+		fix_checksums(*bytes);
+		EXPECT_EQ(recipe::deserialize(*bytes).error().code, errc::recipe_corrupt);
+	}
+
 	TEST(Recipe, CommitPublishesAtomicallyAndLoadReadsBack) {
 		privateer::testing::temp_dir dir;
 		recipe const rec = sample_recipe();
@@ -165,13 +243,6 @@ namespace {
 	TEST(Recipe, InconsistentHeaderFieldsAreCorrupt) {
 		auto bytes = *sample_recipe().serialize();
 		bytes[40] = std::byte{7};  // slot count no longer matches size
-		fix_checksums(bytes);
-		EXPECT_EQ(recipe::deserialize(bytes).error().code, errc::recipe_corrupt);
-	}
-
-	TEST(Recipe, NonZeroEntryPaddingIsCorrupt) {
-		auto bytes = *sample_recipe().serialize();
-		bytes[56 + 20] = std::byte{1};  // beyond the 16 byte xxh3_128 digest
 		fix_checksums(bytes);
 		EXPECT_EQ(recipe::deserialize(bytes).error().code, errc::recipe_corrupt);
 	}

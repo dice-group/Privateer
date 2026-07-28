@@ -17,9 +17,9 @@ namespace privateer {
 	namespace {
 
 		constexpr char magic[8] = {'P', 'V', 'R', 'E', 'C', 'I', 'P', 'E'};
-		constexpr size_t header_size = 56;              // includes the header checksum
-		constexpr size_t header_checksum_offset = 48;   // checksum covers the bytes before it
-		constexpr size_t entry_size = max_digest_size;  // 32, zero padded
+		constexpr size_t header_size = 56;             // includes the header checksum
+		constexpr size_t header_checksum_offset = 48;  // checksum covers the bytes before it
+		constexpr size_t entry_width_offset = 13;      // one byte, next to the algorithm id
 		constexpr size_t min_file_size = header_size + sizeof(uint64_t);
 
 		void store_le32(std::byte *out, uint32_t value) noexcept {
@@ -81,11 +81,16 @@ namespace privateer {
 				return fail(errc::invalid_argument, "recipe entry width does not match the algorithm");
 			}
 		}
+		// The entry is exactly as wide as the digest, and the header carries
+		// that width, so an algorithm with a wider digest needs a new id and
+		// not a new format version.
+		size_t const entry_size = expected_digest;
 
 		std::vector<std::byte> bytes(header_size + entries.size() * entry_size + sizeof(uint64_t));
 		std::memcpy(bytes.data(), magic, sizeof(magic));
 		store_le32(bytes.data() + 8, recipe_format_version);
 		bytes[12] = static_cast<std::byte>(algorithm);
+		bytes[entry_width_offset] = static_cast<std::byte>(entry_size);
 		store_le64(bytes.data() + 16, block_size);
 		store_le64(bytes.data() + 24, capacity);
 		store_le64(bytes.data() + 32, size);
@@ -95,7 +100,8 @@ namespace privateer {
 
 		std::byte *out = bytes.data() + header_size;
 		for (auto const &entry : entries) {
-			std::memcpy(out, entry.bytes.data(), entry_size);  // padding is zero by construction
+			// a sentinel entry is all zero, and its bytes array is too
+			std::memcpy(out, entry.bytes.data(), entry_size);
 			out += entry_size;
 		}
 		store_le64(out, checksum64({bytes.data() + header_size, entries.size() * entry_size}));
@@ -125,6 +131,15 @@ namespace privateer {
 		if (expected_digest == 0) {
 			return fail(errc::recipe_unsupported, "recipe hash algorithm unknown to the build");
 		}
+		// A recipe written before the width entered the header carries a zero
+		// here, which this rejects rather than reading at the wrong stride.
+		size_t const entry_size = static_cast<size_t>(bytes[entry_width_offset]);
+		if (entry_size == 0 || entry_size > max_digest_size) {
+			return fail(errc::recipe_corrupt, "recipe entry width invalid");
+		}
+		if (entry_size != expected_digest) {
+			return fail(errc::recipe_corrupt, "recipe entry width does not match the algorithm");
+		}
 
 		recipe rec;
 		rec.algorithm = algorithm;
@@ -146,12 +161,13 @@ namespace privateer {
 
 		rec.entries.resize(slot_count);
 		for (auto &entry : rec.entries) {
+			// An entry is exactly the digest, so there is no padding to check;
+			// all zero is the empty sentinel. The rest of bytes stays zero
+			// from the default construction, which is what makes two digests
+			// of one algorithm comparable over the whole array.
 			if (!all_zero(in, entry_size)) {
-				if (!all_zero(in + expected_digest, entry_size - expected_digest)) {
-					return fail(errc::recipe_corrupt, "recipe entry padding not zero");
-				}
 				std::memcpy(entry.bytes.data(), in, entry_size);
-				entry.size = static_cast<uint8_t>(expected_digest);
+				entry.size = static_cast<uint8_t>(entry_size);
 			}
 			in += entry_size;
 		}

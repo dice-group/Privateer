@@ -4,13 +4,20 @@
 // The recipe maps every slot of a region to the content-named block that
 // backs it, or to the empty sentinel. On disk it is one little-endian
 // binary file, <segment>/_recipe, replaced atomically by rename at each
-// commit: a header (magic, format version, hash algorithm id, block_size,
-// capacity, size, slot count, header checksum), one 32 byte entry per slot
-// (raw digest bytes zero padded, all zero for an empty slot), and a
-// trailing checksum over the entries. A torn or corrupt file fails to
-// load, and so does an intact one whose header this build cannot serve: a
-// newer format version, or an unknown hash algorithm id. block_size and
-// the hash algorithm are datastore constants adopted from the header.
+// commit: a 56 byte header (magic, format version, hash algorithm id,
+// entry width, block_size, capacity, size, slot count, header checksum),
+// one entry per slot holding the raw digest bytes, all zero for an empty
+// slot, and a trailing checksum over the entries. A torn or corrupt file
+// fails to load, and so does an intact one whose header this build cannot
+// serve: a newer format version, or an unknown hash algorithm id.
+// block_size and the hash algorithm are datastore constants adopted from
+// the header.
+//
+// The entry is exactly as wide as the algorithm's digest, 16 bytes under
+// xxh3-128, and the header records that width. So the file costs nothing
+// for digest room it does not use, and an algorithm with a wider digest is
+// a new algorithm id rather than a new format version. Format version 1 is
+// frozen; any change to the layout above takes version 2.
 
 #include <privateer/block_hash.hpp>
 #include <privateer/block_store.hpp>
