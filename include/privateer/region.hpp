@@ -45,6 +45,14 @@ namespace privateer {
 	// the next durable commit. eager_durable additionally syncs each batch's
 	// block files and shard directory entries, so a later durable commit
 	// pays only for dirt the cleaner has not reached yet.
+	//
+	// non_durable is the mode to use. eager_durable costs more and delivers
+	// less: its per-batch barrier is many small barriers where a commit runs
+	// one barrier over all its files at once, and a barrier gets cheap by
+	// spreading many syncs together, so it drains slower and makes
+	// checkpoints slower rather than faster. Write-back pairs with a dirty
+	// budget (governor_options): the budget is what sets the rate, and it
+	// sets it to what the workload needs without a cadence to tune.
 	enum struct cleaner_mode : uint8_t {
 		off,
 		non_durable,
@@ -54,7 +62,9 @@ namespace privateer {
 	struct cleaner_options {
 		cleaner_mode mode = cleaner_mode::off;
 
-		// cadence of the background sweep
+		// Cadence of the background sweep, used when no dirty budget is set.
+		// With a dirty budget the soft-mark crossing drives write-back and
+		// this is only the fallback poll.
 		std::chrono::nanoseconds interval = std::chrono::seconds{1};
 
 		// most slots written back per batch; bounds one commit-mutex hold
@@ -94,6 +104,17 @@ namespace privateer {
 	// close while a writer is blocked at the hard mark forwards that
 	// writer's fault as a crash: close requires quiesced writers.
 	//
+	// The dirty budget is how a deployment caps the memory a write phase
+	// takes, and it is the only knob that does so. The resident set of a
+	// bulk load settles at dirty_soft plus a few hundred MiB of drain lag,
+	// so put dirty_soft at the dirty memory the deployment can spare,
+	// dirty_low at three quarters of it, and dirty_hard at one and a half
+	// times it. The write volume does not grow: the cleaner writes a block
+	// early instead of a commit writing it later, and a write phase that
+	// does not revisit its blocks re-dirties none of them. What a tight
+	// budget costs is writer stalls, and a budget below about one eighth of
+	// the bytes the phase dirties starts to lose write throughput to them.
+	//
 	// The resident budget is advisory and Linux only (Darwin has no
 	// non-destructive userspace trim): one process-level sweep serves every
 	// open region with a resident budget. It reads the process Pss from
@@ -104,6 +125,14 @@ namespace privateer {
 	// reader-inflatable, so there is no hard mark: the sweep converges, it
 	// does not enforce. When several regions set resident budgets, the
 	// sweep uses the smallest watermarks and the shortest interval.
+	//
+	// It suits only a process that writes without serving reads, and it is
+	// not a substitute for the dirty budget. It cannot bound a write phase
+	// at all, because it pages out clean and empty slots and the slots of a
+	// running write phase are dirty. Against concurrent readers it thrashes:
+	// the readers fault back what the sweep pushes out, so a sweep_interval
+	// short enough to trim materially multiplies reader tail latency, and
+	// one long enough to be harmless trims a few percent of the working set.
 	struct governor_options {
 		// dirty budget, bytes; dirty_soft 0 disables it
 		uint64_t dirty_soft = 0;
