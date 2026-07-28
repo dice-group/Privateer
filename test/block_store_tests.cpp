@@ -20,6 +20,8 @@
 #include <thread>
 #include <vector>
 
+#include <unistd.h>
+
 using namespace privateer;
 namespace fs = std::filesystem;
 
@@ -122,6 +124,87 @@ namespace {
 		ASSERT_TRUE(again.has_value()) << to_string(again.error());
 		EXPECT_FALSE(*again);
 		EXPECT_EQ(file_count(f.blocks_dir()), 1u);
+	}
+
+	TEST(BlockStore, PublishWritesNothingForADuplicate) {
+		store_fixture f;
+		auto const data = content(std::string(1 << 16, 'q'));
+		auto const name = name_of(data);
+
+		detail_file_util::staged_files.store(0);
+		ASSERT_TRUE(f.store.publish(name, data));
+		EXPECT_EQ(detail_file_util::staged_files.load(), 1u);
+
+		// the name has a file, so the compare answers the publication
+		detail_file_util::staged_files.store(0);
+		auto again = f.store.publish(name, data);
+		ASSERT_TRUE(again.has_value()) << to_string(again.error());
+		EXPECT_FALSE(*again);
+		EXPECT_EQ(detail_file_util::staged_files.load(), 0u);
+		EXPECT_EQ(read_file(f.store.block_path(name)).size(), data.size());
+	}
+
+	TEST(BlockStore, PublishWritesNothingForACollision) {
+		store_fixture f;
+		auto const data = content("first content");
+		auto const name = name_of(data);
+		ASSERT_TRUE(f.store.publish(name, data));
+
+		detail_file_util::staged_files.store(0);
+		auto collided = f.store.publish(name, content("other content"));
+		ASSERT_FALSE(collided.has_value());
+		EXPECT_EQ(collided.error().code, errc::hash_collision);
+		EXPECT_EQ(detail_file_util::staged_files.load(), 0u);
+	}
+
+	TEST(BlockStore, PublishSurvivesConcurrentUnlinks) {
+		store_fixture f;
+		auto const data = content(std::string(1 << 14, 'u'));
+		auto const name = name_of(data);
+		fs::path const path = f.store.block_path(name);
+
+		// A name that keeps disappearing under the publisher: every round is
+		// either a compare against the file or a fresh write, and neither
+		// leaves the store with a temp file or an error.
+		std::atomic<bool> stop{false};
+		std::thread unlinker{[&] {
+			while (!stop.load()) {
+				::unlink(path.c_str());
+				std::this_thread::yield();
+			}
+		}};
+		int created = 0;
+		for (int round = 0; round < 500; ++round) {
+			auto published = f.store.publish(name, data);
+			if (!published) {
+				stop.store(true);
+				unlinker.join();
+				FAIL() << to_string(published.error());
+			}
+			created += *published ? 1 : 0;
+		}
+		stop.store(true);
+		unlinker.join();
+
+		EXPECT_GT(created, 0);
+		for (auto const &shard : fs::directory_iterator{f.blocks_dir()}) {
+			for (auto const &entry : fs::directory_iterator{shard}) {
+				EXPECT_FALSE(entry.path().filename().string().starts_with(temp_name_prefix));
+			}
+		}
+	}
+
+	TEST(BlockStore, PublishGivesUpOnANameThatCannotBeOpened) {
+		store_fixture f;
+		auto const data = content("content behind a broken name");
+		auto const name = name_of(data);
+		// A dangling symlink is a name whose entry refuses the link and whose
+		// file cannot be opened, so no round of publish can resolve it.
+		fs::create_symlink("nowhere", f.store.block_path(name));
+
+		auto published = f.store.publish(name, data);
+		ASSERT_FALSE(published.has_value());
+		EXPECT_EQ(published.error().code, errc::io_error);
 	}
 
 	TEST(BlockStore, PublishDetectsAHashCollision) {

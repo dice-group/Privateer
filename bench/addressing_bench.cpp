@@ -8,7 +8,7 @@
 //                  recipe entry, nothing written: the skip that generation
 //                  addressing gives up (it would rewrite the block)
 //   content_dedup  hash plus publish against an existing identical file:
-//                  the staged write, the refused link, the byte compare
+//                  the byte compare that answers the publication, no write
 //   generation     write under a counter name, no hash, always a fresh
 //                  file: what a generation-addressed commit does for every
 //                  dirty block, value-identical or not
@@ -120,8 +120,7 @@ namespace {
 	}
 
 	// the dedup hit: hash plus publish where an identical file already
-	// carries the name (the staged write, the refused link, the byte
-	// compare); the staged temp file is discarded by publish itself
+	// carries the name, which the compare against that file answers
 	void content_dedup(benchmark::State &state) {
 		size_t const len = block_len_of(state);
 		bench_store bench;

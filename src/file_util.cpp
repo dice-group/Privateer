@@ -14,6 +14,7 @@ namespace privateer {
 	namespace detail_file_util {
 
 		std::atomic<uint64_t> sync_calls{0};
+		std::atomic<uint64_t> staged_files{0};
 
 	}  // namespace detail_file_util
 #endif
@@ -23,6 +24,12 @@ namespace privateer {
 		void count_sync() noexcept {
 #ifdef PRIVATEER_TEST_HOOKS
 			detail_file_util::sync_calls.fetch_add(1, std::memory_order_relaxed);
+#endif
+		}
+
+		void count_staged_file() noexcept {
+#ifdef PRIVATEER_TEST_HOOKS
+			detail_file_util::staged_files.fetch_add(1, std::memory_order_relaxed);
 #endif
 		}
 
@@ -101,6 +108,7 @@ namespace privateer {
 				if (::access("/proc/self/fd", F_OK) == 0) {
 					f.fd_ = fd;
 					f.anonymous_ = true;
+					count_staged_file();
 					return f;
 				}
 				::close(fd);
@@ -122,6 +130,7 @@ namespace privateer {
 		}
 		f.fd_ = fd;
 		f.temp_path_ = name.data();
+		count_staged_file();
 		return f;
 	}
 

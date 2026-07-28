@@ -179,7 +179,8 @@ namespace privateer {
 		uint64_t slots_hashed = 0;
 		// hash matched the recipe entry, so no file was written
 		uint64_t slots_skipped = 0;
-		// new name, an identical block file already existed
+		// new name whose block file already existed, so the compare against
+		// that file replaced the write and nothing was written either
 		uint64_t slots_deduped = 0;
 		// new name, a new block file was written
 		uint64_t slots_written = 0;

@@ -49,8 +49,9 @@ namespace privateer {
 
 		// Publishes data under its digest, atomically. Returns true when a
 		// new file was created, false when an identical file already carried
-		// the name (dedup). A different file under the name is a fatal
-		// hash_collision error. Thread-safe.
+		// the name (dedup). A name that already has a file is answered by
+		// comparing that file, so a duplicate writes nothing. A different
+		// file under the name is a fatal hash_collision error. Thread-safe.
 		result<bool> publish(block_digest const &name, std::span<std::byte const> data) const;
 
 		// path of the block file for a name, existing or not
