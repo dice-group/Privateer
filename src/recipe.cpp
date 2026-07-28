@@ -70,6 +70,12 @@ namespace privateer {
 			return fail(errc::invalid_argument, "recipe entry count does not match size");
 		}
 		size_t const expected_digest = digest_size(algorithm);
+		if (expected_digest == 0) {
+			// symmetric with deserialize: a recipe never names an algorithm
+			// this build cannot compute, so no commit can reach hash_block
+			// with an id it has no implementation for
+			return fail(errc::recipe_unsupported, "recipe hash algorithm unknown to the build");
+		}
 		for (auto const &entry : entries) {
 			if (entry.size != 0 && entry.size != expected_digest) {
 				return fail(errc::invalid_argument, "recipe entry width does not match the algorithm");

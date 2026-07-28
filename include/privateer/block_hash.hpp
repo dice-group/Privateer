@@ -18,22 +18,22 @@
 
 namespace privateer {
 
+	// Ids 2 (blake3), 3 (sha256) and 4 (rapidhash) were measured as candidates
+	// and are retired. They stay spent: a new algorithm takes id 5 or higher,
+	// so a store written by a build that had them keeps naming its own
+	// algorithm and this build refuses it instead of misreading it.
 	enum struct hash_algorithm : uint8_t {
 		xxh3_128 = 1,
-		blake3 = 2,
-		sha256 = 3,
-		rapidhash = 4,
 	};
 
+	// Width of one recipe entry on disk, which is a format constant and wider
+	// than the 16 byte digest in use. It does not shrink with the algorithm.
 	inline constexpr size_t max_digest_size = 32;
 
 	// digest byte count of the algorithm, 0 for an id this build does not know
 	[[nodiscard]] constexpr size_t digest_size(hash_algorithm alg) noexcept {
 		switch (alg) {
 			case hash_algorithm::xxh3_128: return 16;
-			case hash_algorithm::blake3: return 32;
-			case hash_algorithm::sha256: return 32;
-			case hash_algorithm::rapidhash: return 8;
 		}
 		return 0;
 	}

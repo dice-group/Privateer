@@ -78,13 +78,13 @@ namespace {
 
 	TEST_F(RegionTest, OpenAdoptsTheRecipeHeader) {
 		region_options create_options = small_options();
-		create_options.algorithm = hash_algorithm::blake3;
+		create_options.algorithm = hash_algorithm::xxh3_128;
 		ASSERT_TRUE(region::create(dir.path, 4 * bs, create_options));
 
 		auto reg = region::open(dir.path);  // no options requested
 		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
 		EXPECT_EQ(reg->block_size(), bs);
-		EXPECT_EQ(reg->algorithm(), hash_algorithm::blake3);
+		EXPECT_EQ(reg->algorithm(), hash_algorithm::xxh3_128);
 	}
 
 	TEST_F(RegionTest, RequestedOptionsMustMatchTheHeader) {
@@ -94,8 +94,11 @@ namespace {
 		wrong_block.block_size = 2 * bs;
 		EXPECT_EQ(region::open(dir.path, wrong_block).error().code, errc::option_mismatch);
 
+		// a retired id: the only algorithm this build serves is the one the
+		// header already names, so the mismatch needs an id from outside the
+		// enumeration
 		region_options wrong_algorithm = small_options();
-		wrong_algorithm.algorithm = hash_algorithm::sha256;
+		wrong_algorithm.algorithm = static_cast<hash_algorithm>(3);
 		EXPECT_EQ(region::open(dir.path, wrong_algorithm).error().code, errc::option_mismatch);
 
 		EXPECT_TRUE(region::open(dir.path, small_options()).has_value());

@@ -1,6 +1,6 @@
-// Throughput of the block hash candidates at the engine's block sizes,
-// plus a plain byte compare as the reference line for the dedup path.
-// The argument is the block size in MiB.
+// Throughput of the block hash at the engine's block sizes, plus a plain
+// byte compare as the reference line for the dedup path. The argument is
+// the block size in MiB.
 
 #include <benchmark/benchmark.h>
 
@@ -44,9 +44,6 @@ namespace {
 	}
 
 	BENCHMARK_CAPTURE(hash_throughput, xxh3_128, privateer::hash_algorithm::xxh3_128)->Arg(2)->Arg(8)->Arg(32);
-	BENCHMARK_CAPTURE(hash_throughput, blake3, privateer::hash_algorithm::blake3)->Arg(2)->Arg(8)->Arg(32);
-	BENCHMARK_CAPTURE(hash_throughput, sha256, privateer::hash_algorithm::sha256)->Arg(2)->Arg(8)->Arg(32);
-	BENCHMARK_CAPTURE(hash_throughput, rapidhash, privateer::hash_algorithm::rapidhash)->Arg(2)->Arg(8)->Arg(32);
 	BENCHMARK(byte_compare_throughput)->Arg(2)->Arg(8)->Arg(32);
 
 }  // namespace
