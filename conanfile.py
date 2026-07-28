@@ -18,8 +18,8 @@ class PrivateerConan(ConanFile):
     topics = ("memory-mapped-io", "content-addressable-storage", "copy-on-write", "snapshots", "metall")
     package_type = "static-library"
     settings = "os", "arch", "compiler", "build_type"
-    options = {"fPIC": [True, False], "build_legacy": [True, False]}
-    default_options = {"fPIC": True, "build_legacy": False}
+    options = {"fPIC": [True, False]}
+    default_options = {"fPIC": True}
     exports = "LICENSE", "NOTICE"
     exports_sources = "CMakeLists.txt", "cmake/*", "include/*", "src/*"
 
@@ -31,8 +31,6 @@ class PrivateerConan(ConanFile):
         self.requires("rapidhash/3.0")
         self.requires("boost/1.88.0", headers=True, libs=False, transitive_headers=True,
                       options={"header_only": True})
-        if self.options.build_legacy:
-            self.requires("spdlog/1.17.0")
 
     def build_requirements(self):
         self.test_requires("gtest/1.17.0")
@@ -54,7 +52,6 @@ class PrivateerConan(ConanFile):
         tc = CMakeToolchain(self)
         tc.cache_variables["PRIVATEER_BUILD_TESTING"] = False
         tc.cache_variables["PRIVATEER_BUILD_BENCHMARKS"] = False
-        tc.cache_variables["PRIVATEER_BUILD_LEGACY"] = bool(self.options.build_legacy)
         tc.generate()
 
     def build(self):
