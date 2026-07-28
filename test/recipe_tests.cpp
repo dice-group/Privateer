@@ -94,8 +94,18 @@ namespace {
 		EXPECT_EQ(rec.serialize().error().code, errc::invalid_argument);
 
 		rec = sample_recipe();
-		rec.entries[0] = hash_block(hash_algorithm::rapidhash, {});  // 8 byte digest under xxh3_128
+		rec.entries[0] = hash_block(hash_algorithm::xxh3_128, {});
+		rec.entries[0].size = 8;  // narrower than xxh3_128's 16 bytes
 		EXPECT_EQ(rec.serialize().error().code, errc::invalid_argument);
+	}
+
+	// The write path refuses an algorithm this build cannot compute, the same
+	// way the read path does, so no commit reaches hash_block without an
+	// implementation for the id in the header.
+	TEST(Recipe, SerializeRefusesAnAlgorithmTheBuildDoesNotKnow) {
+		recipe rec = sample_recipe();
+		rec.algorithm = static_cast<hash_algorithm>(3);  // retired sha256 id
+		EXPECT_EQ(rec.serialize().error().code, errc::recipe_unsupported);
 	}
 
 	TEST(Recipe, CommitPublishesAtomicallyAndLoadReadsBack) {

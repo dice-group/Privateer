@@ -6,10 +6,7 @@ option(PRIVATEER_BUILD_BENCHMARKS "Build the microbenchmarks" ${PROJECT_IS_TOP_L
 
 find_package(asio REQUIRED)
 find_package(Boost REQUIRED)
-find_package(blake3 REQUIRED)
 find_package(xxHash REQUIRED)
-find_package(OpenSSL REQUIRED)
-find_package(rapidhash REQUIRED)
 find_package(Threads REQUIRED)
 
 add_library(privateer STATIC
@@ -49,7 +46,7 @@ target_compile_definitions(privateer PUBLIC
 )
 target_compile_definitions(privateer PRIVATE PRIVATEER_VERSION="${PROJECT_VERSION}")
 target_link_libraries(privateer PUBLIC asio::asio Boost::headers Threads::Threads)
-target_link_libraries(privateer PRIVATE BLAKE3::blake3 xxHash::xxhash OpenSSL::Crypto rapidhash::rapidhash)
+target_link_libraries(privateer PRIVATE xxHash::xxhash)
 
 if (PRIVATEER_BUILD_TESTING)
     # Compile the test-only hooks into the library (failure-injection seams,

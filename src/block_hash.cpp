@@ -3,30 +3,13 @@
 #include <cstdlib>
 #include <cstring>
 
-#include <blake3.h>
-#include <openssl/evp.h>
-#include <rapidhash.h>
 #include <xxhash.h>
 
 namespace privateer {
 
-	namespace {
-
-		// big-endian serialization, the canonical digest byte order
-		void store_be64(std::byte *out, uint64_t value) noexcept {
-			for (int i = 0; i < 8; ++i) {
-				out[i] = static_cast<std::byte>(value >> (56 - 8 * i));
-			}
-		}
-
-	}  // namespace
-
 	char const *to_string(hash_algorithm alg) noexcept {
 		switch (alg) {
 			case hash_algorithm::xxh3_128: return "xxh3_128";
-			case hash_algorithm::blake3: return "blake3";
-			case hash_algorithm::sha256: return "sha256";
-			case hash_algorithm::rapidhash: return "rapidhash";
 		}
 		return "unknown";
 	}
@@ -40,26 +23,6 @@ namespace privateer {
 				XXH128_canonical_t canonical;
 				XXH128_canonicalFromHash(&canonical, hash);
 				std::memcpy(digest.bytes.data(), canonical.digest, sizeof(canonical.digest));
-				return digest;
-			}
-			case hash_algorithm::blake3: {
-				blake3_hasher hasher;
-				blake3_hasher_init(&hasher);
-				blake3_hasher_update(&hasher, data.data(), data.size());
-				blake3_hasher_finalize(&hasher, reinterpret_cast<uint8_t *>(digest.bytes.data()), BLAKE3_OUT_LEN);
-				return digest;
-			}
-			case hash_algorithm::sha256: {
-				unsigned int len = 0;
-				if (EVP_Digest(data.empty() ? "" : reinterpret_cast<char const *>(data.data()), data.size(),
-							   reinterpret_cast<unsigned char *>(digest.bytes.data()), &len, EVP_sha256(), nullptr) != 1 ||
-					len != digest.size) {
-					std::abort();  // EVP_Digest fails only on a broken crypto library
-				}
-				return digest;
-			}
-			case hash_algorithm::rapidhash: {
-				store_be64(digest.bytes.data(), ::rapidhash(data.data(), data.size()));
 				return digest;
 			}
 		}

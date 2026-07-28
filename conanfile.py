@@ -25,10 +25,7 @@ class PrivateerConan(ConanFile):
 
     def requirements(self):
         self.requires("asio/1.38.0", transitive_headers=True)
-        self.requires("blake3/1.8.5")
         self.requires("xxhash/0.8.3")
-        self.requires("openssl/3.6.1")
-        self.requires("rapidhash/3.0")
         self.requires("boost/1.88.0", headers=True, libs=False, transitive_headers=True,
                       options={"header_only": True})
 
