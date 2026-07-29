@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Crash tests for the storage-level commit sequence over the block store
 // and the recipe: publish the changed blocks, run the durability barrier,
 // rename the recipe, reclaim the retired names. A child process runs the

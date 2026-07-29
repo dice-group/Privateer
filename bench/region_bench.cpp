@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Engine microbenchmarks on a real region: barrier fault latency, commit
 // throughput and worker scaling, writer stall during a commit, and reader
 // disturbance during commit capture. Every benchmark sweeps the A/B 3

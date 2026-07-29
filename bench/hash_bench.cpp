@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Throughput of the block hash at the engine's block sizes, plus a plain
 // byte compare as the reference line for the dedup path. The argument is
 // the block size in MiB.

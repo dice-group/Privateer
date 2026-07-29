@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // The executor around the region: the parallel commit write-out, the
 // region-owned task and timer lifecycle, and the close-time drain.
 

@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Tests for the process-wide fault handler: installation, the alternate
 // stack, a handled fault inside a registered region, the chaining matrix for
 // unowned faults (previous SA_SIGINFO handler, plain handler, SIG_DFL,

@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Tests for the recipe: serialization round trip, field validation, the
 // atomic commit through the file, and corruption, version, and block
 // validation on the load path. Corruption cases patch serialized bytes

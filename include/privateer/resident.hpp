@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 #ifndef PRIVATEER_RESIDENT_HPP
 #define PRIVATEER_RESIDENT_HPP
 
