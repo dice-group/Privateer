@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // The combined long-running soak: many readers, one writer, a GC thread
 // freeing slot ranges, and a committer running commit and snapshot cycles,
 // with the cleaner and the governor enabled the whole time. The suite

@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Crash tests for the staged publication: a child process is killed at each
 // phase boundary. The properties checked on the survivor side: a published
 // name exists exactly from the publish step on, with its full content, and a

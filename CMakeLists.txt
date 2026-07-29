@@ -1,3 +1,6 @@
+# Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+# SPDX-License-Identifier: MIT
+
 cmake_minimum_required(VERSION 3.24)
 project(privateer VERSION 0.2.0 LANGUAGES CXX)
 

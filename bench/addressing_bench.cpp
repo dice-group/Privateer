@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // The A/B 2 microbenchmark: the per-block commit-path mechanics of
 // content-addressed names against generation-addressed names (slot plus
 // epoch, no hashing). Four arms per block size (2, 8, 32 MiB):

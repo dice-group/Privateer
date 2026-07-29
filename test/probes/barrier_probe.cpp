@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Probes P1 to P3: the write-barrier signal mechanics the engine is built on.
 //
 // P1: a write to a PROT_READ MAP_PRIVATE file mapping faults with the expected

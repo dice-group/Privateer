@@ -1,3 +1,6 @@
+# Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+# SPDX-License-Identifier: MIT
+
 import os
 
 from conan import ConanFile
@@ -20,7 +23,7 @@ class PrivateerConan(ConanFile):
     settings = "os", "arch", "compiler", "build_type"
     options = {"fPIC": [True, False]}
     default_options = {"fPIC": True}
-    exports = "LICENSE", "NOTICE"
+    exports = "LICENSE", "LICENSE-UPB", "NOTICE"
     exports_sources = "CMakeLists.txt", "cmake/*", "include/*", "src/*"
 
     def requirements(self):
@@ -62,7 +65,10 @@ class PrivateerConan(ConanFile):
         # consumers find the package through the generated CMakeDeps files, so
         # the installed export set is redundant
         rmdir(self, os.path.join(self.package_folder, "lib", "cmake"))
+        # two licenses, both MIT: LICENSE covers the inherited files, LICENSE-UPB
+        # the files written for this engine
         copy(self, "LICENSE", src=self.recipe_folder, dst=os.path.join(self.package_folder, "licenses"))
+        copy(self, "LICENSE-UPB", src=self.recipe_folder, dst=os.path.join(self.package_folder, "licenses"))
         copy(self, "NOTICE", src=self.recipe_folder, dst=os.path.join(self.package_folder, "licenses"))
 
     def package_info(self):

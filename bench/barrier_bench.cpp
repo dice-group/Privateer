@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // The A/B 6 microbenchmark: the shape of the commit durability barrier.
 // The engine's barrier is one fdatasync per new block file plus one fsync
 // per shard directory that received an entry, all issued in line on the

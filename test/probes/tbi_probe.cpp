@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Probe P7, Linux aarch64 only: faults through TBI-tagged pointers.
 //
 // Top-byte-ignore is on by default for user pointers on aarch64 Linux, so an

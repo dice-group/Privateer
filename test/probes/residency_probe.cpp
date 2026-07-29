@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Probes P5 and P6, Linux only: the syscalls behind the resident-budget trim.
 //
 // P5: MADV_PAGEOUT on a clean single-mapped file range evicts the pages from

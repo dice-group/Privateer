@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // The background write-back: victim selection with cold-first order and
 // re-dirty backoff, the write-back correctness under re-dirtying writers,
 // the durability modes, and crash safety mid-clean.

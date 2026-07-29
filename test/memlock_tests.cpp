@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Tests for mlocked buffers and the resource limit handling: the
 // raise-or-refuse contract for RLIMIT_MEMLOCK, the unlocked override for
 // swapless deployments, and the Darwin RLIMIT_NOFILE raise. The limit

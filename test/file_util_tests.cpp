@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Unit tests for the durable file utilities: staged publication under both
 // backings, the data barriers, and write_all.
 

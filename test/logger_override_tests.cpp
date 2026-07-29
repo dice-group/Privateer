@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Own test binary: it defines a strong metall_log, which must replace
 // privateer's weak built-in sink at link time. The other test binaries keep
 // the built-in sink, so both linking modes are covered.

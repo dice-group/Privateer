@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Tests for the content-addressed block store: the shard skeleton,
 // atomic publication with dedup and the hash-collision check, the
 // durable-name set, reference bookkeeping feeding reclaim, and the

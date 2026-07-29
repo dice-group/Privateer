@@ -1,3 +1,6 @@
+# Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+# SPDX-License-Identifier: MIT
+
 find_package(GTest REQUIRED)
 find_package(Threads REQUIRED)
 include(GoogleTest)

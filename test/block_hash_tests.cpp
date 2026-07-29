@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Tests for the block hash layer. The digest constants pin the exact
 // output bytes of xxh3_128 against vectors from an independent
 // implementation, so the pin catches silent drift on a dependency bump.

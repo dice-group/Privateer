@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Crash tests for the region commit: a child process opens the datastore,
 // dirties a slot through the write barrier, and is killed at each commit
 // phase boundary. Properties checked on the survivor side: the datastore

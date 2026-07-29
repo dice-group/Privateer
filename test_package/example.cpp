@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Smoke test for the packaged library: create a datastore, dirty one block
 // through the write barrier, and commit it durably.
 

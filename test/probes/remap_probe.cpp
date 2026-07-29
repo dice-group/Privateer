@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Probe P8: MAP_FIXED replacement atomicity under concurrent readers.
 //
 // The commit path remaps a slot to its new block file with one

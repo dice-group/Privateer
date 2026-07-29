@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Probe P4: mprotect downgrade shootdown synchrony.
 //
 // The commit capture phase downgrades a dirty slot to PROT_READ and then treats

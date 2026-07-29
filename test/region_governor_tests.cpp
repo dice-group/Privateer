@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // The memory governor: option validation, the dirty budget (soft-mark
 // edge-triggered cleaning, the hard-mark writer wait with its timeout
 // overshoot, close forwarding a parked writer), and the resident budget

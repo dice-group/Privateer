@@ -1,3 +1,6 @@
+// Copyright 2026 Data Science Group (DICE), Paderborn University. See LICENSE-UPB.
+// SPDX-License-Identifier: MIT
+
 // Sanitizer defaults for the test binaries. One definition per binary, so
 // this lives in its own translation unit rather than in a header.
 
