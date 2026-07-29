@@ -30,6 +30,13 @@ class PrivateerConan(ConanFile):
                       options={"header_only": True})
 
     def build_requirements(self):
+        # A package build has the tests and the benchmarks off, so these are
+        # dead weight there, and liburing does not configure everywhere the
+        # engine builds (its configure needs GNU realpath, which alpine does
+        # not have). A consumer that builds the engine from source therefore
+        # sets tools.build:skip_test and needs none of them.
+        if self.conf.get("tools.build:skip_test", default=False, check_type=bool):
+            return
         self.test_requires("gtest/1.17.0")
         self.test_requires("benchmark/1.9.5")
         # the io_uring arms of the durability barrier benchmark; the engine
