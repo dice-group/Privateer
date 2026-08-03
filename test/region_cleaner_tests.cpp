@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <privateer/block_store.hpp>
 #include <privateer/fault_handler.hpp>
 #include <privateer/file_util.hpp>
 #include <privateer/region.hpp>
@@ -25,6 +26,9 @@
 #include <functional>
 #include <optional>
 #include <thread>
+#include <vector>
+
+#include <sys/stat.h>
 
 // sanitizer detection: gcc defines __SANITIZE_*, clang answers __has_feature
 #ifdef __SANITIZE_THREAD__
@@ -57,6 +61,23 @@ namespace {
 
 	// the injected cleaner clock; tests advance it by hand
 	std::atomic<int64_t> g_now{0};
+
+	// the inode of a file, 0 when it does not exist: what tells a rewrite
+	// through a fresh file from a second sync of the same one
+	ino_t inode_of(fs::path const &path) {
+		struct stat st {};
+		return ::stat(path.c_str(), &st) == 0 ? st.st_ino : 0;
+	}
+
+	// the block file a slot holding fill in its first byte and zeros behind
+	// it is named after
+	fs::path block_of(fs::path const &segment_dir, uint64_t block_size, char fill) {
+		std::vector<std::byte> data(block_size, std::byte{0});
+		data[0] = static_cast<std::byte>(fill);
+		auto store = block_store::open(segment_dir);
+		EXPECT_TRUE(store.has_value());
+		return store->block_path(hash_block(hash_algorithm::xxh3_128, data));
+	}
 
 	struct RegionCleanerTest : ::testing::Test {
 		privateer::testing::temp_dir dir;
@@ -467,6 +488,37 @@ namespace {
 		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
 		EXPECT_EQ(bytes(*reopened)[0], 'a');
 		EXPECT_EQ(bytes(*reopened)[bs], 'b');
+	}
+
+	// The eager barrier covers every name the batch's entries carry, and a
+	// slot whose content still carries the name its entry holds writes no
+	// file. When that barrier fails, the file behind that name is the one
+	// the failed sync left, so the next batch writes it again instead of
+	// skipping the slot a second time.
+	TEST_F(RegionCleanerTest, AFailedEagerBarrierRewritesTheNameASkippedSlotCarries) {
+		auto reg = region::create(dir.path, 8 * bs, options(cleaner_mode::eager_durable));
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		ASSERT_TRUE(reg->extend(bs));
+		bytes(*reg)[0] = 'a';
+		ASSERT_TRUE(reg->commit(false));  // publishes the block, no barrier owed yet
+		bytes(*reg)[0] = 'a';             // dirty again, same content, same name
+		auto const block = block_of(dir.path, bs, 'a');
+		auto const before = inode_of(block);
+		ASSERT_NE(before, 0u);
+
+		detail_block_store::barrier_sync_fails_fn = [](block_digest const &) { return true; };
+		EXPECT_EQ(detail_region::run_cleaner_batch(*reg, false), 0u);
+		detail_block_store::barrier_sync_fails_fn = nullptr;
+		EXPECT_EQ(detail_region::table_of(*reg).load(0), slot_state::dirty);
+
+		g_now.store(100);  // past the failure backoff
+		EXPECT_EQ(detail_region::run_cleaner_batch(*reg, false), 1u);
+		EXPECT_NE(inode_of(block), before) << "the block was not written again";
+
+		ASSERT_TRUE(reg->commit(true));
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		EXPECT_EQ(bytes(*reopened)[0], 'a');
 	}
 
 	TEST_F(RegionCleanerTest, TheTimerDrivenCleanerDrainsDirtySlots) {

@@ -803,6 +803,53 @@ namespace privateer {
 			return true;
 		}
 
+		// Puts the region back where the next write-out rewrites every name a
+		// failed durability barrier left distrusted. The file behind such a
+		// name may hold anything and re-syncing it proves nothing, so its
+		// content must go through a fresh file: the clean slots carrying such
+		// a name go back to dirty, so the next capture writes them out again,
+		// and the segments whose record names one are marked, so the next
+		// commit re-encodes and republishes them. A slot that is not clean
+		// needs nothing: a dirty one is written out anyway, and a transient
+		// one belongs to its owner. The caller holds the commit mutex, so
+		// only the fault handler competes for a slot, and it loses the claim
+		// or waits it out. Allocates nothing and does not log: the failure
+		// paths that call it must not throw.
+		void rewrite_distrusted_names() noexcept {
+			auto &table = hot->table;
+			bool changed = false;
+			for (size_t slot = 0; slot < rec.entries.size(); ++slot) {
+				auto const &entry = rec.entries[slot];
+				if (entry.size == 0 || !store->needs_rewrite(entry)) {
+					continue;
+				}
+				if (!table.try_claim(slot, slot_state::clean, slot_state::materializing)) {
+					continue;
+				}
+				auto *const addr = segment_base() + slot * rec.block_size;
+				table.add_dirty();
+				if (::mprotect(addr, rec.block_size, PROT_READ | PROT_WRITE) != 0) {
+					hot->poisoned.fetch_add(1, std::memory_order_release);
+					table.sub_dirty();
+					table.publish(slot, slot_state::poisoned);
+					hot->error.store(1, std::memory_order_release);
+					changed = true;
+					continue;
+				}
+				table.publish(slot, slot_state::dirty);
+				changed = true;
+			}
+			if (changed) {
+				table.wake_governor();
+			}
+			for (size_t index = 0; index < rec.segments.size() && index < segment_dirty.size(); ++index) {
+				if (rec.segments[index].digest.size != 0 &&
+					store->needs_rewrite(rec.segments[index].digest)) {
+					segment_dirty[index] = 1;
+				}
+			}
+		}
+
 		// One write-back batch: scans for dirty slots, orders them coldest
 		// first, and runs the commit's capture and write-out for them under
 		// one commit-mutex hold. The batch writes every victim's block file
@@ -962,7 +1009,11 @@ namespace privateer {
 				auto const name = hash_block(rec.algorithm, content);
 				stat_hashed.fetch_add(1, std::memory_order_relaxed);
 				auto &entry = rec.entries[slot];
-				if (name == entry) {
+				// A name a failed durability barrier left distrusted needs
+				// its file written again, so the content goes to the store
+				// even when the entry already carries the name.
+				bool const rewrite = store->needs_rewrite(name);
+				if (name == entry && !rewrite) {
 					stat_skipped.fetch_add(1, std::memory_order_relaxed);
 					pendings.push_back({slot, entry, false});
 					written.push_back(entry);
@@ -984,6 +1035,9 @@ namespace privateer {
 					break;
 				}
 				(*published ? stat_written : stat_deduped).fetch_add(1, std::memory_order_relaxed);
+				if (rewrite) {
+					store->note_rewritten(name);
+				}
 				if (*published) {
 					fresh_names.push_back(name);
 				}
@@ -1013,7 +1067,10 @@ namespace privateer {
 			// and drops the files this batch created: a later publish of the
 			// same content must not dedup against a file whose sync failed,
 			// because a re-synced file cannot be trusted; the rewrite
-			// through a fresh file is the trustworthy retry.
+			// through a fresh file is the trustworthy retry. The names the
+			// barrier attempted and this batch did not create keep their
+			// files and their references, so the store's distrust is what
+			// forces their rewrite.
 			if (cleaner.mode == cleaner_mode::eager_durable && !written.empty()) {
 				auto const synced = cleaner_durability_fails()
 											? result<>{std::unexpected{error{errc::io_error, EIO,
@@ -1029,6 +1086,7 @@ namespace privateer {
 						store->discard_unreferenced(name);
 					}
 					pendings.clear();
+					rewrite_distrusted_names();
 					failed = true;
 				}
 			}
@@ -2095,6 +2153,11 @@ namespace privateer {
 		};
 		struct worker_result {
 			std::vector<ref_delta> deltas;
+			// Names whose file this worker rewrote because a failed
+			// durability barrier had distrusted them. A worker runs on a pool
+			// thread and must not touch the store's bookkeeping, so it
+			// records them here and the join below ends their distrust.
+			std::vector<block_digest> rewritten;
 			// Segments whose entries this worker wrote. A worker runs on a pool
 			// thread and must not touch the region's flags, so it records the
 			// indices here and the join below marks them.
@@ -2164,7 +2227,11 @@ namespace privateer {
 				auto const name = hash_block(st.rec.algorithm, content);
 				st.stat_hashed.fetch_add(1, std::memory_order_relaxed);
 				block_digest const prior = entry;
-				if (name == entry) {
+				// A name a failed durability barrier left distrusted needs
+				// its file written again, so the content goes to the store
+				// even when the entry already carries the name.
+				bool const rewrite = st.store->needs_rewrite(name);
+				if (name == entry && !rewrite) {
 					st.stat_skipped.fetch_add(1, std::memory_order_relaxed);
 				} else {
 					auto const published = st.store->publish(name, content);
@@ -2174,8 +2241,13 @@ namespace privateer {
 						return;
 					}
 					(*published ? st.stat_written : st.stat_deduped).fetch_add(1, std::memory_order_relaxed);
-					entry = name;
-					note_segment(cap.slot);
+					if (rewrite) {
+						res.rewritten.push_back(name);
+					}
+					if (name != prior) {
+						entry = name;
+						note_segment(cap.slot);
+					}
 				}
 				// One MAP_FIXED call replaces the private pages with the
 				// named block file; a concurrent reader either reads the old
@@ -2267,6 +2339,9 @@ namespace privateer {
 					st.store->note_unsynced(delta.add);
 				}
 			}
+			for (auto const &name : res.rewritten) {
+				st.store->note_rewritten(name);
+			}
 			for (uint32_t const index : res.dirty_segments) {
 				st.mark_segments(index, index);
 			}
@@ -2325,9 +2400,16 @@ namespace privateer {
 				auto const name = hash_block(st.rec.algorithm, **encoded);
 				record = segment_record{segment_encoding::raw,
 										static_cast<uint32_t>((*encoded)->size()), name};
-				if (name != records[index].digest) {
+				// A name a failed durability barrier left distrusted needs
+				// its file written again, even when the record already
+				// carries the name.
+				bool const rewrite = st.store->needs_rewrite(name);
+				if (name != records[index].digest || rewrite) {
 					if (auto ok = st.store->publish(name, **encoded); !ok) {
 						return std::unexpected{ok.error()};
+					}
+					if (rewrite) {
+						st.store->note_rewritten(name);
 					}
 					// The name owes a sync: a file this commit created, or a
 					// dedup hit on a file no barrier covers yet.
@@ -2364,8 +2446,13 @@ namespace privateer {
 		// batches, so it costs what was published since the last barrier and
 		// not a pass over the whole recipe. The store skips names already in
 		// the durable set and names nothing references any more.
+		//
+		// A failed barrier leaves its names distrusted, and the region is put
+		// back where the next commit rewrites them: the manifest below is
+		// never renamed over a name whose content the device may not have.
 		if (durable) {
 			if (auto synced = st.store->make_pending_durable(spread); !synced) {
+				st.rewrite_distrusted_names();
 				return std::unexpected{synced.error()};
 			}
 			commit_phase_done(4);
