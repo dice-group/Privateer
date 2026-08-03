@@ -183,11 +183,13 @@ UndefinedBehaviorSanitizer and under ThreadSanitizer as well.
 
 ## Benchmarks
 
-`PRIVATEER_BUILD_BENCHMARKS=ON` builds four Google Benchmark binaries under `bench/`:
+`PRIVATEER_BUILD_BENCHMARKS=ON` builds five Google Benchmark binaries under `bench/`:
 `region_bench` (fault, commit and snapshot paths of a whole region), `barrier_bench` (durability
-barrier shapes), `hash_bench` (block hashing) and `addressing_bench` (the per-block commit mechanics
-of content addressing). They write into `TMPDIR`, so put it on the device under test, and not on a
-network or virtual file system when the numbers are meant to be compared.
+barrier shapes), `hash_bench` (block hashing), `addressing_bench` (the per-block commit mechanics
+of content addressing) and `recipe_bench` (recipe persistence: the segments and manifest a commit
+writes for its changeset, against the whole-file write of format version 1). They write into
+`TMPDIR`, so put it on the device under test, and not on a network or virtual file system when the
+numbers are meant to be compared.
 
 ## License
 
