@@ -1329,23 +1329,29 @@ namespace privateer {
 				}
 			}
 
-			// One pass of the periodic chain, running on a pool thread; it
-			// re-arms the chain.
-			void chain_pass(uint64_t passed_chain) {
-				std::lock_guard const lock{mutex};
-				if (passed_chain != chain) {
-					return;  // a timer of a chain the sweeper gave up on
+			// One pass of the periodic chain, running on a pool thread. It
+			// re-arms the chain, and it swallows what the sweep throws: an
+			// allocation failure ends the chain instead of leaving the pool
+			// thread, which would end the process.
+			void chain_pass(uint64_t passed_chain) noexcept {
+				try {
+					std::lock_guard const lock{mutex};
+					if (passed_chain != chain) {
+						return;  // a timer of a chain the sweeper gave up on
+					}
+					if (entries.empty() || disabled) {
+						armed = false;
+						return;
+					}
+					(void) sweep_locked();
+					if (disabled) {
+						armed = false;
+						return;
+					}
+					arm(min_interval_ns());
+				} catch (...) {
+					end_chain(passed_chain);
 				}
-				if (entries.empty() || disabled) {
-					armed = false;
-					return;
-				}
-				(void) sweep_locked();
-				if (disabled) {
-					armed = false;
-					return;
-				}
-				arm(min_interval_ns());
 			}
 
 			// One pass on the calling thread, outside the chain: it neither

@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <thread>
@@ -726,6 +727,35 @@ namespace {
 		EXPECT_TRUE(eventually([&] { return g_probe_calls.load() >= before + 3; }, 30s))
 				<< "the periodic sweep never ran for this region: " << g_probe_calls.load() - before
 				<< " passes";
+	}
+
+	TEST_F(RegionResidentTest, AnAllocationFailureInAPassEndsTheChainNotTheProcess) {
+		// A pass allocates: the residency probe reads procfs into a string,
+		// and the pass builds a victim plan per region. The failure runs out
+		// of a pool thread, where an unguarded one takes the process down.
+		// The budget is advisory, so the chain ends and the kernel's own
+		// reclaim remains.
+		privateer::testing::build_committed_store(dir.path, bs, {'a', 'b'});
+		detail_region::resident_bytes_fn = []() -> result<uint64_t> {
+			g_probe_calls.fetch_add(1);
+			throw std::bad_alloc{};
+		};
+		auto opts = resident_options(2 * bs, 0);
+		opts.governor.sweep_interval = 5ms;
+		auto reg = region::open(dir.path, opts);
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		scan_slot(*reg, 0, bs);
+		ASSERT_TRUE(eventually([] { return g_probe_calls.load() > 0; }, 30s));
+
+		// the failed pass ended the chain: no pass follows it
+		int const passes = g_probe_calls.load();
+		std::this_thread::sleep_for(200ms);  // 40 intervals
+		EXPECT_EQ(g_probe_calls.load(), passes);
+
+		// the process is alive and the region is healthy
+		EXPECT_TRUE(reg->check_sanity());
+		bytes(*reg)[0] = 'A';
+		EXPECT_TRUE(reg->commit(true));
 	}
 
 	TEST_F(RegionResidentTest, TheSweepSeamsTakeStoresWhilePassesRun) {
