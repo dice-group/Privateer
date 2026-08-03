@@ -96,6 +96,29 @@ namespace {
 		}
 	};
 
+	// A write-back changes the recipe entry of its slot, so the segment holding
+	// that slot must be republished even though the commit captures nothing.
+	TEST_F(RegionCleanerTest, AWriteBackMarksItsSegmentForTheNextCommit) {
+		privateer::testing::build_committed_store(dir.path, bs, {'x'});
+		auto reg = region::open(dir.path, options(cleaner_mode::non_durable));
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		auto const before = privateer::testing::manifest_records(dir.path);
+		ASSERT_EQ(before.size(), 1u);
+
+		bytes(*reg)[0] = 'a';
+		ASSERT_EQ(detail_region::run_cleaner_batch(*reg, false), 1u);
+		EXPECT_EQ(detail_region::table_of(*reg).dirty_slots(), 0u);
+
+		ASSERT_TRUE(reg->commit(true));
+		auto const after = privateer::testing::manifest_records(dir.path);
+		ASSERT_EQ(after.size(), 1u);
+		EXPECT_NE(after[0], before[0]);
+
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		EXPECT_EQ(bytes(*reopened)[0], 'a');
+	}
+
 	TEST_F(RegionCleanerTest, ABatchWritesTheDirtySlotsBack) {
 		privateer::testing::build_committed_store(dir.path, bs, {'x', 'y'});
 		auto reg = region::open(dir.path, options(cleaner_mode::non_durable));

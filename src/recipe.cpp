@@ -465,6 +465,29 @@ namespace privateer {
 		return records;
 	}
 
+	result<> publish_manifest(recipe const &rec, fs::path const &segment_dir, bool durable) {
+		auto const width = checked_fields(rec);
+		if (!width) {
+			return std::unexpected{width.error()};
+		}
+		if (*width > record_digest_room) {
+			return fail(errc::recipe_unsupported, "recipe digest wider than a manifest record");
+		}
+		if (rec.segments.size() != segment_count(rec.entries.size())) {
+			return fail(errc::invalid_argument, "recipe segment count does not match the slot count");
+		}
+		for (auto const &record : rec.segments) {
+			if (record.encoding == segment_encoding::raw && record.digest.size == 0) {
+				return fail(errc::invalid_argument, "a raw recipe segment names no file");
+			}
+		}
+		auto manifest = encode_manifest(rec, *width, rec.segments);
+		if (!manifest) {
+			return std::unexpected{manifest.error()};
+		}
+		return commit_manifest(*manifest, segment_dir, durable);
+	}
+
 	namespace {
 
 		// The version 2 read path: validate the manifest, then read and decode

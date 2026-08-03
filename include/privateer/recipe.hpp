@@ -135,6 +135,18 @@ namespace privateer {
 		static result<recipe> load(std::filesystem::path const &segment_dir, block_store const &store);
 	};
 
+	// Writes the manifest over the records the recipe carries: <segment>/_recipe
+	// through a staged write and a rename, which is the atomic commit point.
+	// The segment files are the caller's own to publish, so nothing here
+	// touches the store. durable syncs the manifest content before the rename
+	// and the segment directory after it.
+	//
+	// Fails with invalid_argument when the records do not describe the
+	// entries: a count other than one record per segment, or a raw record
+	// that names no file.
+	[[nodiscard]] result<> publish_manifest(recipe const &rec, std::filesystem::path const &segment_dir,
+											bool durable);
+
 	// Framed bytes of the segment at index, or nothing when every slot of its
 	// range holds the empty sentinel, which is what an all_empty record
 	// stands for. The bytes are content addressed: their hash names the
