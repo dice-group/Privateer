@@ -17,6 +17,7 @@
 #include <privateer/word_wait.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -144,16 +145,23 @@ namespace privateer {
 #ifdef PRIVATEER_TEST_HOOKS
 	namespace detail_region {
 
-		int (*mprotect_fn)(void *, size_t, int) = ::mprotect;
-		void (*commit_phase_hook)(int) = nullptr;
-		int (*link_fn)(char const *, char const *) = ::link;
-		int64_t (*clock_fn)() = monotonic_now_ns;
-		void (*cleaner_slot_hook)(size_t) = nullptr;
-		result<uint64_t> (*resident_bytes_fn)() = resident_pss_bytes;
-		int (*pageout_fn)(void *, size_t) = pageout_range;
-		bool (*commit_post_fails_fn)(size_t) = nullptr;
-		bool (*cleaner_write_fails_fn)(size_t) = nullptr;
-		bool (*cleaner_durability_fails_fn)() = nullptr;
+		// The seams are atomic because a test stores one while a live region
+		// reads it: from a pool thread, and from signal context. A relaxed
+		// load compiles to the plain load the handler needs.
+		std::atomic<int (*)(void *, size_t, int)> mprotect_fn{::mprotect};
+		std::atomic<void (*)(int)> commit_phase_hook{nullptr};
+		std::atomic<int (*)(char const *, char const *)> link_fn{::link};
+		std::atomic<int64_t (*)()> clock_fn{monotonic_now_ns};
+		std::atomic<void (*)(size_t)> cleaner_slot_hook{nullptr};
+		std::atomic<result<uint64_t> (*)()> resident_bytes_fn{resident_pss_bytes};
+		std::atomic<int (*)(void *, size_t)> pageout_fn{pageout_range};
+		std::atomic<bool (*)(size_t)> commit_post_fails_fn{nullptr};
+		std::atomic<bool (*)(size_t)> cleaner_write_fails_fn{nullptr};
+		std::atomic<bool (*)()> cleaner_durability_fails_fn{nullptr};
+
+		// the fault path reads its seam in signal context, where only a
+		// lock-free load is allowed
+		static_assert(std::atomic<int (*)(void *, size_t, int)>::is_always_lock_free);
 
 	}  // namespace detail_region
 #endif
@@ -163,7 +171,8 @@ namespace privateer {
 		// the fault path's protection change; tests reroute it through the seam
 		PRIVATEER_HANDLER_TEXT int protect_slot_for_write(void *addr, size_t len) {
 #ifdef PRIVATEER_TEST_HOOKS
-			return detail_region::mprotect_fn(addr, len, PROT_READ | PROT_WRITE);
+			return detail_region::mprotect_fn.load(std::memory_order_relaxed)(
+					addr, len, PROT_READ | PROT_WRITE);
 #else
 			return ::mprotect(addr, len, PROT_READ | PROT_WRITE);
 #endif
@@ -171,15 +180,16 @@ namespace privateer {
 
 		void commit_phase_done([[maybe_unused]] int phase) {
 #ifdef PRIVATEER_TEST_HOOKS
-			if (detail_region::commit_phase_hook != nullptr) {
-				detail_region::commit_phase_hook(phase);
+			if (auto const hook = detail_region::commit_phase_hook.load(std::memory_order_relaxed);
+				hook != nullptr) {
+				hook(phase);
 			}
 #endif
 		}
 
 		int link_for_staging(char const *from, char const *to) {
 #ifdef PRIVATEER_TEST_HOOKS
-			return detail_region::link_fn(from, to);
+			return detail_region::link_fn.load(std::memory_order_relaxed)(from, to);
 #else
 			return ::link(from, to);
 #endif
@@ -188,7 +198,7 @@ namespace privateer {
 		// the cleaner's time source; tests replace it for deterministic backoff
 		int64_t cleaner_now_ns() {
 #ifdef PRIVATEER_TEST_HOOKS
-			return detail_region::clock_fn();
+			return detail_region::clock_fn.load(std::memory_order_relaxed)();
 #else
 			return monotonic_now_ns();
 #endif
@@ -264,8 +274,8 @@ namespace privateer {
 		// failure path. The engine always posts.
 		bool commit_post_fails([[maybe_unused]] size_t worker) {
 #ifdef PRIVATEER_TEST_HOOKS
-			return detail_region::commit_post_fails_fn != nullptr &&
-				   detail_region::commit_post_fails_fn(worker);
+			auto const fails = detail_region::commit_post_fails_fn.load(std::memory_order_relaxed);
+			return fails != nullptr && fails(worker);
 #else
 			return false;
 #endif
@@ -275,8 +285,8 @@ namespace privateer {
 		// ENOSPC would; tests reroute it through the seam.
 		bool cleaner_write_fails([[maybe_unused]] size_t slot) {
 #ifdef PRIVATEER_TEST_HOOKS
-			return detail_region::cleaner_write_fails_fn != nullptr &&
-				   detail_region::cleaner_write_fails_fn(slot);
+			auto const fails = detail_region::cleaner_write_fails_fn.load(std::memory_order_relaxed);
+			return fails != nullptr && fails(slot);
 #else
 			return false;
 #endif
@@ -286,8 +296,8 @@ namespace privateer {
 		// a failed fsync would; tests reroute it through the seam.
 		bool cleaner_durability_fails() {
 #ifdef PRIVATEER_TEST_HOOKS
-			return detail_region::cleaner_durability_fails_fn != nullptr &&
-				   detail_region::cleaner_durability_fails_fn();
+			auto const fails = detail_region::cleaner_durability_fails_fn.load(std::memory_order_relaxed);
+			return fails != nullptr && fails();
 #else
 			return false;
 #endif
@@ -295,8 +305,9 @@ namespace privateer {
 
 		void cleaner_slot_done([[maybe_unused]] size_t slot) {
 #ifdef PRIVATEER_TEST_HOOKS
-			if (detail_region::cleaner_slot_hook != nullptr) {
-				detail_region::cleaner_slot_hook(slot);
+			if (auto const hook = detail_region::cleaner_slot_hook.load(std::memory_order_relaxed);
+				hook != nullptr) {
+				hook(slot);
 			}
 #endif
 		}
@@ -304,7 +315,7 @@ namespace privateer {
 		// the resident sweep's probe and trim; tests reroute both seams
 		result<uint64_t> resident_bytes_now() {
 #ifdef PRIVATEER_TEST_HOOKS
-			return detail_region::resident_bytes_fn();
+			return detail_region::resident_bytes_fn.load(std::memory_order_relaxed)();
 #else
 			return resident_pss_bytes();
 #endif
@@ -312,7 +323,7 @@ namespace privateer {
 
 		int pageout(void *addr, size_t len) {
 #ifdef PRIVATEER_TEST_HOOKS
-			return detail_region::pageout_fn(addr, len);
+			return detail_region::pageout_fn.load(std::memory_order_relaxed)(addr, len);
 #else
 			return pageout_range(addr, len);
 #endif
