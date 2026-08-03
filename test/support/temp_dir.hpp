@@ -4,7 +4,8 @@
 #ifndef PRIVATEER_TEST_TEMP_DIR_HPP
 #define PRIVATEER_TEST_TEMP_DIR_HPP
 
-// mkdtemp'd directory for tests, removed recursively on destruction
+// mkdtemp'd directory for tests, removed recursively on destruction. The
+// parent is the system temp directory unless the caller names another one.
 
 #include <filesystem>
 #include <string>
@@ -18,8 +19,8 @@ namespace privateer::testing {
 	struct temp_dir {
 		std::filesystem::path path;
 
-		temp_dir() {
-			std::string const templ = (std::filesystem::temp_directory_path() / "privateer-test-XXXXXX").string();
+		explicit temp_dir(std::filesystem::path const &parent = std::filesystem::temp_directory_path()) {
+			std::string const templ = (parent / "privateer-test-XXXXXX").string();
 			std::vector<char> name{templ.begin(), templ.end()};
 			name.push_back('\0');
 			if (::mkdtemp(name.data()) == nullptr) {
