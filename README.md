@@ -1,12 +1,13 @@
 # Privateer
 
 Privateer is versioned segment storage for memory-mapped data. A datastore is a directory of
-fixed-size block files plus a recipe that says which block belongs at which offset. The engine maps
-those blocks into one contiguous address range. Blocks are mapped private and read-only, so the
-first write into a block traps: a fault handler makes that block writable and the retried store
-lands. A commit hashes every changed block, publishes it under a name derived from its content, and
-replaces the recipe with one atomic rename. Two blocks with the same content are one file, and a
-snapshot is a second recipe that references the same files.
+fixed-size block files plus a recipe that says which block belongs at which offset. The recipe is a
+small manifest plus segment files that hold its entries, one file per fixed range of offsets. The
+engine maps those blocks into one contiguous address range. Blocks are mapped private and read-only,
+so the first write into a block traps: a fault handler makes that block writable and the retried
+store lands. A commit hashes every changed block and every changed recipe segment, publishes each
+under a name derived from its content, and replaces the manifest with one atomic rename. Two blocks
+with the same content are one file, and a snapshot is a second recipe over the same files.
 
 This is version 0.2, a rewrite for use as a segment-storage backend of
 [metall](https://github.com/LLNL/metall). It shares no code with version 0.1 and its API is
@@ -20,17 +21,17 @@ different. The origin of the project is [LLNL/Privateer](https://github.com/LLNL
   size.
 - **Deduplication.** A block whose content already exists under its content name is not written
   again. A block whose content did not change since the last commit is not even published.
-- **Snapshots that share storage.** A snapshot hard-links the block files it references, so it
-  costs a recipe plus link counts, not a copy.
+- **Snapshots that share storage.** A snapshot hard-links the block files and the recipe segment
+  files it references, so it costs a small manifest plus link counts, not a copy.
 - **Checkpoints under a live writer.** The write barrier is per block, and a commit freezes only
   the blocks it captured. Readers stay live throughout, and no mapping is protected globally during
   a sync.
 - **A memory budget for write phases.** Background write-back plus a dirty-byte budget caps the
   resident size of a bulk load, at the cost of writer stalls when the budget is too small for the
   working set.
-- **Crash consistency.** A durable commit puts every block the new recipe references on stable
-  storage before the recipe is renamed into place. An interrupted commit leaves the previous
-  recipe, and the previous state, intact.
+- **Crash consistency.** A durable commit puts every block and every recipe segment the new manifest
+  references on stable storage before the manifest is renamed into place. An interrupted commit
+  leaves the previous recipe, and the previous state, intact.
 
 ## Requirements
 
@@ -135,18 +136,20 @@ file as pages are written. A read-only open registers nothing.
 **A commit** captures every dirty slot, hashes it, and writes back only what changed. A hash equal
 to the recipe entry writes nothing at all. A new hash whose block file already exists is answered by
 a compare against that file, so a duplicate writes nothing either. The remaining blocks are written
-into the store, and the new recipe replaces the old one with an atomic rename. A durable commit adds
-a durability barrier before the rename and reclaims retired block files after it, so it returns only
-when everything the new recipe references is on stable storage. One commit runs at a time. A writer
+into the store. The recipe segments whose entries changed are then published under their content
+names, and the new manifest replaces the old one with an atomic rename. A durable commit adds a
+durability barrier before the rename and reclaims retired files after it, so it returns only when
+everything the new recipe references is on stable storage. One commit runs at a time. A writer
 that faults a captured slot waits for that slot's write-out and nothing else, so a commit does not
 stop the process, but a consistent cut still requires that the application is not writing during it.
 
 **Snapshots** run a durable commit and then stage a self-contained copy: every referenced block file
-is hard-linked, with a per-file copy where linking is refused, and the recipe copy is written and
-synced. Both steps hold the commit mutex, so no commit in between can reclaim a block the staged
-recipe references. Publishing the staged directory is one atomic rename, which the caller does.
+and recipe segment file is hard-linked, with a per-file copy where linking is refused, and the
+manifest is written and synced. Both steps hold the commit mutex, so no commit in between can
+reclaim a file the staged recipe references. Publishing the staged directory is one atomic rename,
+which the caller does.
 
-**Reclaim** is reference counted. A block file that no recipe references any more is deleted after
+**Reclaim** is reference counted. An unreferenced file, block or recipe segment, is deleted after
 the durable commit that retired it, and an open-time sweep removes anything left behind by a crash.
 
 **Growth and holes.** `extend` publishes a larger size and maps the new range as anonymous zeros;
