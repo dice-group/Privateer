@@ -327,7 +327,8 @@ namespace privateer {
 		extern int (*pageout_fn)(void *addr, size_t len);
 
 		// Runs one resident sweep pass synchronously on the calling thread,
-		// regardless of the sweep interval. Returns the bytes the pass asked
+		// regardless of the sweep interval, and leaves the periodic sweep of
+		// the registered regions running. Returns the bytes the pass asked
 		// the kernel to push out.
 		uint64_t run_resident_sweep();
 

@@ -535,6 +535,17 @@ namespace {
 
 	// the injected residency and trim seams
 	std::atomic<uint64_t> g_resident{0};
+
+	// How often the injected residency probe ran: one count per sweep pass
+	// that got as far as reading residency, whichever thread drove it. A
+	// periodic pass runs on a pool thread, so the count is atomic.
+	std::atomic<int> g_probe_calls{0};
+
+	result<uint64_t> injected_resident() {
+		g_probe_calls.fetch_add(1);
+		return result<uint64_t>{g_resident.load()};
+	}
+
 	std::vector<void *> g_pageout_calls;
 
 	struct RegionResidentTest : ::testing::Test {
@@ -545,6 +556,7 @@ namespace {
 
 		void SetUp() override {
 			g_resident.store(0);
+			g_probe_calls.store(0);
 			g_pageout_calls.clear();
 			real_resident_ = detail_region::resident_bytes_fn;
 			real_pageout_ = detail_region::pageout_fn;
@@ -587,7 +599,7 @@ namespace {
 		}
 		bytes(*reg)[3 * bs] = 'D';  // slot 3 turns dirty: never a victim
 
-		detail_region::resident_bytes_fn = [] { return result<uint64_t>{g_resident.load()}; };
+		detail_region::resident_bytes_fn = injected_resident;
 		detail_region::pageout_fn = [](void *addr, size_t) {
 			g_pageout_calls.push_back(addr);
 			return 0;
@@ -615,7 +627,7 @@ namespace {
 			ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
 			scan_slot(*reg, 0, bs);
 		}  // close removes the entry under the sweep mutex
-		detail_region::resident_bytes_fn = [] { return result<uint64_t>{g_resident.load()}; };
+		detail_region::resident_bytes_fn = injected_resident;
 		detail_region::pageout_fn = [](void *addr, size_t) {
 			g_pageout_calls.push_back(addr);
 			return 0;
@@ -653,6 +665,36 @@ namespace {
 		auto reopened = region::open(dir.path);
 		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
 		EXPECT_EQ(bytes(*reopened)[0], 'A');
+	}
+
+	TEST_F(RegionResidentTest, TheHookPassLeavesLaterRegionsWithAPeriodicSweep) {
+		// The periodic sweep is process-wide state shared by every region.
+		// Neither a pass driven by hand nor a region that came before may
+		// decide whether a region registered later is swept.
+		detail_region::resident_bytes_fn = injected_resident;
+		g_resident.store(bs);  // below the soft mark: a pass probes and stops
+		privateer::testing::build_committed_store(dir.path, bs, {'a', 'b'});
+		{
+			auto reg = region::open(dir.path, resident_options(2 * bs, 0));
+			ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+			scan_slot(*reg, 0, bs);
+			EXPECT_EQ(detail_region::run_resident_sweep(), 0u);
+			EXPECT_EQ(g_probe_calls.load(), 1);
+		}  // close: the sweeper holds no entry any more
+
+		// A region registered after all of that, asking for a short
+		// interval. Its passes have to come on their own.
+		privateer::testing::temp_dir later;
+		privateer::testing::build_committed_store(later.path, bs, {'a', 'b'});
+		auto opts = resident_options(2 * bs, 0);
+		opts.governor.sweep_interval = 5ms;
+		auto reg = region::open(later.path, opts);
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		scan_slot(*reg, 0, bs);
+		int const before = g_probe_calls.load();
+		EXPECT_TRUE(eventually([&] { return g_probe_calls.load() >= before + 3; }, 30s))
+				<< "the periodic sweep never ran for this region: " << g_probe_calls.load() - before
+				<< " passes";
 	}
 
 	// Pages of a memory-backed filesystem (tmpfs, ramfs) need swap to leave
