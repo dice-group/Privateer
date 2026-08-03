@@ -21,6 +21,14 @@
 // recipe may reference the name. Names leave the set when their file is
 // unlinked. At open the caller seeds the set with the names the verified
 // recipe references.
+//
+// The pending-name set holds the names published in this run that no
+// successful durability barrier covers yet, so a barrier costs what was
+// published since the last one instead of a pass over the whole recipe. It
+// is a superset of the names the in-memory recipe references minus the
+// durable names: every publish site notes its name, and the pruning after a
+// barrier removes only names that became durable. A name retired before it
+// was ever synced stays pending, because dedup can reference it again.
 
 #include <privateer/block_hash.hpp>
 #include <privateer/error.hpp>
@@ -79,6 +87,22 @@ namespace privateer {
 		// sweep removes.
 		result<> make_durable(std::span<block_digest const> names, sync_fan_out const &fan_out = {});
 
+		// Records a published name as one that owes a sync. A name already in
+		// the durable-name set is not recorded. Bookkeeping owned by one
+		// caller at a time, the same rule as add_reference and
+		// drop_reference; the engine serializes it under its commit mutex.
+		void note_unsynced(block_digest const &name);
+
+		// The durability barrier over the pending names: syncs every pending
+		// name that a recipe entry references and that is not durable yet.
+		// A pending name nothing references is skipped, because its file may
+		// already be unlinked and syncing it would fail for nothing; it stays
+		// pending, so a later reference through dedup is covered by the next
+		// barrier. On success the pending set keeps exactly the names that
+		// are still not durable. A failure leaves the pending set untouched
+		// and reports the error.
+		result<> make_pending_durable(sync_fan_out const &fan_out = {});
+
 		[[nodiscard]] bool is_durable(block_digest const &name) const;
 
 		// records a name as durable without syncing: open-time seeding, the
@@ -123,6 +147,7 @@ namespace privateer {
 
 		std::filesystem::path blocks_dir_;
 		boost::unordered_flat_set<block_digest, block_digest_hash> durable_;
+		boost::unordered_flat_set<block_digest, block_digest_hash> pending_;
 		boost::unordered_flat_map<block_digest, uint32_t, block_digest_hash> refcounts_;
 		boost::unordered_flat_set<block_digest, block_digest_hash> candidates_;
 	};

@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <privateer/fault_handler.hpp>
+#include <privateer/file_util.hpp>
 #include <privateer/region.hpp>
 #include <privateer/vm.hpp>
 
@@ -247,6 +248,64 @@ namespace {
 		// one) are unlinked once the rename is durable
 		EXPECT_EQ(count_block_files(dir.path), 1u);
 		EXPECT_EQ(bytes(*reg)[0], 'c');
+	}
+
+	TEST_F(RegionCommitTest, ADurableCommitSyncsTheNamesOfEarlierNonDurableCommits) {
+		auto reg = make_region(1);
+		bytes(reg)[0] = 'x';
+		ASSERT_TRUE(reg.commit(false));
+
+		// Nothing is dirty, so the inherited name is all the barrier has to
+		// do: its block file and its shard directory entry, plus the recipe
+		// file and the segment directory of the rename.
+		detail_file_util::sync_calls.store(0);
+		ASSERT_TRUE(reg.commit(true));
+		EXPECT_EQ(detail_file_util::sync_calls.load(), 4u);
+
+		// the name is durable now, so the next durable commit pays the rename only
+		detail_file_util::sync_calls.store(0);
+		ASSERT_TRUE(reg.commit(true));
+		EXPECT_EQ(detail_file_util::sync_calls.load(), 2u);
+	}
+
+	TEST_F(RegionCommitTest, ANameRetiredBeforeItWasSyncedDoesNotFailTheBarrier) {
+		{
+			auto reg = make_region(1);
+			bytes(reg)[0] = 'x';
+			ASSERT_TRUE(reg.commit(false));  // the name of 'x' owes a sync
+			bytes(reg)[0] = 'y';
+			// nothing references the name of 'x' any more, so the barrier
+			// leaves it out and the reclaim after the rename unlinks its file
+			ASSERT_TRUE(reg.commit(true));
+			EXPECT_EQ(count_block_files(dir.path), 1u);
+			EXPECT_EQ(bytes(reg)[0], 'y');
+		}
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		EXPECT_EQ(bytes(*reopened)[0], 'y');
+	}
+
+	TEST_F(RegionCommitTest, ARetiredNameThatComesBackIsSyncedByTheNextBarrier) {
+		{
+			auto reg = make_region(1);
+			bytes(reg)[0] = 'x';
+			ASSERT_TRUE(reg.commit(false));
+			bytes(reg)[0] = 'y';
+			ASSERT_TRUE(reg.commit(true));  // the name of 'x' retires unsynced
+			bytes(reg)[0] = 'x';            // and comes back
+
+			// the returning name is written and synced like any other: its
+			// block file and its shard entry, the recipe file and the segment
+			// directory of the rename, and the shard entry of the reclaim that
+			// unlinks the name of 'y'
+			detail_file_util::sync_calls.store(0);
+			ASSERT_TRUE(reg.commit(true));
+			EXPECT_EQ(detail_file_util::sync_calls.load(), 5u);
+			EXPECT_EQ(count_block_files(dir.path), 1u);
+		}
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		EXPECT_EQ(bytes(*reopened)[0], 'x');
 	}
 
 	TEST_F(RegionCommitTest, ADurableCommitSpreadsTheBarrierAndTheReclaim) {

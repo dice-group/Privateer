@@ -277,6 +277,35 @@ namespace privateer {
 		return {};
 	}
 
+	void block_store::note_unsynced(block_digest const &name) {
+		if (durable_.contains(name)) {
+			return;
+		}
+		pending_.insert(name);
+	}
+
+	result<> block_store::make_pending_durable(sync_fan_out const &fan_out) {
+		// What the barrier owes: the pending names a recipe entry references
+		// and that are not durable yet. The reference filter leaves out the
+		// names retired before any barrier reached them; their files may be
+		// gone already.
+		std::vector<block_digest> names;
+		names.reserve(pending_.size());
+		for (auto const &name : pending_) {
+			if (refcounts_.contains(name) && !durable_.contains(name)) {
+				names.push_back(name);
+			}
+		}
+		if (auto synced = make_durable(names, fan_out); !synced) {
+			return synced;
+		}
+		// The synced names are durable now and leave the pending set. The
+		// skipped ones stay, because a reference through dedup can come back
+		// to them, and then the next barrier syncs them.
+		erase_if(pending_, [this](block_digest const &name) { return durable_.contains(name); });
+		return {};
+	}
+
 	bool block_store::is_durable(block_digest const &name) const {
 		return durable_.contains(name);
 	}

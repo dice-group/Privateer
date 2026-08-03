@@ -375,6 +375,92 @@ namespace {
 		}
 	}
 
+	TEST(BlockStore, ThePendingBarrierSyncsTheReferencedNames) {
+		store_fixture f;
+		auto const data = content("pending content");
+		auto const name = name_of(data);
+		ASSERT_TRUE(f.store.publish(name, data));
+		f.store.note_unsynced(name);
+		f.store.add_reference(name);
+
+		ASSERT_TRUE(f.store.make_pending_durable());
+		EXPECT_TRUE(f.store.is_durable(name));
+
+		// the name left the pending set, so a second barrier has nothing to do
+		detail_file_util::sync_calls.store(0);
+		ASSERT_TRUE(f.store.make_pending_durable());
+		EXPECT_EQ(detail_file_util::sync_calls.load(), 0u);
+	}
+
+	TEST(BlockStore, ThePendingBarrierLeavesAnUnreferencedNameOut) {
+		store_fixture f;
+		auto const kept = content("referenced and pending");
+		auto const retired = content("pending and unreferenced");
+		ASSERT_TRUE(f.store.publish(name_of(kept), kept));
+		ASSERT_TRUE(f.store.publish(name_of(retired), retired));
+		f.store.note_unsynced(name_of(kept));
+		f.store.note_unsynced(name_of(retired));
+		f.store.add_reference(name_of(kept));
+		// the file of a name retired before any barrier reached it can be gone
+		fs::remove(f.store.block_path(name_of(retired)));
+
+		ASSERT_TRUE(f.store.make_pending_durable());
+		EXPECT_TRUE(f.store.is_durable(name_of(kept)));
+		EXPECT_FALSE(f.store.is_durable(name_of(retired)));
+	}
+
+	TEST(BlockStore, ThePendingBarrierSyncsAReReferencedName) {
+		store_fixture f;
+		auto const data = content("retired then wanted again");
+		auto const name = name_of(data);
+		ASSERT_TRUE(f.store.publish(name, data));
+		f.store.note_unsynced(name);
+		ASSERT_TRUE(f.store.make_pending_durable());
+		EXPECT_FALSE(f.store.is_durable(name));
+
+		// the name stayed pending, so the reference makes it the barrier's work
+		f.store.add_reference(name);
+		ASSERT_TRUE(f.store.make_pending_durable());
+		EXPECT_TRUE(f.store.is_durable(name));
+	}
+
+	TEST(BlockStore, ThePendingBarrierSkipsADurableName) {
+		store_fixture f;
+		// A durable name with no file at all: the barrier must not touch it,
+		// and a sync of it would fail.
+		auto const name = name_of(content("seeded and noted"));
+		f.store.seed_durable(name);
+		f.store.note_unsynced(name);
+		f.store.add_reference(name);
+
+		detail_file_util::sync_calls.store(0);
+		ASSERT_TRUE(f.store.make_pending_durable());
+		EXPECT_EQ(detail_file_util::sync_calls.load(), 0u);
+	}
+
+	TEST(BlockStore, AFailedPendingBarrierKeepsThePendingNames) {
+		store_fixture f;
+		auto const data = content("pending next to a broken name");
+		auto const name = name_of(data);
+		ASSERT_TRUE(f.store.publish(name, data));
+		auto const missing = name_of(content("never published"));
+		for (auto const &pending : {name, missing}) {
+			f.store.note_unsynced(pending);
+			f.store.add_reference(pending);
+		}
+
+		auto barrier = f.store.make_pending_durable();
+		ASSERT_FALSE(barrier.has_value());
+		EXPECT_EQ(barrier.error().code, errc::io_error);
+		EXPECT_FALSE(f.store.is_durable(name));
+
+		// both names are still pending: with the broken one unreferenced, the
+		// next barrier covers the other one
+		f.store.drop_reference(missing);
+		ASSERT_TRUE(f.store.make_pending_durable());
+		EXPECT_TRUE(f.store.is_durable(name));
+	}
+
 	TEST(BlockStore, ReclaimSpreadsByShard) {
 		store_fixture f;
 		auto const names = publish_eight(f);
