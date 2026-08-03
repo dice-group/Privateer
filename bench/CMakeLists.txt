@@ -15,10 +15,6 @@ add_executable(privateer_addressing_bench addressing_bench.cpp)
 target_include_directories(privateer_addressing_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../test)
 target_link_libraries(privateer_addressing_bench PRIVATE privateer::privateer benchmark::benchmark)
 
-add_executable(privateer_recipe_bench recipe_bench.cpp)
-target_include_directories(privateer_recipe_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../test)
-target_link_libraries(privateer_recipe_bench PRIVATE privateer::privateer benchmark::benchmark)
-
 # The io_uring arms of the barrier benchmark. liburing is a benchmark-only
 # dependency and stays out of the engine unless the batched barrier wins.
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
