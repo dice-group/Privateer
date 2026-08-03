@@ -57,6 +57,19 @@ namespace privateer {
 	// prefix; published names must never start with it.
 	inline constexpr char temp_name_prefix[] = ".privateer-tmp-";
 
+	// Removes the staged files a crash left in dir: every entry whose name
+	// starts with temp_name_prefix. Returns the number of files removed; a
+	// name that cannot be unlinked is logged and left behind. Only the
+	// entries of dir itself are examined, subdirectories are not.
+	//
+	// A temp name belongs to a staged file between its creation and its
+	// publication, so this must not run while another process stages a file
+	// here: that publication would then fail with ENOENT. Nothing is lost
+	// that way (an unpublished file holds nothing anybody can read), but the
+	// commit behind it reports an error. The engine takes one read-write
+	// opener per datastore and sweeps before its first commit.
+	result<size_t> sweep_temp_files(std::filesystem::path const &dir);
+
 	// how a staged_file is backed before publication
 	enum struct temp_backing : int {
 		automatic,  // O_TMPFILE where available, named otherwise

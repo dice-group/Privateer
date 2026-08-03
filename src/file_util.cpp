@@ -3,8 +3,11 @@
 
 #include <privateer/file_util.hpp>
 
+#include <privateer/logger.hpp>
+
 #include <atomic>
 #include <cstdio>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -97,6 +100,27 @@ namespace privateer {
 			written += static_cast<size_t>(n);
 		}
 		return {};
+	}
+
+	result<size_t> sweep_temp_files(std::filesystem::path const &dir) {
+		size_t removed = 0;
+		std::error_code ec;
+		for (auto it = std::filesystem::directory_iterator{dir, ec};
+			 !ec && it != std::filesystem::directory_iterator{}; it.increment(ec)) {
+			if (!it->path().filename().string().starts_with(temp_name_prefix)) {
+				continue;
+			}
+			if (::unlink(it->path().c_str()) != 0 && errno != ENOENT) {
+				PRIVATEER_LOG(log_level::warning, "sweep cannot unlink {} (errno {})", it->path().string(),
+							  errno);
+				continue;
+			}
+			++removed;
+		}
+		if (ec) {
+			return std::unexpected{error{errc::io_error, ec.value(), "list a directory for the sweep"}};
+		}
+		return removed;
 	}
 
 	result<staged_file> staged_file::create_in(std::filesystem::path const &dir, temp_backing backing) {

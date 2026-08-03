@@ -6,6 +6,7 @@
 #include <privateer/block_store.hpp>
 #include <privateer/executor.hpp>
 #include <privateer/fault_handler.hpp>
+#include <privateer/file_util.hpp>
 #include <privateer/handler_text.hpp>
 #include <privateer/logger.hpp>
 #include <privateer/recipe.hpp>
@@ -1715,6 +1716,16 @@ namespace privateer {
 			}
 			if (*swept > 0) {
 				PRIVATEER_LOG(log_level::info, "open-time sweep removed {} unreferenced files", *swept);
+			}
+			// The manifest is staged in the segment directory itself, so the
+			// store's pass over the shards never sees the temp file a commit
+			// killed between staging and rename left there.
+			auto const staged = sweep_temp_files(st.segment_dir);
+			if (!staged) {
+				return std::unexpected{staged.error()};
+			}
+			if (*staged > 0) {
+				PRIVATEER_LOG(log_level::info, "open-time sweep removed {} staged-file leftovers", *staged);
 			}
 
 			// Construct the process-wide state before the region exists, so
