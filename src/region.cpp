@@ -891,6 +891,13 @@ namespace privateer {
 				written.push_back(name);
 			}
 
+			// Every name an entry of this batch carries owes a sync, and a
+			// later durable commit is what pays it. Eager durability pays it
+			// right below, and the note falls away with the next pruning.
+			for (auto const &name : written) {
+				store->note_unsynced(name);
+			}
+
 			// Eager durability: the full durable-name contract for what the
 			// batch wrote, both halves batched (the file contents, then the
 			// shard directory entries), before any of the batch's remaps. A
@@ -2040,6 +2047,9 @@ namespace privateer {
 				}
 				if (delta.add.size != 0) {
 					st.store->add_reference(delta.add);
+					// the name owes a sync: a file this write-out created,
+					// or a dedup hit on a file no barrier covers yet
+					st.store->note_unsynced(delta.add);
 				}
 			}
 		}
@@ -2068,17 +2078,14 @@ namespace privateer {
 			spread_over_workers(count, configured_workers, body);
 		};
 
-		// Phase 3: the durability barrier. Covers this commit's blocks and
-		// every name inherited from earlier non-durable commits; the store
-		// skips names already in the durable set.
+		// Phase 3: the durability barrier over the store's pending names.
+		// Covers the names this commit published and the names inherited from
+		// earlier non-durable commits and cleaner batches, so it costs what
+		// was published since the last barrier and not a pass over the whole
+		// recipe. The store skips names already in the durable set and names
+		// no entry references any more.
 		if (durable) {
-			std::vector<block_digest> referenced;
-			for (auto const &entry : st.rec.entries) {
-				if (entry.size != 0) {
-					referenced.push_back(entry);
-				}
-			}
-			if (auto synced = st.store->make_durable(referenced, spread); !synced) {
+			if (auto synced = st.store->make_pending_durable(spread); !synced) {
 				return std::unexpected{synced.error()};
 			}
 			commit_phase_done(3);
