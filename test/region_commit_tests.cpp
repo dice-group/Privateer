@@ -35,7 +35,7 @@
 
 using namespace privateer;
 using namespace std::chrono_literals;
-using privateer::testing::count_block_files;
+using privateer::testing::count_data_block_files;
 namespace fs = std::filesystem;
 
 namespace {
@@ -148,7 +148,7 @@ namespace {
 		bytes(*reg)[0] = 'a';  // dirtied, but the content is unchanged
 		ASSERT_EQ(detail_region::table_of(*reg).dirty_slots(), 1u);
 		ASSERT_TRUE(reg->commit(true));
-		EXPECT_EQ(count_block_files(dir.path), 1u);
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);
 		EXPECT_EQ(detail_region::table_of(*reg).load(0), slot_state::clean);
 		EXPECT_EQ(detail_region::table_of(*reg).dirty_slots(), 0u);
 	}
@@ -159,7 +159,7 @@ namespace {
 			bytes(reg)[0] = 'd';
 			bytes(reg)[bs] = 'd';
 			ASSERT_TRUE(reg.commit(true));
-			EXPECT_EQ(count_block_files(dir.path), 1u);
+			EXPECT_EQ(count_data_block_files(dir.path), 1u);
 		}
 		auto reopened = region::open(dir.path);
 		ASSERT_TRUE(reopened.has_value());
@@ -214,7 +214,7 @@ namespace {
 		ASSERT_TRUE(reg.has_value());
 		bytes(*reg)[0] = 'b';
 		ASSERT_TRUE(reg->commit(true));
-		EXPECT_EQ(count_block_files(dir.path), 1u);  // the block holding 'a' is unlinked
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);  // the block holding 'a' is unlinked
 		EXPECT_EQ(bytes(*reg)[0], 'b');
 	}
 
@@ -227,12 +227,12 @@ namespace {
 			ASSERT_TRUE(reg->commit(false));
 			// the retired block must survive: a lost rename has to be able to
 			// resurface the old recipe with all its blocks intact
-			EXPECT_EQ(count_block_files(dir.path), 2u);
+			EXPECT_EQ(count_data_block_files(dir.path), 2u);
 		}
 		auto reopened = region::open(dir.path);  // the sweep removes the retired block
 		ASSERT_TRUE(reopened.has_value());
 		EXPECT_EQ(bytes(*reopened)[0], 'b');
-		EXPECT_EQ(count_block_files(dir.path), 1u);
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);
 	}
 
 	TEST_F(RegionCommitTest, ALaterDurableCommitReclaimsNonDurableRetirees) {
@@ -241,12 +241,12 @@ namespace {
 		ASSERT_TRUE(reg.has_value());
 		bytes(*reg)[0] = 'b';
 		ASSERT_TRUE(reg->commit(false));
-		ASSERT_EQ(count_block_files(dir.path), 2u);
+		ASSERT_EQ(count_data_block_files(dir.path), 2u);
 		bytes(*reg)[0] = 'c';
 		ASSERT_TRUE(reg->commit(true));
 		// both retired names ('a' from the non-durable commit, 'b' from this
 		// one) are unlinked once the rename is durable
-		EXPECT_EQ(count_block_files(dir.path), 1u);
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);
 		EXPECT_EQ(bytes(*reg)[0], 'c');
 	}
 
@@ -256,13 +256,16 @@ namespace {
 		ASSERT_TRUE(reg.commit(false));
 
 		// Nothing is dirty, so the inherited name is all the barrier has to
-		// do: its block file and its shard directory entry, plus the recipe
-		// file and the segment directory of the rename.
+		// do: its block file and its shard directory entry, the recipe's
+		// segment file and its shard entry, plus the manifest file and the
+		// segment directory of the rename.
 		detail_file_util::sync_calls.store(0);
 		ASSERT_TRUE(reg.commit(true));
-		EXPECT_EQ(detail_file_util::sync_calls.load(), 4u);
+		EXPECT_EQ(detail_file_util::sync_calls.load(), 6u);
 
-		// the name is durable now, so the next durable commit pays the rename only
+		// Every name is durable now, and the recipe is unchanged, so its
+		// segment file dedups onto a durable name: the next durable commit
+		// pays the rename only.
 		detail_file_util::sync_calls.store(0);
 		ASSERT_TRUE(reg.commit(true));
 		EXPECT_EQ(detail_file_util::sync_calls.load(), 2u);
@@ -277,7 +280,7 @@ namespace {
 			// nothing references the name of 'x' any more, so the barrier
 			// leaves it out and the reclaim after the rename unlinks its file
 			ASSERT_TRUE(reg.commit(true));
-			EXPECT_EQ(count_block_files(dir.path), 1u);
+			EXPECT_EQ(count_data_block_files(dir.path), 1u);
 			EXPECT_EQ(bytes(reg)[0], 'y');
 		}
 		auto reopened = region::open(dir.path);
@@ -294,14 +297,15 @@ namespace {
 			ASSERT_TRUE(reg.commit(true));  // the name of 'x' retires unsynced
 			bytes(reg)[0] = 'x';            // and comes back
 
-			// the returning name is written and synced like any other: its
-			// block file and its shard entry, the recipe file and the segment
-			// directory of the rename, and the shard entry of the reclaim that
-			// unlinks the name of 'y'
+			// The returning name is written and synced like any other: its
+			// block file and its shard entry, the recipe's segment file and
+			// its shard entry, the manifest file and the segment directory of
+			// the rename, and the shard entries of the reclaim that unlinks
+			// the name of 'y' and the retired segment file.
 			detail_file_util::sync_calls.store(0);
 			ASSERT_TRUE(reg.commit(true));
-			EXPECT_EQ(detail_file_util::sync_calls.load(), 5u);
-			EXPECT_EQ(count_block_files(dir.path), 1u);
+			EXPECT_EQ(detail_file_util::sync_calls.load(), 8u);
+			EXPECT_EQ(count_data_block_files(dir.path), 1u);
 		}
 		auto reopened = region::open(dir.path);
 		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
@@ -324,14 +328,14 @@ namespace {
 				bytes(*reg)[slot * bs] = static_cast<unsigned char>('a' + slot);
 			}
 			ASSERT_TRUE(reg->commit(true));
-			EXPECT_EQ(count_block_files(dir.path), slots);
+			EXPECT_EQ(count_data_block_files(dir.path), slots);
 
 			// a second round retires all six names at once
 			for (size_t slot = 0; slot < slots; ++slot) {
 				bytes(*reg)[slot * bs] = static_cast<unsigned char>('A' + slot);
 			}
 			ASSERT_TRUE(reg->commit(true));
-			EXPECT_EQ(count_block_files(dir.path), slots);
+			EXPECT_EQ(count_data_block_files(dir.path), slots);
 		}
 		auto reopened = region::open(dir.path);
 		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
@@ -381,7 +385,7 @@ namespace {
 
 		ASSERT_TRUE(reg->commit(true));
 		EXPECT_EQ(table.load(0), slot_state::empty);
-		EXPECT_EQ(count_block_files(dir.path), 0u);  // the emptied slot retired its name
+		EXPECT_EQ(count_data_block_files(dir.path), 0u);  // the emptied slot retired its name
 	}
 
 	TEST_F(RegionCommitTest, ACommitRecoversAPoisonedSlot) {
@@ -463,7 +467,7 @@ namespace {
 		EXPECT_EQ(detail_region::table_of(reg).dirty_slots(), 1u);
 		ASSERT_TRUE(reg.commit(true));
 		EXPECT_EQ(bytes(reg)[0], 'y');
-		EXPECT_EQ(count_block_files(dir.path), 1u);
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);
 	}
 
 	// The downstream write pattern: the writer quiesces around every commit

@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 using namespace privateer;
-using privateer::testing::count_block_files;
+using privateer::testing::count_data_block_files;
 using privateer::testing::subprocess_result;
 namespace fs = std::filesystem;
 
@@ -76,7 +76,7 @@ namespace {
 	TEST_F(RegionSnapshotTest, SnapshotsShareBlocksThroughHardLinks) {
 		auto reg = open_src_ab();
 		ASSERT_TRUE(reg.snapshot_to(dst));
-		EXPECT_EQ(count_block_files(dst), 2u);
+		EXPECT_EQ(count_data_block_files(dst), 2u);
 
 		auto store = block_store::open(src);
 		ASSERT_TRUE(store.has_value());
@@ -90,7 +90,7 @@ namespace {
 
 		bytes(reg)[0] = 'z';
 		ASSERT_TRUE(reg.commit(true));  // reclaims the source's name for 'a'
-		ASSERT_EQ(count_block_files(src), 2u);
+		ASSERT_EQ(count_data_block_files(src), 2u);
 
 		auto snap = region::open(dst);  // the snapshot's link kept the inode alive
 		ASSERT_TRUE(snap.has_value()) << to_string(snap.error());
@@ -155,7 +155,7 @@ namespace {
 		EXPECT_EQ(bytes(*snap)[0], 'a');
 		EXPECT_EQ(bytes(*snap)[bs], 0);
 		EXPECT_EQ(bytes(*snap)[2 * bs], 'c');
-		EXPECT_EQ(count_block_files(src), 2u);  // the source is untouched
+		EXPECT_EQ(count_data_block_files(src), 2u);  // the source is untouched
 	}
 
 	TEST_F(RegionSnapshotTest, CopyValidatesTheSource) {

@@ -319,10 +319,12 @@ namespace privateer {
 		// Stages a self-contained segment: the shard skeleton, one hard link
 		// per referenced block (per-file copy where link fails: EXDEV across
 		// devices, EMLINK on an exhausted link count; the fallback unshares
-		// the block, trading space for correctness), and the synced recipe
-		// copy. The skeleton and links are not fsynced here: metall fsyncs
-		// the whole staged tree before it publishes the datastore; the
-		// recipe copy's content is the engine's own obligation.
+		// the block, trading space for correctness), and the recipe. The
+		// recipe commit writes its own segment files into the staged store,
+		// so only the data blocks are linked. The skeleton and links are not
+		// fsynced here: metall fsyncs the whole staged tree before it
+		// publishes the datastore; the recipe's content is the engine's own
+		// obligation.
 		result<> stage_segment(recipe const &rec, block_store const &src_store, fs::path const &dst_dir) {
 			std::error_code ec;
 			fs::create_directories(dst_dir, ec);
@@ -347,7 +349,10 @@ namespace privateer {
 					}
 				}
 			}
-			return rec.commit(dst_dir, true);
+			if (auto committed = rec.commit(dst_dir, *dst_store, true); !committed) {
+				return std::unexpected{committed.error()};
+			}
+			return {};
 		}
 
 	}  // namespace
@@ -1333,7 +1338,7 @@ namespace privateer {
 		rec.capacity = round_up(capacity, block_size);
 		rec.size = 0;
 		rec.algorithm = options.algorithm.value_or(hash_algorithm::xxh3_128);
-		if (auto committed = rec.commit(segment_dir, true); !committed) {
+		if (auto committed = rec.commit(segment_dir, *store, true); !committed) {
 			return std::unexpected{committed.error()};
 		}
 		return open_impl(segment_dir, options, false);
@@ -1349,13 +1354,14 @@ namespace privateer {
 
 	result<region> region::open_impl(fs::path const &segment_dir, region_options const &options,
 									 bool read_only) {
-		auto rec = recipe::load(segment_dir);
-		if (!rec) {
-			return std::unexpected{rec.error()};
-		}
+		// The store comes first: the recipe's segment files live in it.
 		auto store = block_store::open(segment_dir);
 		if (!store) {
 			return std::unexpected{store.error()};
+		}
+		auto rec = recipe::load(segment_dir, *store);
+		if (!rec) {
+			return std::unexpected{rec.error()};
 		}
 
 		if (options.block_size && *options.block_size != rec->block_size) {
@@ -1523,13 +1529,26 @@ namespace privateer {
 		st.hot->table.set_extended_size(st.rec.size);
 
 		if (!read_only) {
+			// The recipe's segment files sit in the store next to the blocks,
+			// so they take the same seeding and the same reference: the sweep
+			// keeps what the recipe names, and nothing else.
+			std::vector<block_digest> referenced;
+			referenced.reserve(st.rec.entries.size() + st.rec.segments.size());
 			for (auto const &entry : st.rec.entries) {
 				if (entry.size != 0) {
 					st.store->seed_durable(entry);
 					st.store->add_reference(entry);
+					referenced.push_back(entry);
 				}
 			}
-			auto swept = st.store->sweep(st.rec.entries);
+			for (auto const &segment : st.rec.segments) {
+				if (segment.digest.size != 0) {
+					st.store->seed_durable(segment.digest);
+					st.store->add_reference(segment.digest);
+					referenced.push_back(segment.digest);
+				}
+			}
+			auto swept = st.store->sweep(referenced);
 			if (!swept) {
 				return std::unexpected{swept.error()};
 			}
@@ -2093,8 +2112,25 @@ namespace privateer {
 
 		// Phase 4: the atomic commit point.
 		st.rec.size = captured_size;
-		if (auto committed = st.rec.commit(st.segment_dir, durable); !committed) {
-			return std::unexpected{committed.error()};
+		auto published = st.rec.commit(st.segment_dir, *st.store, durable);
+		if (!published) {
+			return std::unexpected{published.error()};
+		}
+		// The store counts a segment file like a block, so the manifest that
+		// just landed takes a reference on every segment it names and the one
+		// it replaced gives its own back. The new set is referenced first, so
+		// a segment both manifests name never becomes a reclaim candidate.
+		auto const retired = std::move(st.rec.segments);
+		st.rec.segments = std::move(*published);
+		for (auto const &segment : st.rec.segments) {
+			if (segment.digest.size != 0) {
+				st.store->add_reference(segment.digest);
+			}
+		}
+		for (auto const &segment : retired) {
+			if (segment.digest.size != 0) {
+				st.store->drop_reference(segment.digest);
+			}
 		}
 		commit_phase_done(4);
 
@@ -2122,13 +2158,14 @@ namespace privateer {
 	}
 
 	result<> region::copy(fs::path const &src_segment_dir, fs::path const &dst_segment_dir) {
-		auto rec = recipe::load(src_segment_dir);
-		if (!rec) {
-			return std::unexpected{rec.error()};
-		}
+		// The store comes first: the recipe's segment files live in it.
 		auto src_store = block_store::open(src_segment_dir);
 		if (!src_store) {
 			return std::unexpected{src_store.error()};
+		}
+		auto rec = recipe::load(src_segment_dir, *src_store);
+		if (!rec) {
+			return std::unexpected{rec.error()};
 		}
 		if (auto validated = validate_blocks(*rec, *src_store); !validated) {
 			return std::unexpected{validated.error()};

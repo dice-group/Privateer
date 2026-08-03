@@ -32,7 +32,7 @@
 
 using namespace privateer;
 using namespace std::chrono_literals;
-using privateer::testing::count_block_files;
+using privateer::testing::count_data_block_files;
 using privateer::testing::subprocess_result;
 namespace fs = std::filesystem;
 
@@ -88,8 +88,8 @@ namespace {
 
 		// referenced blocks: the shared 'a', 'y', 'w', 'q'; 'x' and the
 		// freed 'z' are reclaimed by the durable commit
-		EXPECT_EQ(count_block_files(dir.path / "one"), 4u);
-		EXPECT_EQ(count_block_files(dir.path / "many"), 4u);
+		EXPECT_EQ(count_data_block_files(dir.path / "one"), 4u);
+		EXPECT_EQ(count_data_block_files(dir.path / "many"), 4u);
 
 		auto one = region::open(dir.path / "one");
 		auto many = region::open(dir.path / "many");

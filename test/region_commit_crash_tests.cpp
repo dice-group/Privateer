@@ -22,7 +22,8 @@
 #include <cstddef>
 
 using namespace privateer;
-using privateer::testing::count_block_files;
+using privateer::testing::count_data_block_files;
+using privateer::testing::count_segment_files;
 using privateer::testing::subprocess_result;
 
 namespace {
@@ -65,13 +66,16 @@ namespace {
 
 		// the reopen properties after the child died
 		void check_state(char slot1_content, size_t files_before_reopen, size_t files_after_sweep) {
-			EXPECT_EQ(count_block_files(dir.path), files_before_reopen);
+			EXPECT_EQ(count_data_block_files(dir.path), files_before_reopen);
 			auto reg = region::open(dir.path);  // read-write: sweeps the garbage
 			ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
 			auto *const bytes = static_cast<unsigned char volatile *>(reg->segment());
 			EXPECT_EQ(bytes[0], 'a');
 			EXPECT_EQ(bytes[bs], static_cast<unsigned char>(slot1_content));
-			EXPECT_EQ(count_block_files(dir.path), files_after_sweep);
+			EXPECT_EQ(count_data_block_files(dir.path), files_after_sweep);
+			// two slots are one segment, and the sweep took the segment file of
+			// every recipe the rename did not publish
+			EXPECT_EQ(count_segment_files(dir.path), 1u);
 			EXPECT_TRUE(reg->commit(true));  // the survivor commits cleanly
 		}
 	};

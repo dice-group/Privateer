@@ -15,7 +15,9 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace privateer::testing {
@@ -45,7 +47,7 @@ namespace privateer::testing {
 		}
 		auto barrier = store->make_durable(names);
 		ASSERT_TRUE(barrier.has_value()) << to_string(barrier.error());
-		ASSERT_TRUE(rec.commit(segment_dir, true));
+		ASSERT_TRUE(rec.commit(segment_dir, *store, true).has_value());
 	}
 
 	// number of files under <segment_dir>/blocks, across all shards
@@ -57,6 +59,31 @@ namespace privateer::testing {
 			}
 		}
 		return count;
+	}
+
+	// True for a recipe segment file, told from a data block by its magic.
+	// The store holds both under the same naming scheme.
+	[[nodiscard]] inline bool is_segment_file(std::filesystem::path const &path) {
+		std::ifstream in{path, std::ios::binary};
+		char magic[4] = {};
+		in.read(magic, sizeof(magic));
+		return in.gcount() == sizeof(magic) && std::string_view{magic, sizeof(magic)} == "PVSG";
+	}
+
+	// the recipe segment files among the store's files
+	[[nodiscard]] inline size_t count_segment_files(std::filesystem::path const &segment_dir) {
+		size_t count = 0;
+		for (auto const &shard : std::filesystem::directory_iterator{segment_dir / "blocks"}) {
+			for (auto const &entry : std::filesystem::directory_iterator{shard}) {
+				count += is_segment_file(entry.path()) ? 1 : 0;
+			}
+		}
+		return count;
+	}
+
+	// the data blocks among the store's files: everything that is no recipe segment
+	[[nodiscard]] inline size_t count_data_block_files(std::filesystem::path const &segment_dir) {
+		return count_block_files(segment_dir) - count_segment_files(segment_dir);
 	}
 
 }  // namespace privateer::testing

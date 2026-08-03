@@ -214,8 +214,10 @@ These are used by a region and are public because tools need them:
 * `privateer/block_store.hpp`: the content-addressed store. Publication stages a file and links it
   under the content name, so it is thread-safe with no store state and no lock; a duplicate is
   answered by comparing the existing file and writes nothing.
-* `privateer/recipe.hpp`: the on-disk recipe, one little-endian file `_recipe` with a header, one
-  entry per slot and a checksum, replaced by rename at every commit.
+* `privateer/recipe.hpp`: the on-disk recipe. The entries live in content-named segment files in the
+  block store, one per fixed slot range, and the little-endian manifest `_recipe` names them; the
+  manifest is replaced by rename at every commit, so a commit writes the segments whose entries
+  changed plus the manifest. A version 1 recipe, one file with every entry in it, still loads.
 * `privateer/vm.hpp`: the reservation and the fixed-address mapping calls, plus `page_size()`.
 * `privateer/fault_handler.hpp`: installing the process-wide handler, and arming a thread with an
   mlocked alternate signal stack.
