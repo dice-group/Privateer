@@ -32,7 +32,7 @@
 
 using namespace privateer;
 using namespace std::chrono_literals;
-using privateer::testing::count_block_files;
+using privateer::testing::count_data_block_files;
 
 namespace {
 
@@ -129,11 +129,11 @@ namespace {
 
 	TEST_F(RegionFreeTest, TheFreedNameIsReclaimedAtTheNextDurableCommit) {
 		auto reg = open_ab();
-		ASSERT_EQ(count_block_files(dir.path), 2u);
+		ASSERT_EQ(count_data_block_files(dir.path), 2u);
 		ASSERT_TRUE(reg.free_region(0, bs));
-		ASSERT_EQ(count_block_files(dir.path), 2u);  // nothing reclaimed before the commit
+		ASSERT_EQ(count_data_block_files(dir.path), 2u);  // nothing reclaimed before the commit
 		ASSERT_TRUE(reg.commit(true));
-		EXPECT_EQ(count_block_files(dir.path), 1u);
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);
 		EXPECT_EQ(detail_region::table_of(reg).load(0), slot_state::empty);
 	}
 
@@ -254,12 +254,12 @@ namespace {
 		// hold slot 0 mid-free across a whole commit
 		ASSERT_TRUE(table.try_claim(0, slot_state::clean, slot_state::freeing));
 		ASSERT_TRUE(reg.commit(true));
-		EXPECT_EQ(count_block_files(dir.path), 2u);  // the pre-free name stays referenced
+		EXPECT_EQ(count_data_block_files(dir.path), 2u);  // the pre-free name stays referenced
 
 		// the free finishes; the next epoch retires the name
 		table.publish(0, slot_state::dirty_empty);
 		ASSERT_TRUE(reg.commit(true));
-		EXPECT_EQ(count_block_files(dir.path), 1u);
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);
 		EXPECT_EQ(table.load(0), slot_state::empty);
 	}
 
@@ -287,7 +287,7 @@ namespace {
 		writer.join();
 		EXPECT_EQ(bytes(reg)[0], 0);  // the last action was a free
 		ASSERT_TRUE(reg.commit(true));
-		EXPECT_EQ(count_block_files(dir.path), 1u);  // only 'b' remains referenced
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);  // only 'b' remains referenced
 	}
 
 	TEST_F(RegionFreeTest, AnUnsynchronizedWriterRacingTheFreerIsSafe) {

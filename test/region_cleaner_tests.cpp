@@ -38,7 +38,7 @@
 
 using namespace privateer;
 using namespace std::chrono_literals;
-using privateer::testing::count_block_files;
+using privateer::testing::count_data_block_files;
 using privateer::testing::subprocess_result;
 namespace fs = std::filesystem;
 
@@ -96,6 +96,29 @@ namespace {
 		}
 	};
 
+	// A write-back changes the recipe entry of its slot, so the segment holding
+	// that slot must be republished even though the commit captures nothing.
+	TEST_F(RegionCleanerTest, AWriteBackMarksItsSegmentForTheNextCommit) {
+		privateer::testing::build_committed_store(dir.path, bs, {'x'});
+		auto reg = region::open(dir.path, options(cleaner_mode::non_durable));
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		auto const before = privateer::testing::manifest_records(dir.path);
+		ASSERT_EQ(before.size(), 1u);
+
+		bytes(*reg)[0] = 'a';
+		ASSERT_EQ(detail_region::run_cleaner_batch(*reg, false), 1u);
+		EXPECT_EQ(detail_region::table_of(*reg).dirty_slots(), 0u);
+
+		ASSERT_TRUE(reg->commit(true));
+		auto const after = privateer::testing::manifest_records(dir.path);
+		ASSERT_EQ(after.size(), 1u);
+		EXPECT_NE(after[0], before[0]);
+
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		EXPECT_EQ(bytes(*reopened)[0], 'a');
+	}
+
 	TEST_F(RegionCleanerTest, ABatchWritesTheDirtySlotsBack) {
 		privateer::testing::build_committed_store(dir.path, bs, {'x', 'y'});
 		auto reg = region::open(dir.path, options(cleaner_mode::non_durable));
@@ -130,7 +153,7 @@ namespace {
 
 		ASSERT_TRUE(reg->commit(true));
 		// the superseded 'a' version and the replaced 'x' are both reclaimed
-		EXPECT_EQ(count_block_files(dir.path), 1u);
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);
 
 		auto reopened = region::open(dir.path);
 		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
@@ -150,7 +173,7 @@ namespace {
 		// syncs what the cleaner wrote, renames the recipe, and reclaims the
 		// replaced blocks.
 		ASSERT_TRUE(reg->commit(true));
-		EXPECT_EQ(count_block_files(dir.path), 2u);
+		EXPECT_EQ(count_data_block_files(dir.path), 2u);
 
 		auto reopened = region::open(dir.path);
 		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
@@ -210,12 +233,13 @@ namespace {
 		EXPECT_EQ(detail_file_util::sync_calls.load(), 2u);
 
 		// the durable commit pays only for the dirt the cleaner has not
-		// reached: the fresh block and its shard entry, plus the recipe
-		// file and the segment directory of the rename
+		// reached: the fresh block and its shard entry, the recipe's segment
+		// file and its shard entry, plus the manifest file and the segment
+		// directory of the rename
 		bytes(*reg)[bs] = 'b';
 		detail_file_util::sync_calls.store(0);
 		ASSERT_TRUE(reg->commit(true));
-		EXPECT_EQ(detail_file_util::sync_calls.load(), 4u);
+		EXPECT_EQ(detail_file_util::sync_calls.load(), 6u);
 
 		auto reopened = region::open(dir.path);
 		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
@@ -338,7 +362,7 @@ namespace {
 		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
 		EXPECT_EQ(bytes(*reopened)[0], 'x');
 		EXPECT_EQ(bytes(*reopened)[bs], 'y');
-		EXPECT_EQ(count_block_files(dir.path), 2u);
+		EXPECT_EQ(count_data_block_files(dir.path), 2u);
 	}
 
 	TEST_F(RegionCleanerTest, AFailedWriteBackUnwindsTheSlotAndLeavesTheStoreHealthy) {
@@ -433,7 +457,7 @@ namespace {
 		EXPECT_EQ(table.load(1), slot_state::dirty);
 		EXPECT_EQ(table.dirty_slots(), 2u);
 		EXPECT_TRUE(reg->check_sanity());
-		EXPECT_EQ(count_block_files(dir.path), 0u);
+		EXPECT_EQ(count_data_block_files(dir.path), 0u);
 
 		// past the failure backoff the retry writes both back durably
 		g_now.store(100);

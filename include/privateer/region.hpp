@@ -268,7 +268,8 @@ namespace privateer {
 		extern int (*mprotect_fn)(void *addr, size_t len, int prot);
 
 		// When set, called after each completed commit phase (1 capture,
-		// 2 write-out, 3 durability barrier, 4 recipe rename, 5 reclaim).
+		// 2 write-out, 3 segment publish, 4 durability barrier, 5 manifest
+		// rename, 6 reclaim). Phases 4 and 6 run for a durable commit only.
 		// Crash tests kill the process inside it.
 		extern void (*commit_phase_hook)(int completed_phase);
 

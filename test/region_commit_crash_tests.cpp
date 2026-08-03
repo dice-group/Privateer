@@ -22,13 +22,14 @@
 #include <cstddef>
 
 using namespace privateer;
-using privateer::testing::count_block_files;
+using privateer::testing::count_data_block_files;
+using privateer::testing::count_segment_files;
 using privateer::testing::subprocess_result;
 
 namespace {
 
 	// which completed phase kills the child (1 capture, 2 write-out,
-	// 3 barrier, 4 rename, 5 reclaim)
+	// 3 segment publish, 4 barrier, 5 rename, 6 reclaim)
 	int g_kill_after_phase = 0;
 
 	// parameter: the commit worker count, covering the single-threaded and
@@ -65,13 +66,16 @@ namespace {
 
 		// the reopen properties after the child died
 		void check_state(char slot1_content, size_t files_before_reopen, size_t files_after_sweep) {
-			EXPECT_EQ(count_block_files(dir.path), files_before_reopen);
+			EXPECT_EQ(count_data_block_files(dir.path), files_before_reopen);
 			auto reg = region::open(dir.path);  // read-write: sweeps the garbage
 			ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
 			auto *const bytes = static_cast<unsigned char volatile *>(reg->segment());
 			EXPECT_EQ(bytes[0], 'a');
 			EXPECT_EQ(bytes[bs], static_cast<unsigned char>(slot1_content));
-			EXPECT_EQ(count_block_files(dir.path), files_after_sweep);
+			EXPECT_EQ(count_data_block_files(dir.path), files_after_sweep);
+			// two slots are one segment, and the sweep took the segment file of
+			// every recipe the rename did not publish
+			EXPECT_EQ(count_segment_files(dir.path), 1u);
 			EXPECT_TRUE(reg->commit(true));  // the survivor commits cleanly
 		}
 	};
@@ -86,18 +90,26 @@ namespace {
 		check_state('b', 3, 2);  // the block holding 'c' is swept garbage
 	}
 
-	TEST_P(RegionCommitCrashTest, DurableKilledAfterTheBarrierKeepsTheOldRecipe) {
+	// The segment file of the new recipe is written before the rename, so it
+	// sits next to the one the manifest on disk names; the reopen sweep takes
+	// it like any unreferenced file.
+	TEST_P(RegionCommitCrashTest, DurableKilledAfterTheSegmentPublishKeepsTheOldRecipe) {
 		run_killed_at(3, true);
+		check_state('b', 3, 2);
+	}
+
+	TEST_P(RegionCommitCrashTest, DurableKilledAfterTheBarrierKeepsTheOldRecipe) {
+		run_killed_at(4, true);
 		check_state('b', 3, 2);  // durable but unreferenced: still swept
 	}
 
 	TEST_P(RegionCommitCrashTest, DurableKilledAfterTheRenameShowsTheNewContent) {
-		run_killed_at(4, true);
+		run_killed_at(5, true);
 		check_state('c', 3, 2);  // the retired 'b' block is not yet reclaimed
 	}
 
 	TEST_P(RegionCommitCrashTest, DurableKilledAfterReclaimLeavesNoGarbage) {
-		run_killed_at(5, true);
+		run_killed_at(6, true);
 		check_state('c', 2, 2);
 	}
 
@@ -106,10 +118,15 @@ namespace {
 		check_state('b', 3, 2);
 	}
 
+	TEST_P(RegionCommitCrashTest, NonDurableKilledAfterTheSegmentPublishKeepsTheOldRecipe) {
+		run_killed_at(3, false);
+		check_state('b', 3, 2);
+	}
+
 	TEST_P(RegionCommitCrashTest, NonDurableKilledAfterTheRenameShowsTheNewContent) {
 		// a non-durable commit never unlinks, so the retired 'b' block
 		// survives as sweepable garbage
-		run_killed_at(4, false);
+		run_killed_at(5, false);
 		check_state('c', 3, 2);
 	}
 

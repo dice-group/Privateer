@@ -66,7 +66,7 @@ int main() {
     }
     std::memset(region->segment(), 'p', 1ull << 20);
 
-    // durable: every block the new recipe references is on stable storage on return
+    // durable: blocks and recipe segments the new recipe references are on stable storage on return
     if (auto committed = region->commit(true); !committed) {
         std::fprintf(stderr, "commit failed: %s\n", to_string(committed.error()).c_str());
         return 1;

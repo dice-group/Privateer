@@ -22,7 +22,10 @@
 #include <unistd.h>
 
 using namespace privateer;
-using privateer::testing::count_block_files;
+using privateer::testing::count_data_block_files;
+using privateer::testing::count_segment_files;
+using privateer::testing::manifest_records;
+using privateer::testing::manifest_version;
 using privateer::testing::subprocess_result;
 namespace fs = std::filesystem;
 
@@ -76,12 +79,48 @@ namespace {
 	TEST_F(RegionSnapshotTest, SnapshotsShareBlocksThroughHardLinks) {
 		auto reg = open_src_ab();
 		ASSERT_TRUE(reg.snapshot_to(dst));
-		EXPECT_EQ(count_block_files(dst), 2u);
+		EXPECT_EQ(count_data_block_files(dst), 2u);
 
 		auto store = block_store::open(src);
 		ASSERT_TRUE(store.has_value());
 		std::vector<std::byte> const data(bs, std::byte{'a'});
 		EXPECT_EQ(fs::hard_link_count(store->block_path(hash_block(hash_algorithm::xxh3_128, data))), 2u);
+	}
+
+	// The recipe's segment files are content-named like the data blocks, so
+	// the staging links them and the staged manifest keeps the records of the
+	// source.
+	TEST_F(RegionSnapshotTest, SnapshotsShareTheSegmentFileThroughALink) {
+		auto reg = open_src_ab();
+		ASSERT_TRUE(reg.snapshot_to(dst));
+		ASSERT_EQ(count_segment_files(dst), 1u);
+		EXPECT_EQ(manifest_records(dst), manifest_records(src));
+
+		fs::path segment_file;
+		for (auto const &shard : fs::directory_iterator{dst / "blocks"}) {
+			for (auto const &entry : fs::directory_iterator{shard}) {
+				if (privateer::testing::is_segment_file(entry.path())) {
+					segment_file = entry.path();
+				}
+			}
+		}
+		ASSERT_FALSE(segment_file.empty());
+		EXPECT_EQ(fs::hard_link_count(segment_file), 2u);
+	}
+
+	// A version 1 source names no segment files, so its staged copy writes
+	// them and becomes a version 2 datastore.
+	TEST_F(RegionSnapshotTest, CopyOfAVersionOneSourceWritesTheSegments) {
+		privateer::testing::build_legacy_store(src, bs, {'a', 'b'});
+		ASSERT_TRUE(region::copy(src, dst));
+		EXPECT_EQ(manifest_version(src), 1u);  // the source is untouched
+		EXPECT_EQ(manifest_version(dst), 2u);
+		EXPECT_EQ(count_segment_files(dst), 1u);
+
+		auto snap = region::open(dst);
+		ASSERT_TRUE(snap.has_value()) << to_string(snap.error());
+		EXPECT_EQ(bytes(*snap)[0], 'a');
+		EXPECT_EQ(bytes(*snap)[bs], 'b');
 	}
 
 	TEST_F(RegionSnapshotTest, LaterSourceCommitsDoNotDisturbTheSnapshot) {
@@ -90,7 +129,7 @@ namespace {
 
 		bytes(reg)[0] = 'z';
 		ASSERT_TRUE(reg.commit(true));  // reclaims the source's name for 'a'
-		ASSERT_EQ(count_block_files(src), 2u);
+		ASSERT_EQ(count_data_block_files(src), 2u);
 
 		auto snap = region::open(dst);  // the snapshot's link kept the inode alive
 		ASSERT_TRUE(snap.has_value()) << to_string(snap.error());
@@ -155,7 +194,7 @@ namespace {
 		EXPECT_EQ(bytes(*snap)[0], 'a');
 		EXPECT_EQ(bytes(*snap)[bs], 0);
 		EXPECT_EQ(bytes(*snap)[2 * bs], 'c');
-		EXPECT_EQ(count_block_files(src), 2u);  // the source is untouched
+		EXPECT_EQ(count_data_block_files(src), 2u);  // the source is untouched
 	}
 
 	TEST_F(RegionSnapshotTest, CopyValidatesTheSource) {

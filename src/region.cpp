@@ -18,7 +18,9 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -317,12 +319,15 @@ namespace privateer {
 		}
 
 		// Stages a self-contained segment: the shard skeleton, one hard link
-		// per referenced block (per-file copy where link fails: EXDEV across
-		// devices, EMLINK on an exhausted link count; the fallback unshares
-		// the block, trading space for correctness), and the synced recipe
-		// copy. The skeleton and links are not fsynced here: metall fsyncs
-		// the whole staged tree before it publishes the datastore; the
-		// recipe copy's content is the engine's own obligation.
+		// per file the recipe names (per-file copy where link fails: EXDEV
+		// across devices, EMLINK on an exhausted link count; the fallback
+		// unshares the file, trading space for correctness), and the manifest.
+		// The segment files are named by their content like the data blocks, so
+		// they are linked like them and the staged manifest keeps the records
+		// the source carries. A version 1 source has no segment files, so its
+		// staged copy writes them. The skeleton and links are not fsynced here:
+		// metall fsyncs the whole staged tree before it publishes the
+		// datastore; the recipe's content is the engine's own obligation.
 		result<> stage_segment(recipe const &rec, block_store const &src_store, fs::path const &dst_dir) {
 			std::error_code ec;
 			fs::create_directories(dst_dir, ec);
@@ -334,20 +339,39 @@ namespace privateer {
 				return std::unexpected{dst_store.error()};
 			}
 			boost::unordered_flat_set<block_digest, block_digest_hash> staged;
-			for (auto const &entry : rec.entries) {
-				if (entry.size == 0 || !staged.insert(entry).second) {
-					continue;
+			auto const stage_file = [&](block_digest const &name) -> result<> {
+				if (name.size == 0 || !staged.insert(name).second) {
+					return {};
 				}
-				fs::path const src = src_store.block_path(entry);
-				fs::path const dst = dst_store->block_path(entry);
+				fs::path const src = src_store.block_path(name);
+				fs::path const dst = dst_store->block_path(name);
 				if (link_for_staging(src.c_str(), dst.c_str()) != 0) {
 					fs::copy_file(src, dst, ec);
 					if (ec) {
 						return std::unexpected{error{errc::io_error, ec.value(), "stage a block copy"}};
 					}
 				}
+				return {};
+			};
+			for (auto const &entry : rec.entries) {
+				if (auto linked = stage_file(entry); !linked) {
+					return linked;
+				}
 			}
-			return rec.commit(dst_dir, true);
+			if (rec.segments.size() != segment_count(rec.entries.size())) {
+				// a version 1 source: the staged copy is the first version 2
+				// manifest of this recipe, so it writes every segment
+				if (auto committed = rec.commit(dst_dir, *dst_store, true); !committed) {
+					return std::unexpected{committed.error()};
+				}
+				return {};
+			}
+			for (auto const &segment : rec.segments) {
+				if (auto linked = stage_file(segment.digest); !linked) {
+					return linked;
+				}
+			}
+			return publish_manifest(rec, dst_dir, true);
 		}
 
 	}  // namespace
@@ -530,6 +554,15 @@ namespace privateer {
 		fs::path segment_dir;
 		std::optional<block_store> store;
 		recipe rec;  // the in-memory recipe table; entries change only under the commit mutex
+		// One flag per segment of rec, guarded by the commit mutex. A set flag
+		// means the segment may differ from the record the on-disk manifest
+		// carries, so the commit re-encodes and republishes it. The flags are
+		// set in the same statement region as every write to rec.entries and
+		// cleared only after a manifest publish succeeded. Over-marking is
+		// harmless: the re-encoded segment dedups onto its own name and the
+		// record stays. Under-marking loses the write silently, which is what
+		// the audit of a test-hook build looks for.
+		std::vector<uint8_t> segment_dirty;
 		mlocked_buffer hot_buffer;
 		region_hot *hot = nullptr;
 		bool registered = false;
@@ -662,6 +695,58 @@ namespace privateer {
 			return static_cast<std::byte *>(reservation.addr()) + header_bytes;
 		}
 
+		// Marks the segments of the index range [first, last], growing the
+		// flags to reach it.
+		void mark_segments(size_t first, size_t last) {
+			if (segment_dirty.size() <= last) {
+				segment_dirty.resize(last + 1, 0);
+			}
+			for (size_t index = first; index <= last; ++index) {
+				segment_dirty[index] = 1;
+			}
+		}
+
+		// marks the segment that holds a slot
+		void mark_segment_dirty(size_t slot) {
+			size_t const index = slot / recipe_segment_slots;
+			mark_segments(index, index);
+		}
+
+		// Marks what a grown entry table changes. The last segment of the
+		// previous slot count grows its entry count when that count was no
+		// multiple of the segment size, so its content changes too; every
+		// segment above it is new.
+		void mark_grown_segments(size_t previous_slots, size_t slots) {
+			if (slots <= previous_slots) {
+				return;
+			}
+			mark_segments(previous_slots / recipe_segment_slots, (slots - 1) / recipe_segment_slots);
+		}
+
+#ifdef PRIVATEER_TEST_HOOKS
+		// The audit behind the dirty flags: every segment must re-encode to
+		// the record the manifest just took. A mismatch means an entries write
+		// ran without its mark, which loses that write on the next open, so
+		// the test build stops the process instead of carrying on.
+		void audit_segments() const {
+			for (size_t index = 0; index < rec.segments.size(); ++index) {
+				auto const encoded = encode_segment(rec, index);
+				auto const &record = rec.segments[index];
+				bool ok = encoded.has_value();
+				if (ok) {
+					ok = *encoded ? record.encoding == segment_encoding::raw &&
+											hash_block(rec.algorithm, **encoded) == record.digest
+								  : record.encoding == segment_encoding::all_empty;
+				}
+				if (!ok) {
+					PRIVATEER_LOG(log_level::error,
+								  "recipe segment {} disagrees with the record the manifest carries", index);
+					std::abort();
+				}
+			}
+		}
+#endif
+
 		// Per-slot write-back bookkeeping, owned by the cleaner and guarded
 		// by the commit mutex. Times come from the cleaner's clock.
 		struct cleaner_slot_meta {
@@ -738,7 +823,14 @@ namespace privateer {
 				cleaner_meta.resize(slots);
 			}
 			if (rec.entries.size() < slots) {
+				size_t const previous_slots = rec.entries.size();
 				rec.entries.resize(slots);
+				mark_grown_segments(previous_slots, slots);
+			}
+			// Growing here keeps the marking below allocation-free, which the
+			// unwind depends on.
+			if (segment_dirty.size() < segment_count(slots)) {
+				segment_dirty.resize(static_cast<size_t>(segment_count(slots)), 0);
 			}
 
 			// The sweep: record first-dirty times, apply the re-dirty rule,
@@ -819,6 +911,7 @@ namespace privateer {
 						store->add_reference(p.prior);
 					}
 					entry = p.prior;
+					mark_segment_dirty(p.slot);
 				}
 				auto *const addr = segment_base() + p.slot * block_size;
 				if (::mprotect(addr, block_size, PROT_READ | PROT_WRITE) != 0) {
@@ -888,6 +981,7 @@ namespace privateer {
 				}
 				store->add_reference(name);
 				entry = name;
+				mark_segment_dirty(slot);
 				written.push_back(name);
 			}
 
@@ -1333,7 +1427,7 @@ namespace privateer {
 		rec.capacity = round_up(capacity, block_size);
 		rec.size = 0;
 		rec.algorithm = options.algorithm.value_or(hash_algorithm::xxh3_128);
-		if (auto committed = rec.commit(segment_dir, true); !committed) {
+		if (auto committed = rec.commit(segment_dir, *store, true); !committed) {
 			return std::unexpected{committed.error()};
 		}
 		return open_impl(segment_dir, options, false);
@@ -1349,13 +1443,14 @@ namespace privateer {
 
 	result<region> region::open_impl(fs::path const &segment_dir, region_options const &options,
 									 bool read_only) {
-		auto rec = recipe::load(segment_dir);
-		if (!rec) {
-			return std::unexpected{rec.error()};
-		}
+		// The store comes first: the recipe's segment files live in it.
 		auto store = block_store::open(segment_dir);
 		if (!store) {
 			return std::unexpected{store.error()};
+		}
+		auto rec = recipe::load(segment_dir, *store);
+		if (!rec) {
+			return std::unexpected{rec.error()};
 		}
 
 		if (options.block_size && *options.block_size != rec->block_size) {
@@ -1469,6 +1564,13 @@ namespace privateer {
 		auto &st = *reg.state_;
 		st.segment_dir = segment_dir;
 		st.rec = std::move(*rec);
+		// A version 2 load carries a record per segment, so the loaded state
+		// matches the manifest on disk and no segment needs republishing. A
+		// version 1 load has no records at all, so the first commit writes
+		// every segment.
+		size_t const loaded_segments = static_cast<size_t>(segment_count(st.rec.entries.size()));
+		st.segment_dirty.assign(loaded_segments,
+								st.rec.segments.size() == loaded_segments ? uint8_t{0} : uint8_t{1});
 		st.hot_buffer = std::move(*hot_buffer);
 		st.hot = new (st.hot_buffer.addr()) region_hot{};
 		st.hot->table = std::move(*table);
@@ -1523,13 +1625,26 @@ namespace privateer {
 		st.hot->table.set_extended_size(st.rec.size);
 
 		if (!read_only) {
+			// The recipe's segment files sit in the store next to the blocks,
+			// so they take the same seeding and the same reference: the sweep
+			// keeps what the recipe names, and nothing else.
+			std::vector<block_digest> referenced;
+			referenced.reserve(st.rec.entries.size() + st.rec.segments.size());
 			for (auto const &entry : st.rec.entries) {
 				if (entry.size != 0) {
 					st.store->seed_durable(entry);
 					st.store->add_reference(entry);
+					referenced.push_back(entry);
 				}
 			}
-			auto swept = st.store->sweep(st.rec.entries);
+			for (auto const &segment : st.rec.segments) {
+				if (segment.digest.size != 0) {
+					st.store->seed_durable(segment.digest);
+					st.store->add_reference(segment.digest);
+					referenced.push_back(segment.digest);
+				}
+			}
+			auto swept = st.store->sweep(referenced);
 			if (!swept) {
 				return std::unexpected{swept.error()};
 			}
@@ -1770,7 +1885,13 @@ namespace privateer {
 		// the next epoch; this epoch persists the size captured here.
 		uint64_t const captured_size = table.extended_size();
 		size_t const captured_slots = captured_size / block_size;
+		size_t const previous_slots = st.rec.entries.size();
 		st.rec.entries.resize(captured_slots);
+		st.mark_grown_segments(previous_slots, captured_slots);
+		// The size the segments encode against: an entry table and a size that
+		// disagree describe no recipe. Only a commit writes this field, and
+		// only the manifest publish below reads it.
+		st.rec.size = captured_size;
 
 		struct captured_slot {
 			size_t slot;
@@ -1898,6 +2019,10 @@ namespace privateer {
 		};
 		struct worker_result {
 			std::vector<ref_delta> deltas;
+			// Segments whose entries this worker wrote. A worker runs on a pool
+			// thread and must not touch the region's flags, so it records the
+			// indices here and the join below marks them.
+			std::vector<uint32_t> dirty_segments;
 			std::optional<error> err;
 		};
 		// The pools' threads do not survive a fork; in a fork child the
@@ -1931,6 +2056,14 @@ namespace privateer {
 		};
 
 		auto const write_out = [&](worker_result &res) {
+			// Workers claim ascending slots, so the segment of one worker's
+			// writes repeats in runs; only a change is recorded.
+			auto const note_segment = [&res](size_t slot) {
+				auto const index = static_cast<uint32_t>(slot / recipe_segment_slots);
+				if (res.dirty_segments.empty() || res.dirty_segments.back() != index) {
+					res.dirty_segments.push_back(index);
+				}
+			};
 			for (;;) {
 				if (write_out_failed.load(std::memory_order_acquire) != 0) {
 					return;
@@ -1945,6 +2078,7 @@ namespace privateer {
 					if (entry.size != 0) {
 						res.deltas.push_back({entry, block_digest{}});
 						entry = block_digest{};
+						note_segment(cap.slot);
 					}
 					// the fresh anonymous zero mapping is already in place
 					table.publish(cap.slot, slot_state::empty);
@@ -1965,6 +2099,7 @@ namespace privateer {
 					}
 					(*published ? st.stat_written : st.stat_deduped).fetch_add(1, std::memory_order_relaxed);
 					entry = name;
+					note_segment(cap.slot);
 				}
 				// One MAP_FIXED call replaces the private pages with the
 				// named block file; a concurrent reader either reads the old
@@ -1979,6 +2114,7 @@ namespace privateer {
 					// same private pages. A published file stays sweepable
 					// garbage.
 					entry = prior;
+					note_segment(cap.slot);
 					res.err = mapped.error();
 					write_out_failed.store(1, std::memory_order_release);
 					return;
@@ -2040,6 +2176,9 @@ namespace privateer {
 		count_worker_out();
 		join_workers();
 
+		// The bookkeeping of the workers, applied by their single owner. It runs
+		// before the failure check, so a failed commit keeps the marks of the
+		// slots its write-out released.
 		for (auto const &res : results) {
 			for (auto const &delta : res.deltas) {
 				if (delta.drop.size != 0) {
@@ -2051,6 +2190,9 @@ namespace privateer {
 					// or a dedup hit on a file no barrier covers yet
 					st.store->note_unsynced(delta.add);
 				}
+			}
+			for (uint32_t const index : res.dirty_segments) {
+				st.mark_segments(index, index);
 			}
 		}
 		if (write_out_failed.load(std::memory_order_acquire) != 0) {
@@ -2078,31 +2220,101 @@ namespace privateer {
 			spread_over_workers(count, configured_workers, body);
 		};
 
-		// Phase 3: the durability barrier over the store's pending names.
-		// Covers the names this commit published and the names inherited from
-		// earlier non-durable commits and cleaner batches, so it costs what
-		// was published since the last barrier and not a pass over the whole
-		// recipe. The store skips names already in the durable set and names
-		// no entry references any more.
+		// Phase 3: the segment publish. Only the marked segments are encoded
+		// and published; an unmarked segment keeps the record the manifest
+		// already carries, so a commit pays for the entries it changed and not
+		// for the whole table. A marked segment that re-encodes to its own name
+		// keeps its record and needs no publish either.
+		size_t const segments_now = static_cast<size_t>(segment_count(captured_slots));
+		if (st.segment_dirty.size() < segments_now) {
+			st.segment_dirty.resize(segments_now, 0);
+		}
+		// Records above the previous table start as all_empty defaults; the
+		// resize rule of phase 1 marked their indices.
+		std::vector<segment_record> records = st.rec.segments;
+		records.resize(segments_now);
+		std::vector<ref_delta> segment_deltas;
+		for (size_t index = 0; index < segments_now; ++index) {
+			if (st.segment_dirty[index] == 0) {
+				continue;
+			}
+			auto encoded = encode_segment(st.rec, index);
+			if (!encoded) {
+				// The marks stay set and the records stay as they are, so a
+				// retried commit republishes this segment.
+				return std::unexpected{encoded.error()};
+			}
+			segment_record record;  // a segment whose slots are all empty
+			if (*encoded) {
+				auto const name = hash_block(st.rec.algorithm, **encoded);
+				record = segment_record{segment_encoding::raw,
+										static_cast<uint32_t>((*encoded)->size()), name};
+				if (name != records[index].digest) {
+					if (auto ok = st.store->publish(name, **encoded); !ok) {
+						return std::unexpected{ok.error()};
+					}
+					// The name owes a sync: a file this commit created, or a
+					// dedup hit on a file no barrier covers yet.
+					st.store->note_unsynced(name);
+				}
+			}
+			if (record.digest != records[index].digest) {
+				segment_deltas.push_back({records[index].digest, record.digest});
+			}
+			records[index] = record;
+		}
+		// The store counts a segment file like a block, and the in-memory
+		// records are what the references mirror. The new names are referenced
+		// before the replaced ones are dropped, so a name both tables carry
+		// never dips to zero and becomes a reclaim candidate. Reclaim runs only
+		// after a successful rename, so a name the manifest on disk still
+		// carries keeps its file until a manifest without it landed.
+		for (auto const &delta : segment_deltas) {
+			if (delta.add.size != 0) {
+				st.store->add_reference(delta.add);
+			}
+		}
+		for (auto const &delta : segment_deltas) {
+			if (delta.drop.size != 0) {
+				st.store->drop_reference(delta.drop);
+			}
+		}
+		st.rec.segments = std::move(records);
+		commit_phase_done(3);
+
+		// Phase 4: the durability barrier over the store's pending names.
+		// Covers the block files and the segment files this commit published
+		// and the names inherited from earlier non-durable commits and cleaner
+		// batches, so it costs what was published since the last barrier and
+		// not a pass over the whole recipe. The store skips names already in
+		// the durable set and names nothing references any more.
 		if (durable) {
 			if (auto synced = st.store->make_pending_durable(spread); !synced) {
 				return std::unexpected{synced.error()};
 			}
-			commit_phase_done(3);
+			commit_phase_done(4);
 		}
 
-		// Phase 4: the atomic commit point.
-		st.rec.size = captured_size;
-		if (auto committed = st.rec.commit(st.segment_dir, durable); !committed) {
-			return std::unexpected{committed.error()};
+		// Phase 5: the atomic commit point.
+		if (auto written = publish_manifest(st.rec, st.segment_dir, durable); !written) {
+			return std::unexpected{written.error()};
 		}
-		commit_phase_done(4);
+		// The manifest on disk carries the records of every segment below the
+		// captured slot count now. A flag above that count belongs to a segment
+		// a concurrent extend added, and the next commit publishes it.
+		for (size_t index = 0; index < segments_now; ++index) {
+			st.segment_dirty[index] = 0;
+		}
+#ifdef PRIVATEER_TEST_HOOKS
+		st.audit_segments();
+#endif
+		commit_phase_done(5);
 
-		// Phase 5: reclaim. Errors are non-fatal and logged inside; a failed
+		// Phase 6: reclaim. Errors are non-fatal and logged inside; a failed
 		// name stays a candidate, and the open-time sweep is the backstop.
 		if (durable) {
 			st.store->reclaim(spread);
-			commit_phase_done(5);
+			commit_phase_done(6);
 		}
 		return {};
 	}
@@ -2122,13 +2334,14 @@ namespace privateer {
 	}
 
 	result<> region::copy(fs::path const &src_segment_dir, fs::path const &dst_segment_dir) {
-		auto rec = recipe::load(src_segment_dir);
-		if (!rec) {
-			return std::unexpected{rec.error()};
-		}
+		// The store comes first: the recipe's segment files live in it.
 		auto src_store = block_store::open(src_segment_dir);
 		if (!src_store) {
 			return std::unexpected{src_store.error()};
+		}
+		auto rec = recipe::load(src_segment_dir, *src_store);
+		if (!rec) {
+			return std::unexpected{rec.error()};
 		}
 		if (auto validated = validate_blocks(*rec, *src_store); !validated) {
 			return std::unexpected{validated.error()};

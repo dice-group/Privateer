@@ -11,13 +11,16 @@
 #include "support/store_builder.hpp"
 #include "support/temp_dir.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -35,7 +38,10 @@
 
 using namespace privateer;
 using namespace std::chrono_literals;
-using privateer::testing::count_block_files;
+using privateer::testing::count_data_block_files;
+using privateer::testing::count_segment_files;
+using privateer::testing::manifest_records;
+using privateer::testing::manifest_version;
 namespace fs = std::filesystem;
 
 namespace {
@@ -148,7 +154,7 @@ namespace {
 		bytes(*reg)[0] = 'a';  // dirtied, but the content is unchanged
 		ASSERT_EQ(detail_region::table_of(*reg).dirty_slots(), 1u);
 		ASSERT_TRUE(reg->commit(true));
-		EXPECT_EQ(count_block_files(dir.path), 1u);
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);
 		EXPECT_EQ(detail_region::table_of(*reg).load(0), slot_state::clean);
 		EXPECT_EQ(detail_region::table_of(*reg).dirty_slots(), 0u);
 	}
@@ -159,7 +165,7 @@ namespace {
 			bytes(reg)[0] = 'd';
 			bytes(reg)[bs] = 'd';
 			ASSERT_TRUE(reg.commit(true));
-			EXPECT_EQ(count_block_files(dir.path), 1u);
+			EXPECT_EQ(count_data_block_files(dir.path), 1u);
 		}
 		auto reopened = region::open(dir.path);
 		ASSERT_TRUE(reopened.has_value());
@@ -214,7 +220,7 @@ namespace {
 		ASSERT_TRUE(reg.has_value());
 		bytes(*reg)[0] = 'b';
 		ASSERT_TRUE(reg->commit(true));
-		EXPECT_EQ(count_block_files(dir.path), 1u);  // the block holding 'a' is unlinked
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);  // the block holding 'a' is unlinked
 		EXPECT_EQ(bytes(*reg)[0], 'b');
 	}
 
@@ -227,12 +233,12 @@ namespace {
 			ASSERT_TRUE(reg->commit(false));
 			// the retired block must survive: a lost rename has to be able to
 			// resurface the old recipe with all its blocks intact
-			EXPECT_EQ(count_block_files(dir.path), 2u);
+			EXPECT_EQ(count_data_block_files(dir.path), 2u);
 		}
 		auto reopened = region::open(dir.path);  // the sweep removes the retired block
 		ASSERT_TRUE(reopened.has_value());
 		EXPECT_EQ(bytes(*reopened)[0], 'b');
-		EXPECT_EQ(count_block_files(dir.path), 1u);
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);
 	}
 
 	TEST_F(RegionCommitTest, ALaterDurableCommitReclaimsNonDurableRetirees) {
@@ -241,12 +247,12 @@ namespace {
 		ASSERT_TRUE(reg.has_value());
 		bytes(*reg)[0] = 'b';
 		ASSERT_TRUE(reg->commit(false));
-		ASSERT_EQ(count_block_files(dir.path), 2u);
+		ASSERT_EQ(count_data_block_files(dir.path), 2u);
 		bytes(*reg)[0] = 'c';
 		ASSERT_TRUE(reg->commit(true));
 		// both retired names ('a' from the non-durable commit, 'b' from this
 		// one) are unlinked once the rename is durable
-		EXPECT_EQ(count_block_files(dir.path), 1u);
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);
 		EXPECT_EQ(bytes(*reg)[0], 'c');
 	}
 
@@ -256,13 +262,16 @@ namespace {
 		ASSERT_TRUE(reg.commit(false));
 
 		// Nothing is dirty, so the inherited name is all the barrier has to
-		// do: its block file and its shard directory entry, plus the recipe
-		// file and the segment directory of the rename.
+		// do: its block file and its shard directory entry, the recipe's
+		// segment file and its shard entry, plus the manifest file and the
+		// segment directory of the rename.
 		detail_file_util::sync_calls.store(0);
 		ASSERT_TRUE(reg.commit(true));
-		EXPECT_EQ(detail_file_util::sync_calls.load(), 4u);
+		EXPECT_EQ(detail_file_util::sync_calls.load(), 6u);
 
-		// the name is durable now, so the next durable commit pays the rename only
+		// Every name is durable now, and the recipe is unchanged, so its
+		// segment file dedups onto a durable name: the next durable commit
+		// pays the rename only.
 		detail_file_util::sync_calls.store(0);
 		ASSERT_TRUE(reg.commit(true));
 		EXPECT_EQ(detail_file_util::sync_calls.load(), 2u);
@@ -277,7 +286,7 @@ namespace {
 			// nothing references the name of 'x' any more, so the barrier
 			// leaves it out and the reclaim after the rename unlinks its file
 			ASSERT_TRUE(reg.commit(true));
-			EXPECT_EQ(count_block_files(dir.path), 1u);
+			EXPECT_EQ(count_data_block_files(dir.path), 1u);
 			EXPECT_EQ(bytes(reg)[0], 'y');
 		}
 		auto reopened = region::open(dir.path);
@@ -294,14 +303,15 @@ namespace {
 			ASSERT_TRUE(reg.commit(true));  // the name of 'x' retires unsynced
 			bytes(reg)[0] = 'x';            // and comes back
 
-			// the returning name is written and synced like any other: its
-			// block file and its shard entry, the recipe file and the segment
-			// directory of the rename, and the shard entry of the reclaim that
-			// unlinks the name of 'y'
+			// The returning name is written and synced like any other: its
+			// block file and its shard entry, the recipe's segment file and
+			// its shard entry, the manifest file and the segment directory of
+			// the rename, and the shard entries of the reclaim that unlinks
+			// the name of 'y' and the retired segment file.
 			detail_file_util::sync_calls.store(0);
 			ASSERT_TRUE(reg.commit(true));
-			EXPECT_EQ(detail_file_util::sync_calls.load(), 5u);
-			EXPECT_EQ(count_block_files(dir.path), 1u);
+			EXPECT_EQ(detail_file_util::sync_calls.load(), 8u);
+			EXPECT_EQ(count_data_block_files(dir.path), 1u);
 		}
 		auto reopened = region::open(dir.path);
 		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
@@ -324,14 +334,14 @@ namespace {
 				bytes(*reg)[slot * bs] = static_cast<unsigned char>('a' + slot);
 			}
 			ASSERT_TRUE(reg->commit(true));
-			EXPECT_EQ(count_block_files(dir.path), slots);
+			EXPECT_EQ(count_data_block_files(dir.path), slots);
 
 			// a second round retires all six names at once
 			for (size_t slot = 0; slot < slots; ++slot) {
 				bytes(*reg)[slot * bs] = static_cast<unsigned char>('A' + slot);
 			}
 			ASSERT_TRUE(reg->commit(true));
-			EXPECT_EQ(count_block_files(dir.path), slots);
+			EXPECT_EQ(count_data_block_files(dir.path), slots);
 		}
 		auto reopened = region::open(dir.path);
 		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
@@ -370,6 +380,163 @@ namespace {
 		EXPECT_EQ(bytes(*reopened)[2 * bs], '3');
 	}
 
+	TEST_F(RegionCommitTest, AFreedSegmentCollapsesToAllEmpty) {
+		auto reg = make_region(2);
+		bytes(reg)[0] = 'a';
+		ASSERT_TRUE(reg.commit(true));
+		ASSERT_EQ(count_segment_files(dir.path), 1u);
+		ASSERT_EQ(count_data_block_files(dir.path), 1u);
+
+		ASSERT_TRUE(reg.free_region(0, 2 * bs));
+		ASSERT_TRUE(reg.commit(true));
+		// every slot of the segment holds the sentinel now, so its record says
+		// all_empty and the reclaim unlinked the file
+		auto const records = manifest_records(dir.path);
+		ASSERT_EQ(records.size(), 1u);
+		EXPECT_EQ(records[0][0], 0u);  // the all_empty encoding
+		EXPECT_EQ(count_segment_files(dir.path), 0u);
+		EXPECT_EQ(count_data_block_files(dir.path), 0u);
+	}
+
+	TEST_F(RegionCommitTest, AVersionOneDatastoreRewritesEverySegmentOnItsFirstCommit) {
+		privateer::testing::build_legacy_store(dir.path, bs, {'a', 'b'});
+		ASSERT_EQ(manifest_version(dir.path), 1u);
+		ASSERT_EQ(count_segment_files(dir.path), 0u);
+		{
+			auto reg = region::open(dir.path);
+			ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+			ASSERT_TRUE(reg->commit(true));  // nothing is dirty, and every segment is
+			EXPECT_EQ(manifest_version(dir.path), 2u);
+			EXPECT_EQ(count_segment_files(dir.path), 1u);
+		}
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		EXPECT_EQ(reopened->size(), 2 * bs);
+		EXPECT_EQ(bytes(*reopened)[0], 'a');
+		EXPECT_EQ(bytes(*reopened)[bs], 'b');
+		EXPECT_EQ(count_data_block_files(dir.path), 2u);
+	}
+
+	// Regions that span more than one segment. A segment covers
+	// recipe_segment_slots slots, so these stay cheap by materializing a
+	// handful of slots and leaving the rest sparse.
+	struct RegionSegmentTest : RegionCommitTest {
+		uint64_t const seg = recipe_segment_slots;
+
+		region make_wide_region(uint64_t extended_slots, uint64_t capacity_slots) {
+			auto reg = region::create(dir.path, capacity_slots * bs, options());
+			EXPECT_TRUE(reg.has_value()) << to_string(reg.error());
+			EXPECT_TRUE(reg->extend(extended_slots * bs));
+			return std::move(*reg);
+		}
+	};
+
+	TEST_F(RegionSegmentTest, OnlyTheDirtySegmentsArePublished) {
+		auto reg = make_wide_region(2 * seg + 1, 2 * seg + 8);
+		bytes(reg)[0] = 'a';             // segment 0
+		bytes(reg)[2 * seg * bs] = 'c';  // segment 2
+		ASSERT_TRUE(reg.commit(true));
+		auto const first = manifest_records(dir.path);
+		ASSERT_EQ(first.size(), 3u);
+		EXPECT_EQ(count_segment_files(dir.path), 2u);  // segment 1 is all_empty
+		EXPECT_EQ(count_data_block_files(dir.path), 2u);
+
+		bytes(reg)[0] = 'b';  // only the entries of segment 0 change
+		ASSERT_TRUE(reg.commit(true));
+		auto const second = manifest_records(dir.path);
+		ASSERT_EQ(second.size(), 3u);
+		EXPECT_NE(second[0], first[0]);
+		EXPECT_EQ(second[1], first[1]);
+		EXPECT_EQ(second[2], first[2]);
+		EXPECT_EQ(count_segment_files(dir.path), 2u);
+	}
+
+	TEST_F(RegionSegmentTest, ExtendGrowsTheManifestWithoutFiles) {
+		auto reg = make_wide_region(1, seg + 8);
+		bytes(reg)[0] = 'a';
+		ASSERT_TRUE(reg.commit(true));
+		ASSERT_EQ(manifest_records(dir.path).size(), 1u);
+		ASSERT_EQ(count_segment_files(dir.path), 1u);
+
+		ASSERT_TRUE(reg.extend((seg + 1) * bs));
+		ASSERT_TRUE(reg.commit(true));
+		// The manifest carries the new segment, which is all_empty and has no
+		// file. Segment 0 grew its entry count, so it republished and the
+		// reclaim took its old file.
+		EXPECT_EQ(manifest_records(dir.path).size(), 2u);
+		EXPECT_EQ(count_segment_files(dir.path), 1u);
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);
+	}
+
+	// The missed-mark detector at scale: rounds of writes, frees, growth,
+	// failed commits and cleaner batches across a segment boundary, against a
+	// shadow of what every slot should hold. A dirty flag that is never set
+	// shows up here as a slot whose reopened content is stale; in a test-hook
+	// build the commit's own segment audit aborts before that.
+	TEST_F(RegionSegmentTest, RandomizedRoundsSurviveAReopenIntact) {
+		uint64_t const capacity_slots = seg + 64;
+		uint64_t slots = seg - 5;  // the growth below crosses the segment boundary
+		std::vector<unsigned char> shadow(capacity_slots, 0);
+		{
+			auto reg = make_wide_region(slots, capacity_slots);
+			// the slots the rounds touch, a handful on each side of the boundary
+			std::vector<uint64_t> const touched = {0,       1,       2,       seg - 4, seg - 3,
+												   seg - 2, seg - 1, seg,     seg + 1};
+			std::mt19937 rng{20260803};
+			for (int round = 0; round < 30; ++round) {
+				auto const value = static_cast<unsigned char>('A' + round % 26);
+				for (int write = 0; write < 4; ++write) {
+					uint64_t const slot = touched[rng() % touched.size()];
+					if (slot >= slots) {
+						continue;
+					}
+					bytes(reg)[slot * bs] = value;
+					shadow[slot] = value;
+				}
+				uint64_t const first = touched[rng() % touched.size()];
+				uint64_t const freed = 1 + rng() % 2;
+				if (first < slots) {
+					ASSERT_TRUE(reg.free_region(first * bs, freed * bs));
+					for (uint64_t slot = first; slot < std::min(first + freed, slots); ++slot) {
+						shadow[slot] = 0;
+					}
+				}
+				if (slots < capacity_slots) {
+					++slots;
+					ASSERT_TRUE(reg.extend(slots * bs));
+				}
+				if (round % 3 == 0) {
+					// A commit whose worker post fails: every captured slot goes
+					// back to dirty and keeps its mark, so the commit below
+					// persists it.
+					detail_region::commit_post_fails_fn = [](size_t) { return true; };
+					(void) reg.commit(true);
+					detail_region::commit_post_fails_fn = nullptr;
+				}
+				if (round % 4 == 0) {
+					(void) detail_region::run_cleaner_batch(reg, true);
+				}
+				ASSERT_TRUE(reg.commit(round % 2 == 0));
+			}
+			ASSERT_TRUE(reg.commit(true));
+		}
+
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		ASSERT_EQ(reopened->size(), slots * bs);
+		size_t mismatches = 0;
+		uint64_t first_bad = 0;
+		for (uint64_t slot = 0; slot < slots; ++slot) {
+			if (bytes(*reopened)[slot * bs] != shadow[slot]) {
+				if (mismatches == 0) {
+					first_bad = slot;
+				}
+				++mismatches;
+			}
+		}
+		EXPECT_EQ(mismatches, 0u) << "first mismatching slot " << first_bad;
+	}
+
 	TEST_F(RegionCommitTest, ASimulatedEmptiedSlotCommitsTheSentinel) {
 		privateer::testing::build_committed_store(dir.path, bs, {'a'});
 		auto reg = region::open(dir.path);
@@ -381,7 +548,7 @@ namespace {
 
 		ASSERT_TRUE(reg->commit(true));
 		EXPECT_EQ(table.load(0), slot_state::empty);
-		EXPECT_EQ(count_block_files(dir.path), 0u);  // the emptied slot retired its name
+		EXPECT_EQ(count_data_block_files(dir.path), 0u);  // the emptied slot retired its name
 	}
 
 	TEST_F(RegionCommitTest, ACommitRecoversAPoisonedSlot) {
@@ -463,7 +630,7 @@ namespace {
 		EXPECT_EQ(detail_region::table_of(reg).dirty_slots(), 1u);
 		ASSERT_TRUE(reg.commit(true));
 		EXPECT_EQ(bytes(reg)[0], 'y');
-		EXPECT_EQ(count_block_files(dir.path), 1u);
+		EXPECT_EQ(count_data_block_files(dir.path), 1u);
 	}
 
 	// The downstream write pattern: the writer quiesces around every commit

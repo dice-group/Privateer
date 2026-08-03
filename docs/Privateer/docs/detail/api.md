@@ -70,12 +70,13 @@ struct region {
     // their block files become reclaimable. Partly covered blocks stay untouched.
     result<> free_region(uint64_t offset, uint64_t nbytes);
 
-    // Writes back what changed and replaces the recipe atomically. durable adds the
-    // durability barrier before the rename and reclaims retired blocks after it.
+    // Writes back what changed and replaces the recipe manifest atomically. durable adds
+    // the durability barrier before the rename and reclaims retired files after it.
     result<> commit(bool durable);
 
     // Durable commit, then a self-contained copy of the result in staging_segment_dir,
-    // with the block files hard-linked. The caller publishes it with a rename.
+    // with the block and recipe segment files hard-linked. The caller publishes it with
+    // a rename.
     result<> snapshot_to(std::filesystem::path const &staging_segment_dir);
 
     // Same staging for a datastore that no writer holds open. The source is not modified.
@@ -214,8 +215,10 @@ These are used by a region and are public because tools need them:
 * `privateer/block_store.hpp`: the content-addressed store. Publication stages a file and links it
   under the content name, so it is thread-safe with no store state and no lock; a duplicate is
   answered by comparing the existing file and writes nothing.
-* `privateer/recipe.hpp`: the on-disk recipe, one little-endian file `_recipe` with a header, one
-  entry per slot and a checksum, replaced by rename at every commit.
+* `privateer/recipe.hpp`: the on-disk recipe. The entries live in content-named segment files in the
+  block store, one per fixed slot range, and the little-endian manifest `_recipe` names them; the
+  manifest is replaced by rename at every commit, so a commit writes the segments whose entries
+  changed plus the manifest. A version 1 recipe, one file with every entry in it, still loads.
 * `privateer/vm.hpp`: the reservation and the fixed-address mapping calls, plus `page_size()`.
 * `privateer/fault_handler.hpp`: installing the process-wide handler, and arming a thread with an
   mlocked alternate signal stack.

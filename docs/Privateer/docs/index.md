@@ -14,15 +14,16 @@ have different APIs.
 ## Overview
 
 A datastore is a directory that holds fixed-size block files and a recipe. The recipe says which
-block belongs at which offset, and it is the only thing that has to be replaced atomically for the
-datastore to move from one version to the next.
+block belongs at which offset. It is a small manifest plus segment files that hold its entries, one
+file per fixed range of offsets, and the manifest is the only thing that has to be replaced
+atomically for the datastore to move from one version to the next.
 
 Three properties follow from that layout:
 
 - A checkpoint writes the blocks that changed, not the whole segment.
 - A block is named by a digest of its content, so equal content is one file, and content that did
-  not change is not written again.
-- A snapshot is another recipe over the same block files, so it costs link counts instead of a copy.
+  not change is not written again. The recipe segment files are named the same way.
+- A snapshot is another recipe over the same files, so it costs link counts instead of a copy.
 
 ## The model
 
@@ -59,9 +60,10 @@ hash:
   nothing is written,
 - new: the block is written into the store under its content name.
 
-Then the new recipe replaces the old one with an atomic rename. A durable commit adds a durability
-barrier before the rename and reclaims retired block files after it, so it returns only when
-everything the new recipe references is on stable storage.
+Then the recipe segments whose entries changed are published under their content names, and the new
+manifest replaces the old one with an atomic rename. A durable commit adds a durability barrier
+before the rename and reclaims retired files after it, so it returns only when everything the new
+recipe references is on stable storage.
 
 One commit runs at a time. Readers stay live for the whole commit, and a writer that faults a
 captured slot waits for that slot's own write-out and nothing else. A consistent cut still needs the
@@ -70,14 +72,14 @@ application to hold its writes, because a commit cannot know which of them belon
 ### Snapshots and reclaim
 
 `snapshot_to` runs a durable commit and stages a self-contained copy of the result: every referenced
-block file is hard-linked, with a per-file copy where the link is refused, and the recipe copy is
-written and synced. Both steps hold the commit mutex, so no commit in between can reclaim a block
-the staged copy references. Publishing the staged directory is one atomic rename, which the caller
-does.
+block file and recipe segment file is hard-linked, with a per-file copy where the link is refused,
+and the manifest is written and synced. Both steps hold the commit mutex, so no commit in between
+can reclaim a file the staged copy references. Publishing the staged directory is one atomic rename,
+which the caller does.
 
-Block files are reference counted against the recipes that use them. A file that nothing references
-any more is deleted by the durable commit that retired it, and an open-time sweep removes whatever a
-crash left behind.
+Block files and recipe segment files are reference counted against the recipes that use them. A file
+that nothing references any more is deleted by the durable commit that retired it, and an open-time
+sweep removes whatever a crash left behind.
 
 ### Memory
 
