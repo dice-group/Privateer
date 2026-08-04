@@ -17,8 +17,33 @@
 #include <new>
 #include <vector>
 
+// sanitizer detection: gcc defines __SANITIZE_*, clang answers __has_feature
+#ifdef __SANITIZE_THREAD__
+#define PRIVATEER_TEST_TSAN 1
+#endif
+#ifdef __has_feature
+#if __has_feature(thread_sanitizer)
+#define PRIVATEER_TEST_TSAN 1
+#endif
+#endif
+
 using namespace privateer;
 using in_flight = region_registry::in_flight_kind;
+
+#ifdef PRIVATEER_TEST_TSAN
+
+namespace {
+
+	// TSan's runtime defines the global allocation functions itself, and its
+	// definitions are strong: a second one does not link. The tests need the
+	// hooks, so this build has none of them.
+	TEST(RegionRegistryAllocation, TheHooksAreNotAvailableInAThreadSanitizerBuild) {
+		GTEST_SKIP() << "TSan defines the global allocation functions itself";
+	}
+
+}  // namespace
+
+#else
 
 namespace {
 
@@ -219,3 +244,5 @@ namespace {
 	}
 
 }  // namespace
+
+#endif  // PRIVATEER_TEST_TSAN
