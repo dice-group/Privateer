@@ -943,9 +943,21 @@ namespace privateer {
 		// the batch cannot restore is poisoned. override_backoff takes every
 		// dirty slot regardless of its re-dirty backoff: the hard-watermark
 		// drain, where cleaner throughput must not wait out backoff timers.
-		// Returns the number of slots written back.
+		// Returns the number of slots written back; a batch that meets a
+		// running commit writes nothing back.
 		size_t clean_batch(bool override_backoff) {
-			std::lock_guard const commit_lock{commit_mutex};
+			// A batch runs on a work-pool thread, and a commit posts its
+			// write-out workers to the same pool and waits for them. A batch
+			// that waited for the mutex would hold its thread while the
+			// commit that owns the mutex waits for a worker queued behind that
+			// thread, and on a pool with no thread to spare neither side
+			// would ever move again. So a batch that meets a running commit
+			// steps aside: the commit writes back what it captured, and what
+			// it leaves dirty the next batch takes.
+			std::unique_lock const commit_lock{commit_mutex, std::try_to_lock};
+			if (!commit_lock.owns_lock()) {
+				return 0;
+			}
 			if (hot->error.load(std::memory_order_acquire) != 0 ||
 				cleaner_off.load(std::memory_order_acquire) != 0) {
 				return 0;
