@@ -22,7 +22,26 @@ namespace privateer {
 
 	namespace fs = std::filesystem;
 
+#ifdef PRIVATEER_TEST_HOOKS
+	namespace detail_block_store {
+
+		std::atomic<bool (*)(block_digest const &)> barrier_sync_fails_fn{nullptr};
+
+	}  // namespace detail_block_store
+#endif
+
 	namespace {
+
+		// Whether the durability barrier's file sync for this name must fail,
+		// the way a device error would; tests reroute it through the seam.
+		bool barrier_sync_fails([[maybe_unused]] block_digest const &name) {
+#ifdef PRIVATEER_TEST_HOOKS
+			auto const fails = detail_block_store::barrier_sync_fails_fn.load(std::memory_order_relaxed);
+			return fails != nullptr && fails(name);
+#else
+			return false;
+#endif
+		}
 
 		std::string shard_name(uint8_t byte) {
 			static constexpr char alphabet[] = "0123456789abcdef";
@@ -170,6 +189,24 @@ namespace privateer {
 		if (name.size == 0 || data.empty()) {
 			return fail(errc::invalid_argument, "publish needs a name and content");
 		}
+		if (needs_rewrite(name)) {
+			// The file under the name is one a durability barrier failed on,
+			// so it is no dedup target: the content goes into a fresh file
+			// that replaces it. The replacement is one rename, and both files
+			// carry the content the name stands for, so a reader of the name
+			// sees one of them and never a gap.
+			auto staged = staged_file::create_in(shard_path(name));
+			if (!staged) {
+				return std::unexpected{staged.error()};
+			}
+			if (auto written = staged->write(data); !written) {
+				return std::unexpected{written.error()};
+			}
+			if (auto published = staged->publish(to_hex(name), publish_mode::replace); !published) {
+				return std::unexpected{published.error()};
+			}
+			return true;
+		}
 		fs::path const path = block_path(name);
 		for (unsigned attempt = 0; attempt < publish_attempts; ++attempt) {
 			// A file already under the name carries the content the name
@@ -212,6 +249,9 @@ namespace privateer {
 	}
 
 	result<> block_store::make_durable(std::span<block_digest const> names, sync_fan_out const &fan_out) {
+		if (distrust_all_) {
+			return fail(errc::io_error, "a failed durability barrier left its names unrecorded");
+		}
 		// the names this call owes a sync, each one once: a dedup hit puts the
 		// same name in several recipe entries
 		std::vector<block_digest> pending;
@@ -220,6 +260,12 @@ namespace privateer {
 		for (auto const &name : names) {
 			if (durable_.contains(name) || !seen.insert(name).second) {
 				continue;
+			}
+			if (distrusted_.contains(name)) {
+				// The file under this name is the one an earlier barrier
+				// failed on. Syncing it again reports success without moving
+				// a byte, so the name becomes durable only after a rewrite.
+				return fail(errc::io_error, "a block file whose durability barrier failed was not rewritten");
 			}
 			pending.push_back(name);
 			shard_set.insert(shard_byte(name));
@@ -249,7 +295,10 @@ namespace privateer {
 								fail_errno(errc::io_error, "open block for the durability barrier").error();
 						return;
 					}
-					auto synced = sync_file(fd);
+					auto synced = barrier_sync_fails(pending[index])
+										  ? result<>{std::unexpected{
+													error{errc::io_error, EIO, "sync a block file"}}}
+										  : sync_file(fd);
 					::close(fd);
 					if (!synced) {
 						failures[index] = synced.error();
@@ -268,6 +317,7 @@ namespace privateer {
 
 		for (auto const &failure : failures) {
 			if (failure) {
+				distrust(pending);
 				return std::unexpected{*failure};
 			}
 		}
@@ -275,6 +325,29 @@ namespace privateer {
 			durable_.insert(name);
 		}
 		return {};
+	}
+
+	void block_store::distrust(std::span<block_digest const> names) noexcept {
+		// Every name of the wave, whichever sync in it failed: a file sync
+		// that failed dropped the file's dirty pages, a directory sync that
+		// failed dropped the entry, and both errors reach only the open file
+		// the sync ran on. A rewrite writes a fresh file and links it under a
+		// fresh entry, so it answers both.
+		try {
+			for (auto const &name : names) {
+				distrusted_.insert(name);
+			}
+		} catch (...) {
+			distrust_all_ = true;
+		}
+	}
+
+	bool block_store::needs_rewrite(block_digest const &name) const noexcept {
+		return !distrusted_.empty() && distrusted_.contains(name);
+	}
+
+	void block_store::note_rewritten(block_digest const &name) {
+		distrusted_.erase(name);
 	}
 
 	void block_store::note_unsynced(block_digest const &name) {
@@ -346,6 +419,9 @@ namespace privateer {
 		}
 		durable_.erase(name);
 		candidates_.erase(name);
+		// a name with no file has nothing left to distrust: whoever publishes
+		// it next writes a fresh file anyway
+		distrusted_.erase(name);
 	}
 
 	void block_store::reclaim(sync_fan_out const &fan_out) {
@@ -405,6 +481,7 @@ namespace privateer {
 		for (auto const &batch : batches) {
 			for (auto const &name : batch.unlinked) {
 				durable_.erase(name);
+				distrusted_.erase(name);
 				if (batch.synced) {
 					candidates_.erase(name);
 				}

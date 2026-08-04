@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <privateer/block_store.hpp>
 #include <privateer/fault_handler.hpp>
 #include <privateer/file_util.hpp>
 #include <privateer/region.hpp>
@@ -19,12 +20,15 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <optional>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 // sanitizer detection: gcc defines __SANITIZE_*, clang answers __has_feature
 #ifdef __SANITIZE_THREAD__
@@ -75,13 +79,40 @@ namespace {
 		return ::mprotect(addr, len, prot);
 	}
 
+	// the durability-barrier seam: fails every block file sync while it is on
+	std::atomic<bool> g_barrier_fails{false};
+
+	// the inode of every file in the store, by file name: what tells a
+	// rewrite through a fresh file from a second sync of the same one
+	std::map<std::string, ino_t> store_inodes(fs::path const &segment_dir) {
+		std::map<std::string, ino_t> inodes;
+		for (auto const &shard : fs::directory_iterator{segment_dir / "blocks"}) {
+			for (auto const &entry : fs::directory_iterator{shard}) {
+				struct stat st {};
+				if (::stat(entry.path().c_str(), &st) == 0) {
+					inodes.emplace(entry.path().filename().string(), st.st_ino);
+				}
+			}
+		}
+		return inodes;
+	}
+
 	struct RegionCommitTest : ::testing::Test {
 		privateer::testing::temp_dir dir;
 		uint64_t const bs = page_size();
 
 		void TearDown() override {
 			detail_region::mprotect_fn = ::mprotect;
+			detail_block_store::barrier_sync_fails_fn = nullptr;
 			g_protect_fails.store(0);
+			g_barrier_fails.store(false);
+		}
+
+		// arms the barrier seam; it fails while g_barrier_fails is set
+		static void arm_barrier_seam() {
+			detail_block_store::barrier_sync_fails_fn = [](block_digest const &) {
+				return g_barrier_fails.load(std::memory_order_relaxed);
+			};
 		}
 
 		[[nodiscard]] region_options options() const {
@@ -664,6 +695,86 @@ namespace {
 		for (int round = 0; round < rounds; ++round) {
 			EXPECT_EQ(bytes(*reopened)[bs + static_cast<uint64_t>(round)], round + 1);
 		}
+	}
+
+	// A failed durability barrier drops the block's dirty pages and reports
+	// the error only to the file the sync ran on. A retry through a fresh
+	// descriptor over the same file therefore proves nothing about the
+	// device: the content must be written again, through a fresh file.
+	TEST_F(RegionCommitTest, ARetriedDurableCommitRewritesWhatTheBarrierFailedOn) {
+		auto reg = make_region(2);
+		bytes(reg)[0] = 'x';
+		bytes(reg)[bs] = 'y';
+
+		arm_barrier_seam();
+		g_barrier_fails.store(true);
+		auto const failed = reg.commit(true);
+		ASSERT_FALSE(failed.has_value());
+		EXPECT_EQ(failed.error().code, errc::io_error);
+		g_barrier_fails.store(false);
+
+		// the files the failed barrier left behind: one per slot, plus the
+		// segment file of the recipe the commit did not publish
+		auto const before = store_inodes(dir.path);
+		ASSERT_EQ(before.size(), 3u);
+
+		ASSERT_TRUE(reg.commit(true));
+		auto const after = store_inodes(dir.path);
+		ASSERT_EQ(after.size(), before.size());
+		for (auto const &[name, inode] : before) {
+			ASSERT_TRUE(after.contains(name)) << name;
+			EXPECT_NE(after.at(name), inode) << "name " << name << " was not written again";
+		}
+		EXPECT_EQ(detail_region::table_of(reg).dirty_slots(), 0u);
+		EXPECT_TRUE(reg.check_sanity());
+	}
+
+	// The slot the barrier failed on goes back to dirty, so the content it
+	// carries reaches the retry's write-out even though nothing changed it.
+	TEST_F(RegionCommitTest, ARetryRewritesEvenWhenTheContentAlreadyCarriesItsName) {
+		auto reg = make_region(1);
+		bytes(reg)[0] = 'x';
+		ASSERT_TRUE(reg.commit(false));  // published, no barrier owed yet
+		bytes(reg)[0] = 'x';             // dirty again, same content, same name
+
+		arm_barrier_seam();
+		g_barrier_fails.store(true);
+		ASSERT_FALSE(reg.commit(true).has_value());
+		g_barrier_fails.store(false);
+		auto const before = store_inodes(dir.path);
+
+		ASSERT_TRUE(reg.commit(true));
+		auto const after = store_inodes(dir.path);
+		for (auto const &[name, inode] : before) {
+			ASSERT_TRUE(after.contains(name)) << name;
+			EXPECT_NE(after.at(name), inode) << "name " << name << " was not written again";
+		}
+	}
+
+	TEST_F(RegionCommitTest, AFailedBarrierKeepsTheCommittedRecipeAndTheRetryPublishesIt) {
+		privateer::testing::build_committed_store(dir.path, bs, {'a', 'b'});
+		auto const committed = privateer::testing::manifest_records(dir.path);
+		{
+			auto reg = region::open(dir.path, options());
+			ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+			bytes(*reg)[bs] = 'c';
+
+			arm_barrier_seam();
+			g_barrier_fails.store(true);
+			ASSERT_FALSE(reg->commit(true).has_value());
+			g_barrier_fails.store(false);
+			// nothing was renamed, so the datastore still describes 'a' and 'b'
+			EXPECT_EQ(privateer::testing::manifest_records(dir.path), committed);
+
+			ASSERT_TRUE(reg->commit(true));
+			EXPECT_NE(privateer::testing::manifest_records(dir.path), committed);
+		}
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		EXPECT_EQ(bytes(*reopened)[0], 'a');
+		EXPECT_EQ(bytes(*reopened)[bs], 'c');
+		// the reopen sweep took the block the failed barrier left unreferenced
+		EXPECT_EQ(count_data_block_files(dir.path), 2u);
 	}
 
 	// The unsynchronized interleaving: a writer keeps dirtying slots while

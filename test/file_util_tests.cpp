@@ -230,4 +230,29 @@ namespace {
 		EXPECT_EQ(res.error().sys_errno, ENOENT);
 	}
 
+	TEST(FileUtil, TheTempSweepTakesTheLeftoversAndNothingElse) {
+		privateer::testing::temp_dir dir;
+		std::ofstream{dir.path / (std::string{temp_name_prefix} + "1234-0")} << "linkat leftover";
+		std::ofstream{dir.path / (std::string{temp_name_prefix} + "AbCdEf")} << "mkstemp leftover";
+		std::ofstream{dir.path / "_recipe"} << "a manifest";
+		std::ofstream{dir.path / ".hidden"} << "not a leftover";
+		std::filesystem::create_directory(dir.path / "blocks");
+
+		auto const removed = sweep_temp_files(dir.path);
+		ASSERT_TRUE(removed.has_value()) << to_string(removed.error());
+		EXPECT_EQ(*removed, 2u);
+		EXPECT_EQ(entries(dir.path), (std::vector<std::string>{".hidden", "_recipe", "blocks"}));
+
+		// a second pass finds nothing left
+		auto const again = sweep_temp_files(dir.path);
+		ASSERT_TRUE(again.has_value());
+		EXPECT_EQ(*again, 0u);
+	}
+
+	TEST(FileUtil, TheTempSweepReportsAMissingDirectory) {
+		auto const res = sweep_temp_files(std::filesystem::path{"/nonexistent/privateer-test"});
+		ASSERT_FALSE(res.has_value());
+		EXPECT_EQ(res.error().code, errc::io_error);
+	}
+
 }  // namespace

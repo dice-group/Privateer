@@ -29,6 +29,13 @@
 // durable names: every publish site notes its name, and the pruning after a
 // barrier removes only names that became durable. A name retired before it
 // was ever synced stays pending, because dedup can reference it again.
+//
+// A name whose durability barrier failed is distrusted. The failed sync
+// dropped the file's dirty pages and reported the error only to the open
+// file the sync ran on, so a barrier through a fresh descriptor over the
+// same file reports success and proves nothing. A distrusted name is never a
+// dedup target and never becomes durable; the way back is a rewrite through
+// a fresh file, which publish performs and which the next barrier covers.
 
 #include <privateer/block_hash.hpp>
 #include <privateer/error.hpp>
@@ -41,7 +48,24 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 
+#ifdef PRIVATEER_TEST_HOOKS
+#include <atomic>
+#endif
+
 namespace privateer {
+
+#ifdef PRIVATEER_TEST_HOOKS
+	// Test-only hooks, compiled in when the build includes the tests.
+	namespace detail_block_store {
+
+		// When set, decides whether the durability barrier's file sync for
+		// this name fails, the way fdatasync on a device error would. Tests
+		// use it to exercise the barrier's failure path. Atomic because a
+		// barrier wave reads it from the fan-out's threads.
+		extern std::atomic<bool (*)(block_digest const &name)> barrier_sync_fails_fn;
+
+	}  // namespace detail_block_store
+#endif  // PRIVATEER_TEST_HOOKS
 
 	struct block_store {
 		// Creates <segment_dir>/blocks with all shard directories. durable
@@ -62,7 +86,8 @@ namespace privateer {
 		// new file was created, false when an identical file already carried
 		// the name (dedup). A name that already has a file is answered by
 		// comparing that file, so a duplicate writes nothing. A different
-		// file under the name is a fatal hash_collision error. Thread-safe.
+		// file under the name is a fatal hash_collision error. A distrusted
+		// name skips the compare and replaces its file. Thread-safe.
 		result<bool> publish(block_digest const &name, std::span<std::byte const> data) const;
 
 		// path of the block file for a name, existing or not
@@ -81,10 +106,12 @@ namespace privateer {
 		// The durability barrier for a set of published names: syncs the file
 		// content and the shard directory entry of every name not yet in the
 		// durable-name set, then records the names. Nothing is recorded when
-		// any sync fails. The file syncs and the directory syncs of one call
-		// are independent and may run in one wave: a crash between them leaves
-		// a block file that no committed recipe names, which the open-time
-		// sweep removes.
+		// any sync fails; the names the failed wave covered are distrusted
+		// instead, and the call fails outright when one of the names it is
+		// asked to cover is distrusted already. The file syncs and the
+		// directory syncs of one call are independent and may run in one
+		// wave: a crash between them leaves a block file that no committed
+		// recipe names, which the open-time sweep removes.
 		result<> make_durable(std::span<block_digest const> names, sync_fan_out const &fan_out = {});
 
 		// Records a published name as one that owes a sync. A name already in
@@ -104,6 +131,20 @@ namespace privateer {
 		result<> make_pending_durable(sync_fan_out const &fan_out = {});
 
 		[[nodiscard]] bool is_durable(block_digest const &name) const;
+
+		// Whether the name's file must be written again before a recipe may
+		// reference it durably: a barrier failed on it and no rewrite
+		// followed. publish rewrites such a name instead of deduping against
+		// its file, and a caller that would skip the publish because the
+		// content already carries the name asks this first. Reading it beside
+		// running publishes is safe: only the barrier and the unlink paths
+		// change it, and the engine serializes those under its commit mutex.
+		[[nodiscard]] bool needs_rewrite(block_digest const &name) const noexcept;
+
+		// Ends the distrust of a name whose file a publish just rewrote.
+		// Bookkeeping owned by one caller at a time, the same rule as
+		// note_unsynced.
+		void note_rewritten(block_digest const &name);
 
 		// records a name as durable without syncing: open-time seeding, the
 		// verified consistency mark certifies the referenced blocks
@@ -145,11 +186,19 @@ namespace privateer {
 
 		[[nodiscard]] std::filesystem::path shard_path(block_digest const &name) const;
 
+		// records the names of a failed barrier wave as distrusted
+		void distrust(std::span<block_digest const> names) noexcept;
+
 		std::filesystem::path blocks_dir_;
 		boost::unordered_flat_set<block_digest, block_digest_hash> durable_;
 		boost::unordered_flat_set<block_digest, block_digest_hash> pending_;
 		boost::unordered_flat_map<block_digest, uint32_t, block_digest_hash> refcounts_;
 		boost::unordered_flat_set<block_digest, block_digest_hash> candidates_;
+		boost::unordered_flat_set<block_digest, block_digest_hash> distrusted_;
+		// Set when a failed barrier could not record its names. From then on
+		// every barrier fails: the store can no longer tell which of its
+		// files a barrier already failed on.
+		bool distrust_all_ = false;
 	};
 
 }  // namespace privateer

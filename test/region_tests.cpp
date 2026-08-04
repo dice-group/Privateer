@@ -5,6 +5,7 @@
 
 #include <privateer/block_store.hpp>
 #include <privateer/fault_handler.hpp>
+#include <privateer/file_util.hpp>
 #include <privateer/recipe.hpp>
 #include <privateer/region.hpp>
 #include <privateer/vm.hpp>
@@ -18,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <sys/resource.h>
@@ -171,6 +173,29 @@ namespace {
 
 		ASSERT_TRUE(region::open(dir.path).has_value());
 		EXPECT_FALSE(fs::exists(stray));
+	}
+
+	// The manifest is staged in the segment directory itself, so a commit
+	// killed between staging and rename leaves a temp file that no walk over
+	// the shards ever sees.
+	TEST_F(RegionTest, TheOpenSweepTakesTheStagedManifestLeftovers) {
+		build_store({'a'});
+		// the two shapes a staged manifest leaves: the linkat name of the
+		// replace path, and the mkstemp name of the named fallback
+		fs::path const linked = dir.path / (std::string{temp_name_prefix} + "4711-0");
+		fs::path const mkstemped = dir.path / (std::string{temp_name_prefix} + "Ab3Xy9");
+		std::ofstream{linked} << "half a manifest";
+		std::ofstream{mkstemped} << "half a manifest";
+
+		ASSERT_TRUE(region::open_read_only(dir.path).has_value());
+		EXPECT_TRUE(fs::exists(linked));  // read-only opens never mutate the datastore
+
+		auto reg = region::open(dir.path);
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		EXPECT_FALSE(fs::exists(linked));
+		EXPECT_FALSE(fs::exists(mkstemped));
+		EXPECT_TRUE(fs::exists(dir.path / recipe_file_name));  // the manifest itself stays
+		EXPECT_EQ(read_byte(*reg, 0), 'a');
 	}
 
 	TEST_F(RegionTest, ReadOnlyStrayWriteDies) {

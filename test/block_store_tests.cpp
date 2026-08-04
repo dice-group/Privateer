@@ -23,6 +23,7 @@
 #include <thread>
 #include <vector>
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 using namespace privateer;
@@ -44,6 +45,13 @@ namespace {
 	std::string read_file(fs::path const &path) {
 		std::ifstream in{path, std::ios::binary};
 		return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+	}
+
+	// the file's inode number, 0 when it does not exist: what tells a rewrite
+	// through a fresh file from a second sync of the same one
+	ino_t inode_of(fs::path const &path) {
+		struct stat st {};
+		return ::stat(path.c_str(), &st) == 0 ? st.st_ino : 0;
 	}
 
 	size_t file_count(fs::path const &blocks_dir) {
@@ -454,10 +462,89 @@ namespace {
 		EXPECT_EQ(barrier.error().code, errc::io_error);
 		EXPECT_FALSE(f.store.is_durable(name));
 
-		// both names are still pending: with the broken one unreferenced, the
-		// next barrier covers the other one
+		// Both names are still pending, and the wave the barrier attempted is
+		// distrusted: with the broken one unreferenced, the other one becomes
+		// durable through a rewrite and not through a second sync.
 		f.store.drop_reference(missing);
+		EXPECT_TRUE(f.store.needs_rewrite(name));
+		EXPECT_FALSE(f.store.make_pending_durable().has_value());
+		ASSERT_TRUE(f.store.publish(name, data));
+		f.store.note_rewritten(name);
 		ASSERT_TRUE(f.store.make_pending_durable());
+		EXPECT_TRUE(f.store.is_durable(name));
+	}
+
+	// A failed sync drops the file's dirty pages and reports the error only to
+	// the open file it ran on, so the same file synced through a fresh
+	// descriptor returns success while the device holds nothing.
+	TEST(BlockStore, ABarrierThatFailedIsNotAnsweredByASecondSync) {
+		store_fixture f;
+		auto const data = content("content the device never took");
+		auto const name = name_of(data);
+		ASSERT_TRUE(f.store.publish(name, data));
+		block_digest const names[] = {name};
+
+		detail_block_store::barrier_sync_fails_fn = [](block_digest const &) { return true; };
+		auto const barrier = f.store.make_durable(names);
+		detail_block_store::barrier_sync_fails_fn = nullptr;
+		ASSERT_FALSE(barrier.has_value());
+		EXPECT_EQ(barrier.error().code, errc::io_error);
+		EXPECT_FALSE(f.store.is_durable(name));
+
+		// the file is untouched and syncs cleanly now, and that proves nothing
+		auto const retried = f.store.make_durable(names);
+		ASSERT_FALSE(retried.has_value()) << "the name became durable without a rewrite";
+		EXPECT_EQ(retried.error().code, errc::io_error);
+		EXPECT_FALSE(f.store.is_durable(name));
+	}
+
+	TEST(BlockStore, ARewriteAfterAFailedBarrierGoesThroughAFreshFile) {
+		store_fixture f;
+		auto const data = content("content that gets written twice");
+		auto const name = name_of(data);
+		ASSERT_TRUE(f.store.publish(name, data));
+		block_digest const names[] = {name};
+
+		detail_block_store::barrier_sync_fails_fn = [](block_digest const &) { return true; };
+		ASSERT_FALSE(f.store.make_durable(names).has_value());
+		detail_block_store::barrier_sync_fails_fn = nullptr;
+		ASSERT_TRUE(f.store.needs_rewrite(name));
+
+		// the republish writes a fresh file instead of deduping against the
+		// one whose sync failed, byte-identical content and all
+		auto const before = inode_of(f.store.block_path(name));
+		auto const published = f.store.publish(name, data);
+		ASSERT_TRUE(published.has_value()) << to_string(published.error());
+		EXPECT_TRUE(*published);
+		EXPECT_NE(inode_of(f.store.block_path(name)), before);
+		EXPECT_EQ(read_file(f.store.block_path(name)), "content that gets written twice");
+		EXPECT_EQ(file_count(f.blocks_dir()), 1u);  // the replaced file is gone
+
+		f.store.note_rewritten(name);
+		EXPECT_FALSE(f.store.needs_rewrite(name));
+		ASSERT_TRUE(f.store.make_durable(names));
+		EXPECT_TRUE(f.store.is_durable(name));
+	}
+
+	// An unlinked file leaves nothing to distrust: the name has no file, so
+	// whoever publishes it next writes a fresh one anyway.
+	TEST(BlockStore, DiscardingADistrustedNameEndsItsDistrust) {
+		store_fixture f;
+		auto const data = content("published, unsynced, then dropped");
+		auto const name = name_of(data);
+		ASSERT_TRUE(f.store.publish(name, data));
+		block_digest const names[] = {name};
+
+		detail_block_store::barrier_sync_fails_fn = [](block_digest const &) { return true; };
+		ASSERT_FALSE(f.store.make_durable(names).has_value());
+		detail_block_store::barrier_sync_fails_fn = nullptr;
+
+		f.store.discard_unreferenced(name);
+		EXPECT_FALSE(fs::exists(f.store.block_path(name)));
+		EXPECT_FALSE(f.store.needs_rewrite(name));
+
+		ASSERT_TRUE(f.store.publish(name, data));
+		ASSERT_TRUE(f.store.make_durable(names));
 		EXPECT_TRUE(f.store.is_durable(name));
 	}
 
