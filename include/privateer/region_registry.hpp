@@ -65,8 +65,9 @@ namespace privateer {
 		// reach the record has left: publishes the new table, flips the gate
 		// epoch, drains the old epoch's gate counter, then drains both of the
 		// record's in-flight counters. Serialized by the registry mutex, so
-		// concurrent removes flip the epoch one at a time. Normal thread
-		// context only.
+		// concurrent removes flip the epoch one at a time. Takes no heap
+		// memory: the successor table's slot in the table list was reserved
+		// when the region was added. Normal thread context only.
 		void remove(region_record &rec) noexcept;
 
 		// Async-signal-safe lookup. On a hit the record's kind counter is
@@ -97,7 +98,13 @@ namespace privateer {
 		};
 
 		// allocates a table for count entries and keeps its buffer in tables_
-		result<table *> make_table(size_t count, bool lock = true);
+		result<table *> make_table(size_t count, bool lock = true) noexcept;
+
+		// Grows the table list to hold slots buffers. A capacity that
+		// already suffices makes this a no-op, so a caller that reserved
+		// ahead takes no memory here. An allocation failure is reported, not
+		// thrown: add must not throw and remove must not fail.
+		result<> reserve_tables(size_t slots) noexcept;
 
 		std::atomic<table *> current_{nullptr};
 		std::atomic<uint32_t> epoch_{0};
