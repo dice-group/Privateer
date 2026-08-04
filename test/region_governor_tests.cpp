@@ -26,11 +26,23 @@
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <sys/mman.h>
+
+#ifdef __linux__
+#include <sys/vfs.h>
+
+#ifndef TMPFS_MAGIC
+#define TMPFS_MAGIC 0x01021994
+#endif
+#ifndef RAMFS_MAGIC
+#define RAMFS_MAGIC 0x858458f6
+#endif
+#endif
 
 using namespace privateer;
 using namespace std::chrono_literals;
@@ -643,62 +655,106 @@ namespace {
 		EXPECT_EQ(bytes(*reopened)[0], 'A');
 	}
 
-	TEST_F(RegionResidentTest, RealPageoutEvictsCleanSlotsAndContentSurvives) {
-		// The real MADV_PAGEOUT against a disk-backed datastore: the test
-		// runs in the build tree's working directory, never on tmpfs, where
-		// PAGEOUT would no-op (see the deployment notes). The residency
-		// number is injected so the assertion does not depend on the
-		// process-wide Pss; the trim itself is real.
-		auto cwd_store = fs::current_path() / "privateer-governor-resident-test";
-		fs::remove_all(cwd_store);
-		privateer::testing::build_committed_store(cwd_store, bs, {'a', 'b', 'c', 'd'});
-		{
-			auto reg = region::open(cwd_store, resident_options(2 * bs, 0));
-			ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
-			for (size_t slot = 0; slot < 4; ++slot) {
-				scan_slot(*reg, slot, bs);
-			}
+	// Pages of a memory-backed filesystem (tmpfs, ramfs) need swap to leave
+	// memory, so MADV_PAGEOUT cannot evict them where there is no swap.
+	bool memory_backed(fs::path const &dir) {
+		struct statfs sb {};
+		if (::statfs(dir.c_str(), &sb) != 0) {
+			return false;
+		}
+		return sb.f_type == TMPFS_MAGIC || sb.f_type == RAMFS_MAGIC;
+	}
 
-			auto const resident_pages = [&](size_t slot) {
+	TEST_F(RegionResidentTest, RealPageoutEvictsCleanSlotsAndContentSurvives) {
+		// The real MADV_PAGEOUT against a datastore whose pages the kernel
+		// can drop. That needs a filesystem which is not memory-backed: the
+		// fixture's temp directory first, the build tree's working directory
+		// as the fallback. Both are mkdtemp'd, so concurrent runs of this
+		// binary keep their own store. The residency number is injected so
+		// the assertions do not depend on the process-wide Pss; the trim
+		// itself is real.
+		std::optional<privateer::testing::temp_dir> fallback;
+		fs::path store_dir = dir.path;
+		if (memory_backed(store_dir)) {
+			if (memory_backed(fs::current_path())) {
+				GTEST_SKIP() << "neither " << store_dir << " nor " << fs::current_path()
+							 << " is disk-backed; MADV_PAGEOUT evicts nothing there";
+			}
+			fallback.emplace(fs::current_path());
+			store_dir = fallback->path;
+		}
+		privateer::testing::build_committed_store(store_dir, bs, {'a', 'b', 'c', 'd'});
+		{
+			auto reg = region::open(store_dir, resident_options(2 * bs, 0));
+			ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+
+			// the page-cache residency of the four committed slots; nullopt
+			// when the query itself fails, which is not a residency of zero
+			int mincore_errno = 0;
+			auto const resident_pages = [&]() -> std::optional<size_t> {
 				std::vector<unsigned char> vec(bs / page_size());
-				auto *const addr = static_cast<std::byte *>(reg->segment()) + slot * bs;
-				if (::mincore(addr, bs, vec.data()) != 0) {
-					return size_t{0};
-				}
 				size_t pages = 0;
-				for (unsigned char const flags : vec) {
-					pages += flags & 1;
+				for (size_t slot = 0; slot < 4; ++slot) {
+					auto *const addr = static_cast<std::byte *>(reg->segment()) + slot * bs;
+					if (::mincore(addr, bs, vec.data()) != 0) {
+						mincore_errno = errno;
+						return std::nullopt;
+					}
+					for (unsigned char const flags : vec) {
+						pages += flags & 1;
+					}
 				}
 				return pages;
 			};
-			size_t const before = resident_pages(0);
-			ASSERT_GT(before, 0u);
 
 			detail_region::resident_bytes_fn = [] { return result<uint64_t>{g_resident.load()}; };
 			g_resident.store(1000 * bs);  // force a full trim; PAGEOUT stays real
-			EXPECT_GT(detail_region::run_resident_sweep(), 0u);
-			// The kernel may serve one PAGEOUT partially under load, so the
-			// poll keeps sweeping; any eviction proves the trim works.
-			EXPECT_TRUE(eventually([&] {
-				if (resident_pages(0) < before) {
-					return true;
+
+			// One round reads the clean slots in, sweeps, and counts what
+			// stayed. Page-cache residency belongs to the kernel: it can be
+			// gone before a round starts, and PAGEOUT may refuse a folio
+			// that was just referenced. A round that proves nothing runs
+			// again; the proof is one round where the sweep reported a trim
+			// and residency dropped across it.
+			size_t before = 0;
+			size_t after = 0;
+			uint64_t asked = 0;
+			bool const evicted = eventually([&] {
+				for (size_t slot = 0; slot < 4; ++slot) {
+					scan_slot(*reg, slot, bs);
 				}
-				(void) detail_region::run_resident_sweep();
-				return resident_pages(0) < before;
-			})) << "PAGEOUT did not evict; tmpfs working directory?";
+				auto const resident = resident_pages();
+				if (!resident || *resident == 0) {
+					return false;
+				}
+				before = *resident;
+				asked = detail_region::run_resident_sweep();
+				if (asked == 0) {
+					return false;
+				}
+				auto const left = resident_pages();
+				if (!left) {
+					return false;
+				}
+				after = *left;
+				return after < before;
+			});
+			EXPECT_TRUE(evicted) << "PAGEOUT evicted nothing in " << store_dir << ": resident pages "
+								 << before << " -> " << after << ", the sweep asked for " << asked
+								 << " bytes, last mincore errno " << mincore_errno;
 
 			// evicted pages fault back in from the block files unchanged
-			EXPECT_EQ(bytes(*reg)[0], 'a');
-			EXPECT_EQ(bytes(*reg)[bs], 'b');
+			for (size_t slot = 0; slot < 4; ++slot) {
+				EXPECT_EQ(bytes(*reg)[slot * bs], static_cast<unsigned char>('a' + slot));
+			}
 			bytes(*reg)[0] = 'A';
 			EXPECT_TRUE(reg->commit(true));
 		}
 		{
-			auto reopened = region::open(cwd_store);
+			auto reopened = region::open(store_dir);
 			ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
 			EXPECT_EQ(bytes(*reopened)[0], 'A');
 		}
-		fs::remove_all(cwd_store);
 	}
 
 #endif  // __linux__
