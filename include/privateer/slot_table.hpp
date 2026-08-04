@@ -117,14 +117,18 @@ namespace privateer {
 												  int64_t timeout_ns) noexcept;
 
 		// Dirty accounting, slot-granular: a slot counts from the moment a
-		// faulting writer wins its materializing claim until it leaves dirty
-		// or materializing for a terminal state.
+		// writer wins its materializing claim until the actor that takes the
+		// slot out of dirty has released it. A slot a write-out captured
+		// keeps counting while it is syncing, until the write-out publishes
+		// clean, so the count covers the private pages a running commit is
+		// still retiring.
 		[[nodiscard]] uint64_t dirty_slots() const noexcept;
 		// Increments and returns the new count, so the caller can detect
 		// the exact crossing of a watermark.
 		uint64_t add_dirty() noexcept;
 		// Decrements, then bumps the governor word and wakes it: writers
-		// blocked on the dirty budget recheck on every decrease.
+		// blocked on the dirty budget recheck on every decrease. The
+		// decrement stops at zero, so the count never wraps.
 		void sub_dirty() noexcept;
 
 		// The word the governor's waiters park on. Waiting and waking go

@@ -5,6 +5,8 @@
 
 #include <privateer/handler_text.hpp>
 
+#include <cerrno>
+
 #include <time.h>
 
 namespace privateer {
@@ -19,13 +21,29 @@ namespace privateer {
 
 	}  // namespace
 
-	result<region_registry::table *> region_registry::make_table(size_t count, bool lock) {
+	result<> region_registry::reserve_tables(size_t slots) noexcept {
+		if (tables_.capacity() >= slots) {
+			return {};
+		}
+		try {
+			tables_.reserve(slots);
+		} catch (...) {
+			return std::unexpected{error{errc::io_error, ENOMEM, "region registry table list"}};
+		}
+		return {};
+	}
+
+	result<region_registry::table *> region_registry::make_table(size_t count, bool lock) noexcept {
+		if (auto room = reserve_tables(tables_.size() + 1); !room) {
+			return std::unexpected{room.error()};
+		}
 		auto buf = mlocked_buffer::allocate(sizeof(table) + count * sizeof(entry), lock);
 		if (!buf) {
 			return std::unexpected{buf.error()};
 		}
 		auto *t = static_cast<table *>(buf->addr());
 		t->count = count;
+		// the slot is there, so keeping the buffer takes no memory and cannot throw
 		tables_.push_back(std::move(*buf));
 		return t;
 	}
@@ -45,6 +63,12 @@ namespace privateer {
 			}
 		}
 
+		// remove() must not fail and must not throw, so the successor table
+		// it builds finds its slot in the table list already there: every
+		// registered region keeps one spare slot, reserved here.
+		if (auto room = reserve_tables(tables_.size() + old_count + 2); !room) {
+			return std::unexpected{room.error()};
+		}
 		auto t = make_table(old_count + 1);
 		if (!t) {
 			return std::unexpected{t.error()};
@@ -77,12 +101,14 @@ namespace privateer {
 			return;
 		}
 
-		// The successor table needs one small allocation. remove must not
-		// fail (close depends on it), so a memory allocation failure is
-		// retried; a process unable to allocate a few hundred bytes is lost
-		// anyway. A failed mlock is not transient: RLIMIT_MEMLOCK is
-		// exhausted and stays so. The table is then left unlocked, trading
-		// the handler's reclaimed-page hazard for a close that terminates.
+		// The successor table needs one small mapping; its slot in the table
+		// list is the spare the matching add reserved, so nothing here takes
+		// heap memory. remove must not fail (close depends on it), so a
+		// memory allocation failure is retried; a process unable to allocate
+		// a few hundred bytes is lost anyway. A failed mlock is not
+		// transient: RLIMIT_MEMLOCK is exhausted and stays so. The table is
+		// then left unlocked, trading the handler's reclaimed-page hazard
+		// for a close that terminates.
 		table *next = nullptr;
 		bool lock_table = true;
 		for (;;) {

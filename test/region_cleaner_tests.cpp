@@ -63,6 +63,12 @@ namespace {
 	// the injected cleaner clock; tests advance it by hand
 	std::atomic<int64_t> g_now{0};
 
+	// what a seam saw while the cleaner held a slot claimed; the seams take
+	// no state of their own
+	std::atomic<slot_table *> g_watched_table{nullptr};
+	std::atomic<uint32_t> g_state_in_write{0};
+	std::atomic<uint64_t> g_dirty_in_write{0};
+
 	// the inode of a file, 0 when it does not exist: what tells a rewrite
 	// through a fresh file from a second sync of the same one
 	ino_t inode_of(fs::path const &path) {
@@ -160,6 +166,38 @@ namespace {
 		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
 		EXPECT_EQ(bytes(*reopened)[0], 'a');
 		EXPECT_EQ(bytes(*reopened)[bs], 'y');
+	}
+
+	// What the dirty count covers: a slot a write-out captured keeps counting
+	// while it is syncing, and the release that publishes clean is what takes
+	// it out. The budget therefore also holds dirt a write-out is retiring,
+	// which is what the hard watermark stalls writers on.
+	TEST_F(RegionCleanerTest, ACapturedSlotCountsUntilTheWriteOutReleasesIt) {
+		privateer::testing::build_committed_store(dir.path, bs, {'x'});
+		auto reg = region::open(dir.path, options(cleaner_mode::non_durable));
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		auto &table = detail_region::table_of(*reg);
+		bytes(*reg)[0] = 'a';
+		ASSERT_EQ(table.dirty_slots(), 1u);
+
+		// the write seam runs with the slot claimed, the one point from which
+		// the state and the count of a captured slot are visible
+		g_watched_table.store(&table);
+		g_state_in_write.store(static_cast<uint32_t>(slot_state::empty));
+		g_dirty_in_write.store(0);
+		detail_region::cleaner_write_fails_fn = [](size_t slot) {
+			auto *const watched = g_watched_table.load();
+			g_state_in_write.store(static_cast<uint32_t>(watched->load(slot)));
+			g_dirty_in_write.store(watched->dirty_slots());
+			return false;  // the write itself proceeds
+		};
+		EXPECT_EQ(detail_region::run_cleaner_batch(*reg, false), 1u);
+		detail_region::cleaner_write_fails_fn = nullptr;
+
+		EXPECT_EQ(static_cast<slot_state>(g_state_in_write.load()), slot_state::syncing);
+		EXPECT_EQ(g_dirty_in_write.load(), 1u);
+		EXPECT_EQ(table.load(0), slot_state::clean);
+		EXPECT_EQ(table.dirty_slots(), 0u);
 	}
 
 	TEST_F(RegionCleanerTest, ACleanedSlotThatRedirtiesIsRecapturedWithFinalContent) {

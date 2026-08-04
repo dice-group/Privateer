@@ -59,6 +59,15 @@ target_include_directories(privateer_barrier_tests PRIVATE ${CMAKE_CURRENT_SOURC
 target_link_libraries(privateer_barrier_tests PRIVATE privateer::privateer GTest::gtest_main Threads::Threads)
 gtest_discover_tests(privateer_barrier_tests PROPERTIES TIMEOUT ${PRIVATEER_TEST_TIMEOUT})
 
+# own binary: it replaces the global allocation functions to count them and
+# to make them fail, which no other test may run under
+add_executable(privateer_registry_alloc_tests
+        registry_alloc_tests.cpp
+        support/sanitizer_options.cpp)
+target_include_directories(privateer_registry_alloc_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(privateer_registry_alloc_tests PRIVATE privateer::privateer GTest::gtest_main)
+gtest_discover_tests(privateer_registry_alloc_tests PROPERTIES TIMEOUT ${PRIVATEER_TEST_TIMEOUT})
+
 # own binary: the combined long-running soak; excluded from CI by its label,
 # run locally with ctest -L long_running (PRIVATEER_SOAK_SECONDS stretches it)
 add_executable(privateer_soak_tests region_soak_tests.cpp)
