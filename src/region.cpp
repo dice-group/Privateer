@@ -97,6 +97,10 @@ namespace privateer {
 			slot_table table;
 			std::atomic<uint32_t> error{0};
 			std::atomic<uint32_t> closing{0};
+			// Region calls between their entry and their exit. Close waits it
+			// to zero, so a call that entered before closing was stored keeps
+			// the state it works with alive until it is done.
+			std::atomic<uint32_t> calls_in_flight{0};
 			// Count of slots in poisoned state, the recovery cue: the handler
 			// increments when it poisons, every heal decrements. The governed
 			// cleaner runs a batch whenever it is nonzero, so recovery does
@@ -119,6 +123,35 @@ namespace privateer {
 			std::atomic<uint64_t> stat_cleaned{0};
 			std::atomic<uint64_t> stat_redirtied{0};
 			std::atomic<uint64_t> stat_stalls{0};
+		};
+
+		// The entry handshake of the region calls that work with state a
+		// close tears down. Both sides are seq_cst: with weaker orderings the
+		// counter increment and the closing store could each miss the other
+		// (the store-buffer case) and the call would proceed into teardown.
+		// A call that finds the flag set returns shutting_down; one that
+		// entered before it was stored is waited out by close.
+		struct call_guard {
+			explicit call_guard(region_hot &hot) noexcept : hot_{hot} {
+				hot_.calls_in_flight.fetch_add(1, std::memory_order_seq_cst);
+			}
+
+			~call_guard() {
+				// the wake releases a close already waiting on the counter
+				if (hot_.calls_in_flight.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+					word_wake_all(hot_.calls_in_flight);
+				}
+			}
+
+			call_guard(call_guard const &) = delete;
+			call_guard &operator=(call_guard const &) = delete;
+
+			[[nodiscard]] bool closing() const noexcept {
+				return hot_.closing.load(std::memory_order_seq_cst) != 0;
+			}
+
+		private:
+			region_hot &hot_;
 		};
 
 		// the resident sweep's default probe: the process Pss
@@ -735,6 +768,20 @@ namespace privateer {
 			}
 		}
 
+		// Waits until every region call that entered before the closing flag
+		// was stored has left. This is the half of the shutdown handshake
+		// that covers a call which has not reached a mutex yet, so no mutex
+		// is destroyed under a caller waiting on it.
+		void join_calls() {
+			for (;;) {
+				uint32_t const in_flight = hot->calls_in_flight.load(std::memory_order_acquire);
+				if (in_flight == 0) {
+					return;
+				}
+				(void) word_wait(hot->calls_in_flight, in_flight);
+			}
+		}
+
 		[[nodiscard]] std::byte *segment_base() const noexcept {
 			return static_cast<std::byte *>(reservation.addr()) + header_bytes;
 		}
@@ -1320,6 +1367,14 @@ namespace privateer {
 				cancel_timers();
 				join_tasks();
 				resident_sweeper_unregister(this);
+				// Waits out a straggling call: the mutexes wait out one that
+				// is inside its work, the counter also covers one that
+				// entered and has not taken a mutex yet. Only then may the
+				// state the calls work with go away.
+				{
+					std::scoped_lock const straggler_lock{commit_mutex, region_mutex};
+				}
+				join_calls();
 				if (registered) {
 					global_registry().remove(hot->record);
 				}
@@ -1966,6 +2021,11 @@ namespace privateer {
 		if (st.read_only) {
 			return fail(errc::invalid_argument, "extend on a read-only region");
 		}
+		// the shutdown handshake, before the mutex a close takes as well
+		call_guard const in_flight{*st.hot};
+		if (in_flight.closing()) {
+			return fail(errc::shutting_down, "extend on a closing region");
+		}
 		std::lock_guard lock{st.region_mutex};
 		uint64_t const current = st.hot->table.extended_size();
 		if (target_size <= current) {
@@ -2086,6 +2146,11 @@ namespace privateer {
 			// without a read-only guard; a shared-locked datastore is never
 			// mutated, so this succeeds untouched
 			return {};
+		}
+		// the shutdown handshake, before the mutex a close takes as well
+		call_guard const in_flight{*st.hot};
+		if (in_flight.closing()) {
+			return fail(errc::shutting_down, "commit on a closing region");
 		}
 		std::lock_guard const commit_lock{st.commit_mutex};
 		return commit_impl(durable);
@@ -2570,6 +2635,11 @@ namespace privateer {
 
 	result<> region::snapshot_to(fs::path const &staging_segment_dir) {
 		auto &st = *state_;
+		// the shutdown handshake, before the mutex a close takes as well
+		call_guard const in_flight{*st.hot};
+		if (in_flight.closing()) {
+			return fail(errc::shutting_down, "snapshot_to on a closing region");
+		}
 		// Held across the commit and the link pass: a durable commit in
 		// between could reclaim a block the just-committed recipe still
 		// references, and the links would hit ENOENT.

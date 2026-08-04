@@ -24,7 +24,9 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <string>
 #include <thread>
+#include <utility>
 
 using namespace privateer;
 using namespace std::chrono_literals;
@@ -42,9 +44,38 @@ namespace {
 		return condition();
 	}
 
+	// the straggling commit: the phase hook holds it inside the region until
+	// the test lets go
+	std::atomic<bool> g_in_phase{false};
+	std::atomic<bool> g_release{false};
+
+	void hold_after_capture(int completed_phase) {
+		if (completed_phase != 1) {
+			return;
+		}
+		g_in_phase.store(true, std::memory_order_release);
+		while (!g_release.load(std::memory_order_acquire)) {
+			std::this_thread::sleep_for(1ms);
+		}
+	}
+
+	// what a call reported, as text: the name of its error, or "ok"
+	std::string outcome(result<> const &res) {
+		return res ? "ok" : name(res.error().code);
+	}
+
 	struct RegionCloseTest : ::testing::Test {
 		privateer::testing::temp_dir dir;
 		uint64_t const bs = page_size();
+
+		void SetUp() override {
+			g_in_phase.store(false);
+			g_release.store(false);
+		}
+
+		void TearDown() override {
+			detail_region::commit_phase_hook = nullptr;
+		}
 
 		static unsigned char volatile *bytes(region &reg) {
 			return static_cast<unsigned char volatile *>(reg.segment());
@@ -78,9 +109,9 @@ namespace {
 			region_registry::release(*rec, region_registry::in_flight_kind::handler);
 			handled.store(took ? 1 : 0, std::memory_order_release);
 		}};
-		ASSERT_TRUE(eventually([&] { return entered.load(std::memory_order_acquire); }));
+		EXPECT_TRUE(eventually([&] { return entered.load(std::memory_order_acquire); }));
 		std::this_thread::sleep_for(50ms);
-		ASSERT_EQ(handled.load(std::memory_order_acquire), -1) << "the writer left the fault path";
+		EXPECT_EQ(handled.load(std::memory_order_acquire), -1) << "the writer left the fault path";
 
 		std::atomic<bool> closed{false};
 		std::thread closer{[&] {
@@ -100,6 +131,54 @@ namespace {
 		// quiesced, and the process-wide handler turns the forwarded fault
 		// into the crash that says so.
 		EXPECT_EQ(handled.load(std::memory_order_acquire), 0);
+	}
+
+	// A commit works with the state close destroys: the recipe table, the
+	// store, and the reservation its write-out remaps. Close waits out the
+	// commit that is already inside, and every call that arrives after the
+	// closing flag was stored is refused instead of running into the
+	// teardown.
+	TEST_F(RegionCloseTest, CloseWaitsOutACommitAndRefusesTheCallsThatFollow) {
+		privateer::testing::build_committed_store(dir.path, bs, {'a', 'b'});
+		auto reg = region::open(dir.path);
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		std::optional<region> held{std::move(*reg)};
+		region &live = *held;
+		bytes(live)[0] = 'x';
+
+		detail_region::commit_phase_hook = hold_after_capture;
+		std::atomic<int> committed{-1};
+		std::thread committer{
+				[&] { committed.store(live.commit(false) ? 1 : 0, std::memory_order_release); }};
+		EXPECT_TRUE(eventually([&] { return g_in_phase.load(std::memory_order_acquire); }));
+
+		std::atomic<bool> closed{false};
+		std::thread closer{[&] {
+			held.reset();
+			closed.store(true, std::memory_order_release);
+		}};
+		std::this_thread::sleep_for(300ms);
+		EXPECT_FALSE(closed.load(std::memory_order_acquire))
+				<< "close returned while a commit still held the region's state";
+
+		// the closing flag is stored before close waits, so the calls that
+		// arrive now are refused without ever reaching a mutex
+		EXPECT_TRUE(eventually([&] { return outcome(live.extend(bs)) == "shutting_down"; }));
+		EXPECT_EQ(outcome(live.commit(false)), "shutting_down");
+		EXPECT_EQ(outcome(live.snapshot_to(dir.path / "snapshot")), "shutting_down");
+
+		g_release.store(true, std::memory_order_release);
+		committer.join();
+		closer.join();
+		EXPECT_EQ(committed.load(std::memory_order_acquire), 1);
+		EXPECT_TRUE(closed.load(std::memory_order_acquire));
+
+		// the straggler ran to its end, so its content is what the datastore
+		// holds
+		auto reopened = region::open_read_only(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		EXPECT_EQ(bytes(*reopened)[0], 'x');
+		EXPECT_EQ(bytes(*reopened)[bs], 'b');
 	}
 
 }  // namespace
