@@ -405,14 +405,18 @@ namespace privateer {
 
 	namespace {
 
+		// How long the fault path parks on one transient claim before it
+		// looks at the closing flag again. Close leaves every slot state as
+		// it is, so a wait that only ends on a state change would sleep
+		// through a close that finds a claim its owner never released, and
+		// close would wait for that fault to leave the handler forever.
+		constexpr int64_t transient_wait_ns = 1'000'000;
+
 		// The fault path. Runs in the process-wide handler with the record's
 		// in-flight counter held; everything it touches is mlocked, and every
 		// call it makes is async-signal-safe.
 		PRIVATEER_HANDLER_TEXT bool region_on_fault(region_record &rec, uintptr_t addr, int) {
 			auto &hot = *static_cast<region_hot *>(rec.context);
-			if (hot.closing.load(std::memory_order_acquire) != 0) {
-				return false;  // the application must have quiesced; fail loudly
-			}
 			uint64_t const offset = addr - hot.segment_start;
 			if (offset >= hot.table.extended_size()) {
 				return false;  // beyond the extended size: a genuine wild access
@@ -424,6 +428,14 @@ namespace privateer {
 			int64_t gate_deadline = -1;
 			int64_t poison_deadline = -1;
 			for (;;) {
+				// Every wait below is bounded and comes back through here, so
+				// this covers a fault that arrives once close began and one
+				// whose wait outlives the close: the application must have
+				// quiesced its readers and writers, and a fault that has not
+				// fails loudly.
+				if (hot.closing.load(std::memory_order_acquire) != 0) {
+					return false;
+				}
 				slot_state const state = hot.table.load(slot);
 				switch (state) {
 					case slot_state::empty:
@@ -508,9 +520,14 @@ namespace privateer {
 						// Wait out the transient, then retry the instruction;
 						// the retry classifies itself: a read succeeds against
 						// the restored mapping, a write re-faults into the
-						// claim path.
-						(void) hot.table.wait_changed(slot, state);
-						return true;
+						// claim path. The wait is timed: a claim its owner
+						// never released would park this thread for the
+						// region's lifetime, and the loop above is where that
+						// is noticed.
+						if (hot.table.wait_changed_for(slot, state, transient_wait_ns) != state) {
+							return true;
+						}
+						continue;  // still claimed: re-examine
 					case slot_state::dirty:
 						// Writable by publish-after-protect, so this is a
 						// stale TLB entry or a benign race with a fresh
@@ -1292,6 +1309,11 @@ namespace privateer {
 				// contract violation).
 				hot->closing.store(1, std::memory_order_seq_cst);
 				hot->table.wake_governor();
+				// A writer waiting out a slot's transient claim parks on that
+				// slot's own word, which the governor wake does not touch.
+				// This releases the ones already parked; the timed wait of
+				// the fault path covers one that parks after this pass.
+				hot->table.wake_slot_waiters(hot->table.extended_size() / hot->block_size);
 				// Tasks that have not started yet run as no-ops; timer
 				// handlers complete with aborted set. The join waits both
 				// kinds out, so nothing touches the region past this point.

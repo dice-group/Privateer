@@ -135,6 +135,16 @@ namespace privateer {
 		word_wake_all(head()->governor);
 	}
 
+	void slot_table::wake_slot_waiters(size_t slots_in_use) noexcept {
+		size_t const end = std::min(slots_in_use, count_);
+		for (size_t slot = 0; slot < end; ++slot) {
+			slot_state const state = load(slot);
+			if (is_transient(state) || state == slot_state::poisoned) {
+				word_wake_all(states()[slot]);
+			}
+		}
+	}
+
 	PRIVATEER_HANDLER_TEXT std::atomic<uint32_t> &slot_table::governor_word() noexcept {
 		return head()->governor;
 	}
