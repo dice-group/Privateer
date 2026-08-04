@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <thread>
@@ -535,7 +536,44 @@ namespace {
 
 	// the injected residency and trim seams
 	std::atomic<uint64_t> g_resident{0};
+
+	// How often the injected residency probe ran: one count per sweep pass
+	// that got as far as reading residency, whichever thread drove it. A
+	// periodic pass runs on a pool thread, so the count is atomic.
+	std::atomic<int> g_probe_calls{0};
+
+	result<uint64_t> injected_resident() {
+		g_probe_calls.fetch_add(1);
+		return result<uint64_t>{g_resident.load()};
+	}
+
+	// The addresses the injected trim seam saw. A periodic pass pushes from
+	// a pool thread, so the vector has its own lock.
+	std::mutex g_pageout_mutex;
 	std::vector<void *> g_pageout_calls;
+
+	void note_pageout(void *addr) {
+		std::lock_guard const lock{g_pageout_mutex};
+		g_pageout_calls.push_back(addr);
+	}
+
+	std::vector<void *> pageout_calls() {
+		std::lock_guard const lock{g_pageout_mutex};
+		return g_pageout_calls;
+	}
+
+	// the trim seam of the tests that only need to know a pass trimmed
+	std::atomic<int> g_trim_calls{0};
+
+	int counting_pageout(void *, size_t) {
+		g_trim_calls.fetch_add(1);
+		return 0;
+	}
+
+	// The seam values the store loop installs. The loop takes them from
+	// here, so its stores cannot be lifted out of it.
+	std::atomic<result<uint64_t> (*)()> g_stored_resident{injected_resident};
+	std::atomic<int (*)(void *, size_t)> g_stored_pageout{counting_pageout};
 
 	struct RegionResidentTest : ::testing::Test {
 		privateer::testing::temp_dir dir;
@@ -545,7 +583,12 @@ namespace {
 
 		void SetUp() override {
 			g_resident.store(0);
-			g_pageout_calls.clear();
+			g_probe_calls.store(0);
+			g_trim_calls.store(0);
+			{
+				std::lock_guard const lock{g_pageout_mutex};
+				g_pageout_calls.clear();
+			}
 			real_resident_ = detail_region::resident_bytes_fn;
 			real_pageout_ = detail_region::pageout_fn;
 		}
@@ -587,23 +630,24 @@ namespace {
 		}
 		bytes(*reg)[3 * bs] = 'D';  // slot 3 turns dirty: never a victim
 
-		detail_region::resident_bytes_fn = [] { return result<uint64_t>{g_resident.load()}; };
+		detail_region::resident_bytes_fn = injected_resident;
 		detail_region::pageout_fn = [](void *addr, size_t) {
-			g_pageout_calls.push_back(addr);
+			note_pageout(addr);
 			return 0;
 		};
 
 		// below the soft mark: the sweep does nothing
 		g_resident.store(bs);
 		EXPECT_EQ(detail_region::run_resident_sweep(), 0u);
-		EXPECT_TRUE(g_pageout_calls.empty());
+		EXPECT_TRUE(pageout_calls().empty());
 
 		// far above: every clean victim is asked out, the dirty slot never
 		g_resident.store(1000 * bs);
 		EXPECT_GT(detail_region::run_resident_sweep(), 0u);
-		EXPECT_EQ(g_pageout_calls.size(), 3u);
+		auto const calls = pageout_calls();
+		EXPECT_EQ(calls.size(), 3u);
 		auto *const base = static_cast<std::byte *>(reg->segment());
-		for (void *const addr : g_pageout_calls) {
+		for (void *const addr : calls) {
 			EXPECT_NE(addr, base + 3 * bs);
 		}
 	}
@@ -615,14 +659,14 @@ namespace {
 			ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
 			scan_slot(*reg, 0, bs);
 		}  // close removes the entry under the sweep mutex
-		detail_region::resident_bytes_fn = [] { return result<uint64_t>{g_resident.load()}; };
+		detail_region::resident_bytes_fn = injected_resident;
 		detail_region::pageout_fn = [](void *addr, size_t) {
-			g_pageout_calls.push_back(addr);
+			note_pageout(addr);
 			return 0;
 		};
 		g_resident.store(1000 * bs);
 		EXPECT_EQ(detail_region::run_resident_sweep(), 0u);
-		EXPECT_TRUE(g_pageout_calls.empty());
+		EXPECT_TRUE(pageout_calls().empty());
 	}
 
 	// the counting, failing residency probe of the disable test
@@ -653,6 +697,94 @@ namespace {
 		auto reopened = region::open(dir.path);
 		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
 		EXPECT_EQ(bytes(*reopened)[0], 'A');
+	}
+
+	TEST_F(RegionResidentTest, TheHookPassLeavesLaterRegionsWithAPeriodicSweep) {
+		// The periodic sweep is process-wide state shared by every region.
+		// Neither a pass driven by hand nor a region that came before may
+		// decide whether a region registered later is swept.
+		detail_region::resident_bytes_fn = injected_resident;
+		g_resident.store(bs);  // below the soft mark: a pass probes and stops
+		privateer::testing::build_committed_store(dir.path, bs, {'a', 'b'});
+		{
+			auto reg = region::open(dir.path, resident_options(2 * bs, 0));
+			ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+			scan_slot(*reg, 0, bs);
+			EXPECT_EQ(detail_region::run_resident_sweep(), 0u);
+			EXPECT_EQ(g_probe_calls.load(), 1);
+		}  // close: the sweeper holds no entry any more
+
+		// A region registered after all of that, asking for a short
+		// interval. Its passes have to come on their own.
+		privateer::testing::temp_dir later;
+		privateer::testing::build_committed_store(later.path, bs, {'a', 'b'});
+		auto opts = resident_options(2 * bs, 0);
+		opts.governor.sweep_interval = 5ms;
+		auto reg = region::open(later.path, opts);
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		scan_slot(*reg, 0, bs);
+		int const before = g_probe_calls.load();
+		EXPECT_TRUE(eventually([&] { return g_probe_calls.load() >= before + 3; }, 30s))
+				<< "the periodic sweep never ran for this region: " << g_probe_calls.load() - before
+				<< " passes";
+	}
+
+	TEST_F(RegionResidentTest, AnAllocationFailureInAPassEndsTheChainNotTheProcess) {
+		// A pass allocates: the residency probe reads procfs into a string,
+		// and the pass builds a victim plan per region. The failure runs out
+		// of a pool thread, where an unguarded one takes the process down.
+		// The budget is advisory, so the chain ends and the kernel's own
+		// reclaim remains.
+		privateer::testing::build_committed_store(dir.path, bs, {'a', 'b'});
+		detail_region::resident_bytes_fn = []() -> result<uint64_t> {
+			g_probe_calls.fetch_add(1);
+			throw std::bad_alloc{};
+		};
+		auto opts = resident_options(2 * bs, 0);
+		opts.governor.sweep_interval = 5ms;
+		auto reg = region::open(dir.path, opts);
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		scan_slot(*reg, 0, bs);
+		ASSERT_TRUE(eventually([] { return g_probe_calls.load() > 0; }, 30s));
+
+		// the failed pass ended the chain: no pass follows it
+		int const passes = g_probe_calls.load();
+		std::this_thread::sleep_for(200ms);  // 40 intervals
+		EXPECT_EQ(g_probe_calls.load(), passes);
+
+		// the process is alive and the region is healthy
+		EXPECT_TRUE(reg->check_sanity());
+		bytes(*reg)[0] = 'A';
+		EXPECT_TRUE(reg->commit(true));
+	}
+
+	TEST_F(RegionResidentTest, TheSweepSeamsTakeStoresWhilePassesRun) {
+		// The tests here replace the seams while a region is open and its
+		// sweep chain runs, so a pass reads the pointers on a pool thread
+		// while the test thread stores them. Both sides go through
+		// std::atomic; plain pointers make this a data race, which TSan
+		// reports.
+		privateer::testing::build_committed_store(dir.path, bs, {'a', 'b', 'c', 'd'});
+		detail_region::resident_bytes_fn = injected_resident;
+		detail_region::pageout_fn = counting_pageout;
+		auto opts = resident_options(2 * bs, 0);
+		opts.governor.sweep_interval = 1ms;
+		auto reg = region::open(dir.path, opts);
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		for (size_t slot = 0; slot < 4; ++slot) {
+			scan_slot(*reg, slot, bs);  // resident and clean: every pass trims them
+		}
+		g_resident.store(1000 * bs);  // far above the soft mark: every pass reads both seams
+
+		ASSERT_TRUE(eventually([] { return g_probe_calls.load() > 0; }, 30s));
+		int const start = g_probe_calls.load();
+		auto const deadline = std::chrono::steady_clock::now() + 30s;
+		while (g_probe_calls.load() < start + 20 && std::chrono::steady_clock::now() < deadline) {
+			detail_region::resident_bytes_fn = g_stored_resident.load();
+			detail_region::pageout_fn = g_stored_pageout.load();
+		}
+		EXPECT_GE(g_probe_calls.load(), start + 20);
+		EXPECT_GT(g_trim_calls.load(), 0);
 	}
 
 	// Pages of a memory-backed filesystem (tmpfs, ramfs) need swap to leave

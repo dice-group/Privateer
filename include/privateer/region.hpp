@@ -25,6 +25,7 @@
 #include <privateer/error.hpp>
 #include <privateer/slot_table.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -253,6 +254,12 @@ namespace privateer {
 
 #ifdef PRIVATEER_TEST_HOOKS
 	// Test-only hooks, compiled in when the build includes the tests.
+	//
+	// The function-pointer seams are atomic: a test stores one while a live
+	// region reads it from a pool thread or from signal context. The engine
+	// loads them relaxed, which is a plain load, so the handler stays
+	// signal-safe. A store publishes nothing but the pointer, so relaxed is
+	// all the ordering the seams need.
 	namespace detail_region {
 
 		// access to the slot table behind a region
@@ -265,17 +272,17 @@ namespace privateer {
 		// The protection-change syscall of the fault path and of poisoned-slot
 		// recovery (cleaner and commit capture). Tests replace it to fail the
 		// change on purpose; everything else leaves it alone.
-		extern int (*mprotect_fn)(void *addr, size_t len, int prot);
+		extern std::atomic<int (*)(void *addr, size_t len, int prot)> mprotect_fn;
 
 		// When set, called after each completed commit phase (1 capture,
 		// 2 write-out, 3 segment publish, 4 durability barrier, 5 manifest
 		// rename, 6 reclaim). Phases 4 and 6 run for a durable commit only.
 		// Crash tests kill the process inside it.
-		extern void (*commit_phase_hook)(int completed_phase);
+		extern std::atomic<void (*)(int completed_phase)> commit_phase_hook;
 
 		// The hard-link syscall of the snapshot staging. Tests replace it to
 		// force the per-file copy fallback or to kill mid-staging.
-		extern int (*link_fn)(char const *from, char const *to);
+		extern std::atomic<int (*)(char const *from, char const *to)> link_fn;
 
 		// Posts fn as a region-owned executor task: the closing no-op
 		// wrapper, the catch-all, and the outstanding-task counter apply.
@@ -289,11 +296,11 @@ namespace privateer {
 
 		// The cleaner's time source, monotonic nanoseconds. Tests replace it
 		// for deterministic backoff decisions.
-		extern int64_t (*clock_fn)();
+		extern std::atomic<int64_t (*)()> clock_fn;
 
 		// When set, called after each slot the cleaner writes back. Crash
 		// tests kill the process inside it.
-		extern void (*cleaner_slot_hook)(size_t slot);
+		extern std::atomic<void (*)(size_t slot)> cleaner_slot_hook;
 
 		// Runs one cleaner batch synchronously on the calling thread,
 		// regardless of the region's cleaner mode and interval.
@@ -304,12 +311,12 @@ namespace privateer {
 		// When set, decides whether the cleaner's block write for this slot
 		// fails, the way ENOSPC would. Tests use it to exercise the batch's
 		// unwind and the failure backoff.
-		extern bool (*cleaner_write_fails_fn)(size_t slot);
+		extern std::atomic<bool (*)(size_t slot)> cleaner_write_fails_fn;
 
 		// When set, decides whether the cleaner's eager durability barrier
 		// fails, the way a failed fsync would. Tests use it to exercise the
 		// whole-batch unwind.
-		extern bool (*cleaner_durability_fails_fn)();
+		extern std::atomic<bool (*)()> cleaner_durability_fails_fn;
 
 		// whether the cleaner has disabled itself after repeated failures
 		[[nodiscard]] bool cleaner_disabled(region &reg) noexcept;
@@ -320,21 +327,22 @@ namespace privateer {
 
 		// The resident sweep's process residency probe. Tests replace it to
 		// feed synthetic Pss values; the default reads /proc/self/smaps_rollup.
-		extern result<uint64_t> (*resident_bytes_fn)();
+		extern std::atomic<result<uint64_t> (*)()> resident_bytes_fn;
 
 		// The resident sweep's trim syscall. Tests replace it to count and
 		// to suppress the real MADV_PAGEOUT.
-		extern int (*pageout_fn)(void *addr, size_t len);
+		extern std::atomic<int (*)(void *addr, size_t len)> pageout_fn;
 
 		// Runs one resident sweep pass synchronously on the calling thread,
-		// regardless of the sweep interval. Returns the bytes the pass asked
+		// regardless of the sweep interval, and leaves the periodic sweep of
+		// the registered regions running. Returns the bytes the pass asked
 		// the kernel to push out.
 		uint64_t run_resident_sweep();
 
 		// When set, decides whether posting the commit write-out worker with
 		// this index fails, the way an allocation failure would. Tests use it
 		// to exercise the fan-out's failure path.
-		extern bool (*commit_post_fails_fn)(size_t worker);
+		extern std::atomic<bool (*)(size_t worker)> commit_post_fails_fn;
 
 		// the worker count a commit uses, after the default is resolved
 		[[nodiscard]] size_t commit_workers(region &reg) noexcept;
