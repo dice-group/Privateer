@@ -226,6 +226,29 @@ namespace {
 		EXPECT_EQ(table.dirty_slots(), 0u);
 	}
 
+	// The count is the governor's budget, and a count below zero wraps to a
+	// value no drain can bring back under the hard watermark: every writer
+	// would then stall for its full timeout on every fault, for the rest of
+	// the process. An unbalanced decrement stops at zero instead, in every
+	// build.
+	TEST(SlotTableTest, DirtyDecrementStopsAtZero) {
+		auto table = make_table(4);
+		ASSERT_EQ(table.dirty_slots(), 0u);
+
+		table.sub_dirty();
+		EXPECT_EQ(table.dirty_slots(), 0u);
+
+		table.add_dirty();
+		table.sub_dirty();
+		table.sub_dirty();
+		EXPECT_EQ(table.dirty_slots(), 0u);
+
+		// the count still tracks what follows
+		EXPECT_EQ(table.add_dirty(), 1u);
+		table.sub_dirty();
+		EXPECT_EQ(table.dirty_slots(), 0u);
+	}
+
 	TEST(SlotTableTest, EveryDecreaseBumpsTheGovernorWord) {
 		auto table = make_table(4);
 		table.add_dirty();
