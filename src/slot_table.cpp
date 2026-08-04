@@ -125,8 +125,17 @@ namespace privateer {
 	}
 
 	PRIVATEER_HANDLER_TEXT void slot_table::sub_dirty() noexcept {
-		[[maybe_unused]] uint64_t const previous = head()->dirty.fetch_sub(1, std::memory_order_acq_rel);
-		assert(previous > 0);
+		// The decrement stops at zero. Every decrement pairs with one
+		// increment, but the counter must survive a broken pair: a count
+		// that wrapped would hold every writer at the hard mark until its
+		// timeout for the rest of the process, while a count that stays at
+		// zero keeps the budget usable. This runs in signal context too, so
+		// there is nothing to report to and nothing to abort for.
+		uint64_t previous = head()->dirty.load(std::memory_order_relaxed);
+		while (previous > 0 && !head()->dirty.compare_exchange_weak(previous, previous - 1,
+																	std::memory_order_acq_rel,
+																	std::memory_order_relaxed)) {
+		}
 		wake_governor();
 	}
 
