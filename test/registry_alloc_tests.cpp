@@ -50,9 +50,9 @@ namespace {
 		~allocation_failure() { g_failing = false; }
 	};
 
-	void *allocate(std::size_t size, std::size_t alignment) {
+	void *allocate_or_null(std::size_t size, std::size_t alignment) noexcept {
 		if (g_failing) {
-			throw std::bad_alloc{};
+			return nullptr;
 		}
 		if (g_counting) {
 			++g_allocations;
@@ -61,6 +61,14 @@ namespace {
 		// posix_memalign wants at least pointer alignment
 		std::size_t const wanted = alignment > sizeof(void *) ? alignment : sizeof(void *);
 		if (::posix_memalign(&addr, wanted, size != 0 ? size : 1) != 0) {
+			return nullptr;
+		}
+		return addr;
+	}
+
+	void *allocate(std::size_t size, std::size_t alignment) {
+		void *const addr = allocate_or_null(size, alignment);
+		if (addr == nullptr) {
 			throw std::bad_alloc{};
 		}
 		return addr;
@@ -68,8 +76,10 @@ namespace {
 
 }  // namespace
 
-// Every form allocates through posix_memalign and releases through free, so
-// no pairing depends on which form the caller used.
+// Every form allocates through posix_memalign and releases through free. All
+// of them are replaced, including the nothrow ones: a form left to the
+// runtime would pair its allocation with a free here, which a sanitizer
+// reports as a mismatch.
 void *operator new(std::size_t size) { return allocate(size, alignof(std::max_align_t)); }
 void *operator new[](std::size_t size) { return allocate(size, alignof(std::max_align_t)); }
 void *operator new(std::size_t size, std::align_val_t align) {
@@ -77,6 +87,18 @@ void *operator new(std::size_t size, std::align_val_t align) {
 }
 void *operator new[](std::size_t size, std::align_val_t align) {
 	return allocate(size, static_cast<std::size_t>(align));
+}
+void *operator new(std::size_t size, std::nothrow_t const &) noexcept {
+	return allocate_or_null(size, alignof(std::max_align_t));
+}
+void *operator new[](std::size_t size, std::nothrow_t const &) noexcept {
+	return allocate_or_null(size, alignof(std::max_align_t));
+}
+void *operator new(std::size_t size, std::align_val_t align, std::nothrow_t const &) noexcept {
+	return allocate_or_null(size, static_cast<std::size_t>(align));
+}
+void *operator new[](std::size_t size, std::align_val_t align, std::nothrow_t const &) noexcept {
+	return allocate_or_null(size, static_cast<std::size_t>(align));
 }
 void operator delete(void *addr) noexcept { std::free(addr); }
 void operator delete[](void *addr) noexcept { std::free(addr); }
@@ -86,6 +108,12 @@ void operator delete(void *addr, std::align_val_t) noexcept { std::free(addr); }
 void operator delete[](void *addr, std::align_val_t) noexcept { std::free(addr); }
 void operator delete(void *addr, std::size_t, std::align_val_t) noexcept { std::free(addr); }
 void operator delete[](void *addr, std::size_t, std::align_val_t) noexcept { std::free(addr); }
+void operator delete(void *addr, std::nothrow_t const &) noexcept { std::free(addr); }
+void operator delete[](void *addr, std::nothrow_t const &) noexcept { std::free(addr); }
+void operator delete(void *addr, std::align_val_t, std::nothrow_t const &) noexcept { std::free(addr); }
+void operator delete[](void *addr, std::align_val_t, std::nothrow_t const &) noexcept {
+	std::free(addr);
+}
 
 namespace {
 
