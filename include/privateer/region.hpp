@@ -313,6 +313,12 @@ namespace privateer {
 		// unwind and the failure backoff.
 		extern std::atomic<bool (*)(size_t slot)> cleaner_write_fails_fn;
 
+		// When set, decides whether the cleaner's bookkeeping for this slot
+		// fails the way an allocation failure would: the seam throws where
+		// the batch holds a slot claim. Tests use it to exercise the
+		// batch's restore.
+		extern std::atomic<bool (*)(size_t slot)> cleaner_alloc_fails_fn;
+
 		// When set, decides whether the cleaner's eager durability barrier
 		// fails, the way a failed fsync would. Tests use it to exercise the
 		// whole-batch unwind.

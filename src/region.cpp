@@ -158,6 +158,7 @@ namespace privateer {
 		std::atomic<int (*)(void *, size_t)> pageout_fn{pageout_range};
 		std::atomic<bool (*)(size_t)> commit_post_fails_fn{nullptr};
 		std::atomic<bool (*)(size_t)> cleaner_write_fails_fn{nullptr};
+		std::atomic<bool (*)(size_t)> cleaner_alloc_fails_fn{nullptr};
 		std::atomic<bool (*)()> cleaner_durability_fails_fn{nullptr};
 
 		// the fault path reads its seam in signal context, where only a
@@ -287,6 +288,20 @@ namespace privateer {
 		bool cleaner_write_fails([[maybe_unused]] size_t slot) {
 #ifdef PRIVATEER_TEST_HOOKS
 			auto const fails = detail_region::cleaner_write_fails_fn.load(std::memory_order_relaxed);
+			return fails != nullptr && fails(slot);
+#else
+			return false;
+#endif
+		}
+
+		// Whether the cleaner's bookkeeping for this slot must fail the way an
+		// allocation failure would; tests reroute it through the seam. The
+		// engine never fails here on purpose: the seam exists because the
+		// batch holds slot claims across allocating calls, and the unwind of
+		// a throw is what the seam exercises.
+		bool cleaner_alloc_fails([[maybe_unused]] size_t slot) {
+#ifdef PRIVATEER_TEST_HOOKS
+			auto const fails = detail_region::cleaner_alloc_fails_fn.load(std::memory_order_relaxed);
 			return fails != nullptr && fails(slot);
 #else
 			return false;
@@ -949,14 +964,51 @@ namespace privateer {
 			std::vector<pending_slot> pendings;
 			std::vector<block_digest> written;      // entries the barrier must cover
 			std::vector<block_digest> fresh_names;  // block files this batch created
-			// Claims are held from the capture loop on, so the engine's own
-			// bookkeeping must not allocate with a claim in hand (the same
-			// rule as the commit's capture); the loops below only push into
-			// this space.
+			// Claims are held from the capture loop on. What the engine can
+			// keep allocation-free with a claim in hand it does: these
+			// vectors are reserved and the loops below only push into that
+			// space. What allocates anyway, the store's publish and its
+			// reference and pending sets, is covered by the restore below.
 			pendings.reserve(victims.size());
 			written.reserve(victims.size());
 			fresh_names.reserve(victims.size());
 			bool failed = false;
+
+			// Restores every claimed slot the batch has not released, on
+			// every path out of this function, including the one an
+			// allocation failure takes. A slot left in syncing parks every
+			// writer that touches it for as long as the region lives, and
+			// the next commit passes over it, so its content never reaches
+			// a recipe. Only this batch moves a slot out of syncing, so the
+			// state identifies the unreleased ones exactly; where the loops
+			// below released or unwound everything this is a scan that
+			// changes nothing. A recipe entry a claim already replaced keeps
+			// the new name: its file exists and carries the frozen content,
+			// its reference and its sync obligation are recorded, and the
+			// slot is dirty again, so the next write-out replaces the entry
+			// anyway. Allocates nothing, the same rule the batch itself
+			// follows.
+			scope_guard const restore_claimed{[&]() noexcept {
+				bool restored = false;
+				for (auto const &p : pendings) {
+					if (table.load(p.slot) != slot_state::syncing) {
+						continue;
+					}
+					auto *const addr = segment_base() + p.slot * block_size;
+					if (::mprotect(addr, block_size, PROT_READ | PROT_WRITE) != 0) {
+						hot->poisoned.fetch_add(1, std::memory_order_release);
+						table.publish(p.slot, slot_state::poisoned);
+						table.sub_dirty();
+						hot->error.store(1, std::memory_order_release);
+						continue;
+					}
+					table.publish(p.slot, slot_state::dirty);
+					restored = true;
+				}
+				if (restored) {
+					table.wake_governor();
+				}
+			}};
 
 			// Restores one pending slot: the recipe-table entry and the
 			// references revert, the freeze reverses, and the slot returns
@@ -993,6 +1045,9 @@ namespace privateer {
 				if (!table.try_claim(slot, slot_state::dirty, slot_state::syncing)) {
 					continue;  // the slot moved since the scan; its new owner has it
 				}
+				// The claim is recorded before anything that can fail, so the
+				// restore above reaches this slot on every path.
+				pendings.push_back({slot, rec.entries[slot], false});
 				auto *const addr = segment_base() + slot * block_size;
 				// freeze: when mprotect returns, no core holds a stale
 				// writable entry, so the content below is what gets hashed
@@ -1001,7 +1056,8 @@ namespace privateer {
 					// the unwind reverses it before the slot goes back to dirty
 					PRIVATEER_LOG(log_level::warning, "cleaner cannot freeze slot {} (errno {})", slot,
 								  errno);
-					unwind({slot, {}, false});
+					unwind(pendings.back());
+					pendings.pop_back();
 					failed = true;
 					break;
 				}
@@ -1015,9 +1071,15 @@ namespace privateer {
 				bool const rewrite = store->needs_rewrite(name);
 				if (name == entry && !rewrite) {
 					stat_skipped.fetch_add(1, std::memory_order_relaxed);
-					pendings.push_back({slot, entry, false});
+					store->note_unsynced(entry);
 					written.push_back(entry);
 					continue;
+				}
+				// The store's publish allocates its compare buffer and its paths,
+				// so this is where an allocation failure meets a claim in hand;
+				// tests reroute that failure through the seam.
+				if (cleaner_alloc_fails(slot)) {
+					throw std::bad_alloc{};
 				}
 				auto const published =
 						cleaner_write_fails(slot)
@@ -1030,7 +1092,8 @@ namespace privateer {
 					// failure to a caller.
 					PRIVATEER_LOG(log_level::warning, "cleaner cannot write slot {} back: {}", slot,
 								  to_string(published.error()));
-					unwind({slot, {}, false});
+					unwind(pendings.back());
+					pendings.pop_back();
 					failed = true;
 					break;
 				}
@@ -1041,21 +1104,22 @@ namespace privateer {
 				if (*published) {
 					fresh_names.push_back(name);
 				}
-				pendings.push_back({slot, entry, true});
+				// The entry takes the new name only after that name is referenced
+				// and its sync obligation is recorded, so a throw in between
+				// leaves a name referenced once too often, never one an entry
+				// carries without a reference or without a barrier. Every name an
+				// entry of this batch carries owes a sync, and a later durable
+				// commit is what pays it; eager durability pays it right below,
+				// and the note falls away with the next pruning.
+				store->add_reference(name);
+				store->note_unsynced(name);
 				if (entry.size != 0) {
 					store->drop_reference(entry);
 				}
-				store->add_reference(name);
 				entry = name;
+				pendings.back().replaced = true;
 				mark_segment_dirty(slot);
 				written.push_back(name);
-			}
-
-			// Every name an entry of this batch carries owes a sync, and a
-			// later durable commit is what pays it. Eager durability pays it
-			// right below, and the note falls away with the next pruning.
-			for (auto const &name : written) {
-				store->note_unsynced(name);
 			}
 
 			// Eager durability: the full durable-name contract for what the
