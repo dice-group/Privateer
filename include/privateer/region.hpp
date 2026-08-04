@@ -305,7 +305,8 @@ namespace privateer {
 		// Runs one cleaner batch synchronously on the calling thread,
 		// regardless of the region's cleaner mode and interval.
 		// override_backoff ignores the re-dirty backoff. Returns the number
-		// of slots written back.
+		// of slots written back; a batch that meets a running commit steps
+		// aside and writes nothing back.
 		size_t run_cleaner_batch(region &reg, bool override_backoff);
 
 		// When set, decides whether the cleaner's block write for this slot
