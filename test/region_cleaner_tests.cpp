@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <new>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -95,6 +96,7 @@ namespace {
 			detail_region::clock_fn = real_clock_;
 			detail_region::cleaner_slot_hook = nullptr;
 			detail_region::cleaner_write_fails_fn = nullptr;
+			detail_region::cleaner_alloc_fails_fn = nullptr;
 			detail_region::cleaner_durability_fails_fn = nullptr;
 		}
 
@@ -408,6 +410,40 @@ namespace {
 		auto reopened = region::open(dir.path);
 		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
 		EXPECT_EQ(bytes(*reopened)[0], 'b');
+	}
+
+	// A batch holds its slot claims across the store's publish, which
+	// allocates. An allocation failure there throws out of the batch, and
+	// every claim it holds has to go back: a slot left in syncing is
+	// read-only for every writer and invisible to every later capture, so
+	// its content would never reach a recipe.
+	TEST_F(RegionCleanerTest, AnAllocationFailureInABatchPutsItsClaimsBack) {
+		privateer::testing::build_committed_store(dir.path, bs, {'x', 'y'});
+		auto reg = region::open(dir.path, options(cleaner_mode::non_durable));
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		auto &table = detail_region::table_of(*reg);
+		bytes(*reg)[0] = 'a';
+		bytes(*reg)[bs] = 'b';
+		ASSERT_EQ(table.dirty_slots(), 2u);
+
+		// the second slot of the batch throws while the first one is claimed
+		detail_region::cleaner_alloc_fails_fn = [](size_t slot) { return slot == 1; };
+		EXPECT_THROW((void) detail_region::run_cleaner_batch(*reg, false), std::bad_alloc);
+		detail_region::cleaner_alloc_fails_fn = nullptr;
+
+		EXPECT_EQ(table.load(0), slot_state::dirty);
+		EXPECT_EQ(table.load(1), slot_state::dirty);
+		EXPECT_EQ(table.dirty_slots(), 2u);
+		EXPECT_TRUE(reg->check_sanity());
+
+		// both slots are captured again, so neither is missing from the recipe
+		ASSERT_TRUE(reg->commit(true));
+		EXPECT_EQ(table.load(0), slot_state::clean);
+		EXPECT_EQ(table.load(1), slot_state::clean);
+		auto reopened = region::open(dir.path);
+		ASSERT_TRUE(reopened.has_value()) << to_string(reopened.error());
+		EXPECT_EQ(bytes(*reopened)[0], 'a');
+		EXPECT_EQ(bytes(*reopened)[bs], 'b');
 	}
 
 	TEST_F(RegionCleanerTest, AFailedBatchBacksTheCleanerOff) {

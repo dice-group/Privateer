@@ -137,6 +137,13 @@ namespace privateer {
 		// visible as a changed value.
 		void wake_governor() noexcept;
 
+		// Wakes the waiters parked on the state word of a slot below
+		// slots_in_use, for close releasing them. Only the states a waiter
+		// waits on are woken. The state stays what it is, so a waiter
+		// between its state load and its park does not see this wake; the
+		// waits on those states are timed, which is what covers it.
+		void wake_slot_waiters(size_t slots_in_use) noexcept;
+
 		// The extended region size in bytes, a slot multiple. The fault
 		// handler gates on it before it reads any slot state, so it lives in
 		// the same mlocked buffer as the states. The store happens only after

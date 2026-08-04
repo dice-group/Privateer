@@ -313,6 +313,12 @@ namespace privateer {
 		// unwind and the failure backoff.
 		extern std::atomic<bool (*)(size_t slot)> cleaner_write_fails_fn;
 
+		// When set, decides whether the cleaner's bookkeeping for this slot
+		// fails the way an allocation failure would: the seam throws where
+		// the batch holds a slot claim. Tests use it to exercise the
+		// batch's restore.
+		extern std::atomic<bool (*)(size_t slot)> cleaner_alloc_fails_fn;
+
 		// When set, decides whether the cleaner's eager durability barrier
 		// fails, the way a failed fsync would. Tests use it to exercise the
 		// whole-batch unwind.
@@ -404,8 +410,8 @@ namespace privateer {
 		// maps the grown range as anonymous zeros, and publishes the new
 		// size. Fails cleanly beyond capacity, beyond the VMA budget, or
 		// when RLIMIT_MEMLOCK cannot hold the grown state array; a target at
-		// or below the current size is a no-op. The new size is persisted by
-		// the next commit.
+		// or below the current size is a no-op. Fails on read-only and
+		// closing regions. The new size is persisted by the next commit.
 		result<> extend(uint64_t target_size);
 
 		// Frees the whole slots fully covered by [offset, offset + nbytes):
@@ -428,7 +434,8 @@ namespace privateer {
 		// throughout, and a writer that faults a captured slot waits only
 		// for that slot's own write-out. A consistent cut requires that the
 		// application does not write concurrently. On a read-only region
-		// this is a no-op success.
+		// this is a no-op success; on a closing region it fails, and close
+		// waits out a commit that began before it.
 		result<> commit(bool durable);
 
 		// Stages a self-contained copy of the region's committed state into
@@ -438,6 +445,7 @@ namespace privateer {
 		// run under the commit mutex, so no commit in between can reclaim a
 		// block the staged recipe references. The caller (metall) fsyncs the
 		// staged tree and publishes the datastore with one atomic rename.
+		// Fails on a closing region.
 		result<> snapshot_to(std::filesystem::path const &staging_segment_dir);
 
 		// Stages a self-contained copy of an on-disk datastore that no

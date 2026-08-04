@@ -87,7 +87,8 @@ struct region {
 
 A region is movable and not copyable. Closing it (the destructor) requires quiesced writers: a
 writer that is parked at the dirty hard watermark while the region closes has its fault forwarded as
-a crash.
+a crash. `extend`, `free_region`, `commit` and `snapshot_to` fail with `shutting_down` once the
+close began, and the close waits out a call that began before it.
 
 Addresses inside the segment are only valid while the region is open, and a later run maps the same
 content at a different base. Data structures that persist must therefore use offsets.

@@ -97,6 +97,10 @@ namespace privateer {
 			slot_table table;
 			std::atomic<uint32_t> error{0};
 			std::atomic<uint32_t> closing{0};
+			// Region calls between their entry and their exit. Close waits it
+			// to zero, so a call that entered before closing was stored keeps
+			// the state it works with alive until it is done.
+			std::atomic<uint32_t> calls_in_flight{0};
 			// Count of slots in poisoned state, the recovery cue: the handler
 			// increments when it poisons, every heal decrements. The governed
 			// cleaner runs a batch whenever it is nonzero, so recovery does
@@ -119,6 +123,35 @@ namespace privateer {
 			std::atomic<uint64_t> stat_cleaned{0};
 			std::atomic<uint64_t> stat_redirtied{0};
 			std::atomic<uint64_t> stat_stalls{0};
+		};
+
+		// The entry handshake of the region calls that work with state a
+		// close tears down. Both sides are seq_cst: with weaker orderings the
+		// counter increment and the closing store could each miss the other
+		// (the store-buffer case) and the call would proceed into teardown.
+		// A call that finds the flag set returns shutting_down; one that
+		// entered before it was stored is waited out by close.
+		struct call_guard {
+			explicit call_guard(region_hot &hot) noexcept : hot_{hot} {
+				hot_.calls_in_flight.fetch_add(1, std::memory_order_seq_cst);
+			}
+
+			~call_guard() {
+				// the wake releases a close already waiting on the counter
+				if (hot_.calls_in_flight.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+					word_wake_all(hot_.calls_in_flight);
+				}
+			}
+
+			call_guard(call_guard const &) = delete;
+			call_guard &operator=(call_guard const &) = delete;
+
+			[[nodiscard]] bool closing() const noexcept {
+				return hot_.closing.load(std::memory_order_seq_cst) != 0;
+			}
+
+		private:
+			region_hot &hot_;
 		};
 
 		// the resident sweep's default probe: the process Pss
@@ -158,6 +191,7 @@ namespace privateer {
 		std::atomic<int (*)(void *, size_t)> pageout_fn{pageout_range};
 		std::atomic<bool (*)(size_t)> commit_post_fails_fn{nullptr};
 		std::atomic<bool (*)(size_t)> cleaner_write_fails_fn{nullptr};
+		std::atomic<bool (*)(size_t)> cleaner_alloc_fails_fn{nullptr};
 		std::atomic<bool (*)()> cleaner_durability_fails_fn{nullptr};
 
 		// the fault path reads its seam in signal context, where only a
@@ -293,6 +327,20 @@ namespace privateer {
 #endif
 		}
 
+		// Whether the cleaner's bookkeeping for this slot must fail the way an
+		// allocation failure would; tests reroute it through the seam. The
+		// engine never fails here on purpose: the seam exists because the
+		// batch holds slot claims across allocating calls, and the unwind of
+		// a throw is what the seam exercises.
+		bool cleaner_alloc_fails([[maybe_unused]] size_t slot) {
+#ifdef PRIVATEER_TEST_HOOKS
+			auto const fails = detail_region::cleaner_alloc_fails_fn.load(std::memory_order_relaxed);
+			return fails != nullptr && fails(slot);
+#else
+			return false;
+#endif
+		}
+
 		// Whether the cleaner's eager durability barrier must fail, the way
 		// a failed fsync would; tests reroute it through the seam.
 		bool cleaner_durability_fails() {
@@ -390,14 +438,18 @@ namespace privateer {
 
 	namespace {
 
+		// How long the fault path parks on one transient claim before it
+		// looks at the closing flag again. Close leaves every slot state as
+		// it is, so a wait that only ends on a state change would sleep
+		// through a close that finds a claim its owner never released, and
+		// close would wait for that fault to leave the handler forever.
+		constexpr int64_t transient_wait_ns = 1'000'000;
+
 		// The fault path. Runs in the process-wide handler with the record's
 		// in-flight counter held; everything it touches is mlocked, and every
 		// call it makes is async-signal-safe.
 		PRIVATEER_HANDLER_TEXT bool region_on_fault(region_record &rec, uintptr_t addr, int) {
 			auto &hot = *static_cast<region_hot *>(rec.context);
-			if (hot.closing.load(std::memory_order_acquire) != 0) {
-				return false;  // the application must have quiesced; fail loudly
-			}
 			uint64_t const offset = addr - hot.segment_start;
 			if (offset >= hot.table.extended_size()) {
 				return false;  // beyond the extended size: a genuine wild access
@@ -409,6 +461,14 @@ namespace privateer {
 			int64_t gate_deadline = -1;
 			int64_t poison_deadline = -1;
 			for (;;) {
+				// Every wait below is bounded and comes back through here, so
+				// this covers a fault that arrives once close began and one
+				// whose wait outlives the close: the application must have
+				// quiesced its readers and writers, and a fault that has not
+				// fails loudly.
+				if (hot.closing.load(std::memory_order_acquire) != 0) {
+					return false;
+				}
 				slot_state const state = hot.table.load(slot);
 				switch (state) {
 					case slot_state::empty:
@@ -493,9 +553,14 @@ namespace privateer {
 						// Wait out the transient, then retry the instruction;
 						// the retry classifies itself: a read succeeds against
 						// the restored mapping, a write re-faults into the
-						// claim path.
-						(void) hot.table.wait_changed(slot, state);
-						return true;
+						// claim path. The wait is timed: a claim its owner
+						// never released would park this thread for the
+						// region's lifetime, and the loop above is where that
+						// is noticed.
+						if (hot.table.wait_changed_for(slot, state, transient_wait_ns) != state) {
+							return true;
+						}
+						continue;  // still claimed: re-examine
 					case slot_state::dirty:
 						// Writable by publish-after-protect, so this is a
 						// stale TLB entry or a benign race with a fresh
@@ -700,6 +765,20 @@ namespace privateer {
 					return;
 				}
 				(void) word_wait(*outstanding_tasks, outstanding);
+			}
+		}
+
+		// Waits until every region call that entered before the closing flag
+		// was stored has left. This is the half of the shutdown handshake
+		// that covers a call which has not reached a mutex yet, so no mutex
+		// is destroyed under a caller waiting on it.
+		void join_calls() {
+			for (;;) {
+				uint32_t const in_flight = hot->calls_in_flight.load(std::memory_order_acquire);
+				if (in_flight == 0) {
+					return;
+				}
+				(void) word_wait(hot->calls_in_flight, in_flight);
 			}
 		}
 
@@ -949,14 +1028,51 @@ namespace privateer {
 			std::vector<pending_slot> pendings;
 			std::vector<block_digest> written;      // entries the barrier must cover
 			std::vector<block_digest> fresh_names;  // block files this batch created
-			// Claims are held from the capture loop on, so the engine's own
-			// bookkeeping must not allocate with a claim in hand (the same
-			// rule as the commit's capture); the loops below only push into
-			// this space.
+			// Claims are held from the capture loop on. What the engine can
+			// keep allocation-free with a claim in hand it does: these
+			// vectors are reserved and the loops below only push into that
+			// space. What allocates anyway, the store's publish and its
+			// reference and pending sets, is covered by the restore below.
 			pendings.reserve(victims.size());
 			written.reserve(victims.size());
 			fresh_names.reserve(victims.size());
 			bool failed = false;
+
+			// Restores every claimed slot the batch has not released, on
+			// every path out of this function, including the one an
+			// allocation failure takes. A slot left in syncing parks every
+			// writer that touches it for as long as the region lives, and
+			// the next commit passes over it, so its content never reaches
+			// a recipe. Only this batch moves a slot out of syncing, so the
+			// state identifies the unreleased ones exactly; where the loops
+			// below released or unwound everything this is a scan that
+			// changes nothing. A recipe entry a claim already replaced keeps
+			// the new name: its file exists and carries the frozen content,
+			// its reference and its sync obligation are recorded, and the
+			// slot is dirty again, so the next write-out replaces the entry
+			// anyway. Allocates nothing, the same rule the batch itself
+			// follows.
+			scope_guard const restore_claimed{[&]() noexcept {
+				bool restored = false;
+				for (auto const &p : pendings) {
+					if (table.load(p.slot) != slot_state::syncing) {
+						continue;
+					}
+					auto *const addr = segment_base() + p.slot * block_size;
+					if (::mprotect(addr, block_size, PROT_READ | PROT_WRITE) != 0) {
+						hot->poisoned.fetch_add(1, std::memory_order_release);
+						table.publish(p.slot, slot_state::poisoned);
+						table.sub_dirty();
+						hot->error.store(1, std::memory_order_release);
+						continue;
+					}
+					table.publish(p.slot, slot_state::dirty);
+					restored = true;
+				}
+				if (restored) {
+					table.wake_governor();
+				}
+			}};
 
 			// Restores one pending slot: the recipe-table entry and the
 			// references revert, the freeze reverses, and the slot returns
@@ -993,6 +1109,9 @@ namespace privateer {
 				if (!table.try_claim(slot, slot_state::dirty, slot_state::syncing)) {
 					continue;  // the slot moved since the scan; its new owner has it
 				}
+				// The claim is recorded before anything that can fail, so the
+				// restore above reaches this slot on every path.
+				pendings.push_back({slot, rec.entries[slot], false});
 				auto *const addr = segment_base() + slot * block_size;
 				// freeze: when mprotect returns, no core holds a stale
 				// writable entry, so the content below is what gets hashed
@@ -1001,7 +1120,8 @@ namespace privateer {
 					// the unwind reverses it before the slot goes back to dirty
 					PRIVATEER_LOG(log_level::warning, "cleaner cannot freeze slot {} (errno {})", slot,
 								  errno);
-					unwind({slot, {}, false});
+					unwind(pendings.back());
+					pendings.pop_back();
 					failed = true;
 					break;
 				}
@@ -1015,9 +1135,15 @@ namespace privateer {
 				bool const rewrite = store->needs_rewrite(name);
 				if (name == entry && !rewrite) {
 					stat_skipped.fetch_add(1, std::memory_order_relaxed);
-					pendings.push_back({slot, entry, false});
+					store->note_unsynced(entry);
 					written.push_back(entry);
 					continue;
+				}
+				// The store's publish allocates its compare buffer and its paths,
+				// so this is where an allocation failure meets a claim in hand;
+				// tests reroute that failure through the seam.
+				if (cleaner_alloc_fails(slot)) {
+					throw std::bad_alloc{};
 				}
 				auto const published =
 						cleaner_write_fails(slot)
@@ -1030,7 +1156,8 @@ namespace privateer {
 					// failure to a caller.
 					PRIVATEER_LOG(log_level::warning, "cleaner cannot write slot {} back: {}", slot,
 								  to_string(published.error()));
-					unwind({slot, {}, false});
+					unwind(pendings.back());
+					pendings.pop_back();
 					failed = true;
 					break;
 				}
@@ -1041,21 +1168,22 @@ namespace privateer {
 				if (*published) {
 					fresh_names.push_back(name);
 				}
-				pendings.push_back({slot, entry, true});
+				// The entry takes the new name only after that name is referenced
+				// and its sync obligation is recorded, so a throw in between
+				// leaves a name referenced once too often, never one an entry
+				// carries without a reference or without a barrier. Every name an
+				// entry of this batch carries owes a sync, and a later durable
+				// commit is what pays it; eager durability pays it right below,
+				// and the note falls away with the next pruning.
+				store->add_reference(name);
+				store->note_unsynced(name);
 				if (entry.size != 0) {
 					store->drop_reference(entry);
 				}
-				store->add_reference(name);
 				entry = name;
+				pendings.back().replaced = true;
 				mark_segment_dirty(slot);
 				written.push_back(name);
-			}
-
-			// Every name an entry of this batch carries owes a sync, and a
-			// later durable commit is what pays it. Eager durability pays it
-			// right below, and the note falls away with the next pruning.
-			for (auto const &name : written) {
-				store->note_unsynced(name);
 			}
 
 			// Eager durability: the full durable-name contract for what the
@@ -1228,12 +1356,25 @@ namespace privateer {
 				// contract violation).
 				hot->closing.store(1, std::memory_order_seq_cst);
 				hot->table.wake_governor();
+				// A writer waiting out a slot's transient claim parks on that
+				// slot's own word, which the governor wake does not touch.
+				// This releases the ones already parked; the timed wait of
+				// the fault path covers one that parks after this pass.
+				hot->table.wake_slot_waiters(hot->table.extended_size() / hot->block_size);
 				// Tasks that have not started yet run as no-ops; timer
 				// handlers complete with aborted set. The join waits both
 				// kinds out, so nothing touches the region past this point.
 				cancel_timers();
 				join_tasks();
 				resident_sweeper_unregister(this);
+				// Waits out a straggling call: the mutexes wait out one that
+				// is inside its work, the counter also covers one that
+				// entered and has not taken a mutex yet. Only then may the
+				// state the calls work with go away.
+				{
+					std::scoped_lock const straggler_lock{commit_mutex, region_mutex};
+				}
+				join_calls();
 				if (registered) {
 					global_registry().remove(hot->record);
 				}
@@ -1880,6 +2021,11 @@ namespace privateer {
 		if (st.read_only) {
 			return fail(errc::invalid_argument, "extend on a read-only region");
 		}
+		// the shutdown handshake, before the mutex a close takes as well
+		call_guard const in_flight{*st.hot};
+		if (in_flight.closing()) {
+			return fail(errc::shutting_down, "extend on a closing region");
+		}
 		std::lock_guard lock{st.region_mutex};
 		uint64_t const current = st.hot->table.extended_size();
 		if (target_size <= current) {
@@ -1953,7 +2099,15 @@ namespace privateer {
 			for (;;) {
 				slot_state const state = table.load(slot);
 				if (is_transient(state)) {
-					(void) table.wait_changed(slot, state);
+					// The wait is timed and closing is re-checked after it:
+					// close leaves the state as it is, so a claim its owner
+					// never released would park this call, and with it the
+					// close that waits for this call, forever. The slots
+					// already freed keep their free.
+					(void) table.wait_changed_for(slot, state, transient_wait_ns);
+					if (st.hot->closing.load(std::memory_order_acquire) != 0) {
+						return fail(errc::shutting_down, "free_region on a closing region");
+					}
 					continue;
 				}
 				// A poisoned slot is claimed like any terminal state: the
@@ -2000,6 +2154,11 @@ namespace privateer {
 			// without a read-only guard; a shared-locked datastore is never
 			// mutated, so this succeeds untouched
 			return {};
+		}
+		// the shutdown handshake, before the mutex a close takes as well
+		call_guard const in_flight{*st.hot};
+		if (in_flight.closing()) {
+			return fail(errc::shutting_down, "commit on a closing region");
 		}
 		std::lock_guard const commit_lock{st.commit_mutex};
 		return commit_impl(durable);
@@ -2484,6 +2643,11 @@ namespace privateer {
 
 	result<> region::snapshot_to(fs::path const &staging_segment_dir) {
 		auto &st = *state_;
+		// the shutdown handshake, before the mutex a close takes as well
+		call_guard const in_flight{*st.hot};
+		if (in_flight.closing()) {
+			return fail(errc::shutting_down, "snapshot_to on a closing region");
+		}
 		// Held across the commit and the link pass: a durable commit in
 		// between could reclaim a block the just-committed recipe still
 		// references, and the links would hit ENOENT.
