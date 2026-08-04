@@ -8,7 +8,6 @@
 #include <gtest/gtest.h>
 
 #include <privateer/error.hpp>
-#include <privateer/fault_handler.hpp>
 #include <privateer/region.hpp>
 #include <privateer/region_registry.hpp>
 #include <privateer/slot_table.hpp>
@@ -131,6 +130,40 @@ namespace {
 		// quiesced, and the process-wide handler turns the forwarded fault
 		// into the crash that says so.
 		EXPECT_EQ(handled.load(std::memory_order_acquire), 0);
+	}
+
+	// A free waits out a transient claim on the slot it replaces, and close
+	// waits for the free. The same release ends that wait: without it a
+	// claim nothing releases holds the free, and the close behind it, for
+	// good.
+	TEST_F(RegionCloseTest, CloseReleasesAFreeParkedOnAStrandedClaim) {
+		privateer::testing::build_committed_store(dir.path, bs, {'a', 'b'});
+		auto reg = region::open(dir.path);
+		ASSERT_TRUE(reg.has_value()) << to_string(reg.error());
+		std::optional<region> held{std::move(*reg)};
+		region &live = *held;
+		auto &table = detail_region::table_of(live);
+		ASSERT_TRUE(table.try_claim(0, slot_state::clean, slot_state::syncing));
+
+		std::atomic<int> freed{-1};
+		std::thread freer{
+				[&] { freed.store(live.free_region(0, bs) ? 1 : 0, std::memory_order_release); }};
+		std::this_thread::sleep_for(50ms);
+		EXPECT_EQ(freed.load(std::memory_order_acquire), -1) << "the free left the transient wait";
+
+		std::atomic<bool> closed{false};
+		std::thread closer{[&] {
+			held.reset();
+			closed.store(true, std::memory_order_release);
+		}};
+		bool const done = eventually([&] { return closed.load(std::memory_order_acquire); }, 5s);
+		EXPECT_TRUE(done) << "close did not finish with a claim stranded";
+		if (!done) {
+			table.publish(0, slot_state::clean);  // let the run end
+		}
+		closer.join();
+		freer.join();
+		EXPECT_EQ(freed.load(std::memory_order_acquire), 0) << "the free was not refused";
 	}
 
 	// A commit works with the state close destroys: the recipe table, the

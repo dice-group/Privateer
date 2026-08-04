@@ -2099,7 +2099,15 @@ namespace privateer {
 			for (;;) {
 				slot_state const state = table.load(slot);
 				if (is_transient(state)) {
-					(void) table.wait_changed(slot, state);
+					// The wait is timed and closing is re-checked after it:
+					// close leaves the state as it is, so a claim its owner
+					// never released would park this call, and with it the
+					// close that waits for this call, forever. The slots
+					// already freed keep their free.
+					(void) table.wait_changed_for(slot, state, transient_wait_ns);
+					if (st.hot->closing.load(std::memory_order_acquire) != 0) {
+						return fail(errc::shutting_down, "free_region on a closing region");
+					}
 					continue;
 				}
 				// A poisoned slot is claimed like any terminal state: the
